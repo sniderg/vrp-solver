@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vrp_solver.cli import build_parser
+from vrp_solver.cli import _default_checker_exe, build_parser
 from vrp_solver.contest import score_prefix_with_feasibility_tail
 from vrp_solver.model import Solution
 from vrp_solver.solver.robust_batch import (
     RobustBatchResult,
     _target_horizon_days,
+    default_b_targets,
     write_results_csv,
 )
 
@@ -20,6 +21,21 @@ def test_target_horizon_clamps_to_instance_horizon() -> None:
     assert _target_horizon_days(instance, None) == 3
     assert _target_horizon_days(instance, 30) == 3
     assert _target_horizon_days(instance, 2) == 2
+
+
+def test_default_b_targets_resolve_repository_data_files() -> None:
+    targets = default_b_targets()
+
+    assert targets["V2.12"].instance_xml.exists()
+    assert targets["V2.12"].baseline_xml.exists()
+    assert targets["V2.18"].instance_xml.exists()
+    assert targets["V2.18"].baseline_xml.exists()
+
+
+def test_default_checker_path_resolves_repository_data_file() -> None:
+    checker = _default_checker_exe(Path("Instance_V_1.9.xml"))
+
+    assert checker.exists()
 
 
 def test_robust_batch_result_writes_csv(tmp_path: Path) -> None:

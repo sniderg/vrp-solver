@@ -43,8 +43,9 @@ from .smoothness import period_buckets, smoothness_summary
 from .xml_io import load_instance, load_solution, save_solution
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CHECKER_EXE = (
-    Path(__file__).resolve().parent.parent
+    PROJECT_ROOT
     / "roadef_2016_data"
     / "checker_v2"
     / "Challenge_Roadef_EURO_Checker_V2"
@@ -53,7 +54,7 @@ CHECKER_EXE = (
     / "IRP_Roadef_Challenge_Checker.exe"
 )
 RATIO_RE = re.compile(r"Logistic Ratio\s*=\s*([0-9]+(?:[.,][0-9]+)?)")
-RULES_INDEX = Path(__file__).resolve().parent.parent / "roadef_2016_data" / "rules_index.md"
+RULES_INDEX = PROJECT_ROOT / "roadef_2016_data" / "rules_index.md"
 
 
 def cmd_instance_summary(args: argparse.Namespace) -> int:
@@ -1349,7 +1350,7 @@ def cmd_route_swap_search(args: argparse.Namespace) -> int:
 
 
 def _default_checker_exe(instance_path: Path) -> Path:
-    data_dir = Path(__file__).resolve().parent.parent / "roadef_2016_data"
+    data_dir = PROJECT_ROOT / "roadef_2016_data"
     if "_ConvertedTo_V2" not in instance_path.name and "Instance_V_1." in instance_path.name:
         return (
             data_dir

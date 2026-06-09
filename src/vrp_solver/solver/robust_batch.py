@@ -12,7 +12,7 @@ from .rolling_cg import RollingCGConfig, RollingCGStep, robust_rolling_rescue
 
 
 MINUTES_PER_DAY = 1440
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 @dataclass(frozen=True)

@@ -237,6 +237,61 @@ def test_clip_to_tank_capacity_balances_source_load_after_delivery_clip() -> Non
     assert clipped.shifts[0].operations[1].quantity == 1.0
 
 
+def test_final_capacity_clip_is_scored_before_return(monkeypatch) -> None:
+    import vrp_solver.solver.rolling_cg as rolling_cg
+
+    base_instance = tiny_instance(forecast=(1.0, 90.0, 90.0))
+    instance = replace(
+        base_instance,
+        customers=(replace(base_instance.customers[0], initial_tank_quantity=100.0),),
+    )
+    candidate = Solution(
+        shifts=(
+            Shift(
+                index=0,
+                driver=0,
+                trailer=0,
+                start=0,
+                operations=(
+                    Operation(point=1, arrival=0, quantity=-90.0),
+                    Operation(point=2, arrival=1, quantity=90.0),
+                ),
+            ),
+        )
+    )
+
+    def fake_column_generation_rescue(_instance, _baseline, *, config):
+        return candidate, ()
+
+    monkeypatch.setattr(
+        rolling_cg,
+        "column_generation_rescue",
+        fake_column_generation_rescue,
+    )
+
+    solution, _steps = robust_rolling_rescue(
+        instance,
+        Solution(shifts=()),
+        config=RollingCGConfig(
+            mode="deterministic",
+            horizon_days=3,
+            commit_days=3,
+            lookahead_days=0,
+            max_hedge_retries=0,
+            final_clip_capacity=True,
+        ),
+    )
+    score = score_prefix_with_feasibility_tail(
+        instance,
+        solution,
+        score_days=3,
+        feasibility_days=3,
+    )
+
+    assert score.tank_overfill_steps == 0
+    assert score.feasibility_errors == 3
+
+
 def test_progress_log_records_iteration_milestone_and_next_danger(tmp_path, monkeypatch) -> None:
     import csv
     import vrp_solver.solver.rolling_cg as rolling_cg

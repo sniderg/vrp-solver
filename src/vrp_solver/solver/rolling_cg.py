@@ -533,12 +533,27 @@ def robust_rolling_rescue(
             )
         )
     )
-    final_solution = (
-        clip_to_tank_capacity(instance, indexed_solution)
-        if config.final_clip_capacity
-        else indexed_solution
+    if not config.final_clip_capacity:
+        return indexed_solution, steps
+
+    clipped_solution = clip_to_tank_capacity(instance, indexed_solution)
+    indexed_score = score_prefix_with_feasibility_tail(
+        instance,
+        indexed_solution,
+        score_days=max(1, committed_day if config.committed_output_only else horizon_days),
+        feasibility_days=max(1, committed_day if config.committed_output_only else horizon_days),
     )
-    return final_solution, steps
+    clipped_score = score_prefix_with_feasibility_tail(
+        instance,
+        clipped_solution,
+        score_days=max(1, committed_day if config.committed_output_only else horizon_days),
+        feasibility_days=max(1, committed_day if config.committed_output_only else horizon_days),
+    )
+    return (
+        clipped_solution
+        if _score_key(clipped_score) <= _score_key(indexed_score)
+        else indexed_solution
+    ), steps
 
 
 class _ProgressLog:
@@ -773,6 +788,15 @@ def _accept_window(
     if scenario_failures > 0 and incumbent_score.feasible:
         return False, "rejected: scenario validation failed for feasible incumbent"
     return True, ""
+
+
+def _score_key(score: ContestScore) -> tuple[int, int, int, float]:
+    return (
+        0 if score.feasible else 1,
+        score.hard_violations,
+        score.feasibility_errors,
+        score.scored_estimated_cost,
+    )
 
 
 def _mode_sigmas(config: RollingCGConfig) -> tuple[float, float]:
