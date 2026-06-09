@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling", "hatch-cython"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "Cython>=3.0", "numpy>=1.20"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vrp_solver"
@@ -23,6 +23,9 @@ dependencies = [
     "lxml>=4.6",
     "scikit-learn>=1.0",
     "highspy>=1.5",
+    "matplotlib>=3.5",
+    "scipy>=1.8",
+    "alns>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -33,11 +36,6 @@ gurobi = [
 [project.scripts]
 vrp-solver = "vrp_solver.cli:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/vrp_solver"]
-
-[tool.hatch.build.targets.wheel.hooks.cython]
-dependencies = ["hatch-cython"]
-
-[tool.hatch.build.targets.wheel.hooks.cython.options]
-directives = { boundscheck = false, wraparound = false, language_level = "3" }
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["vrp_solver", "vrp_solver.solver"]

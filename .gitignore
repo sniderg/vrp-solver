@@ -7,6 +7,9 @@ __pycache__/
 *.dll
 *.pyc
 
+# Cython generated C files
+src/vrp_solver/inventory_fast.c
+
 # Build and Packaging
 build/
 dist/
@@ -20,9 +23,16 @@ eggs/
 venv/
 ENV/
 
+# Lock file (large, platform-specific)
+uv.lock
+
 # IDEs
 .idea/
 .vscode/
+
+# Testing
+.pytest_cache/
+roadef_2016_data
 
 # OS-specific
 .DS_Store
