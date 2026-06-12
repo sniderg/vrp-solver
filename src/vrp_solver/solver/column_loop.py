@@ -107,6 +107,16 @@ class ColumnLoopStep:
     prior_skeletons_regenerated: int = 0
     prior_rejected_pressure_cover: int = 0
     prior_rejected_route_summary: str = ""
+    pressure_customers: tuple[int, ...] = ()
+    generated_served_customers: int = 0
+    generated_pressure_coverage: int = 0
+    selected_pressure_coverage: int = 0
+    selected_feasibility_errors: int = 0
+    selected_hard_violations: int = 0
+    repaired_feasibility_errors: int = 0
+    repaired_hard_violations: int = 0
+    candidate_accepted: bool = False
+    best_improved: bool = False
 
 
 def get_vulnerabilities(
@@ -293,11 +303,13 @@ def column_generation_rescue(
         )
         candidate = repaired if _score_key(repaired_score) <= _score_key(selected_score) else selected
         candidate_score = repaired_score if candidate is repaired else selected_score
-        if _score_key(candidate_score) <= _score_key(current_score):
+        accepted = _score_key(candidate_score) <= _score_key(current_score)
+        if accepted:
             current = candidate
             current_score = candidate_score
         score = current_score
-        if _score_key(score) < _score_key(best_score):
+        improved_best = _score_key(score) < _score_key(best_score)
+        if improved_best:
             best_score = score
             best_solution = current
             no_improvement_streak = 0
@@ -342,6 +354,29 @@ def column_generation_rescue(
                 prior_skeletons_regenerated=prior_diagnostics.skeletons_regenerated,
                 prior_rejected_pressure_cover=prior_diagnostics.rejected_pressure_cover,
                 prior_rejected_route_summary=prior_diagnostics.rejected_route_summary,
+                pressure_customers=tuple(pressure_customers),
+                generated_served_customers=len(
+                    _served_customers_in_shifts(instance, generated)
+                ),
+                generated_pressure_coverage=len(
+                    set(pressure_customers)
+                    & _served_customers_in_shifts(instance, generated)
+                ),
+                selected_pressure_coverage=len(
+                    set(pressure_customers)
+                    & _served_customers_in_solution(
+                        instance,
+                        selected,
+                        start_minute=config.replace_from_day * MINUTES_PER_DAY,
+                        end_minute=config.end_day * MINUTES_PER_DAY,
+                    )
+                ),
+                selected_feasibility_errors=selected_score.feasibility_errors,
+                selected_hard_violations=selected_score.hard_violations,
+                repaired_feasibility_errors=repaired_score.feasibility_errors,
+                repaired_hard_violations=repaired_score.hard_violations,
+                candidate_accepted=accepted,
+                best_improved=improved_best,
             )
         )
         if score.feasible:
@@ -628,6 +663,32 @@ def _served_customers(instance: Instance, shift: Shift) -> tuple[int, ...]:
         for operation in shift.operations
         if operation.quantity > 0 and operation.point in instance.customer_by_point
     )
+
+
+def _served_customers_in_shifts(instance: Instance, shifts: list[Shift]) -> set[int]:
+    served: set[int] = set()
+    for shift in shifts:
+        served.update(_served_customers(instance, shift))
+    return served
+
+
+def _served_customers_in_solution(
+    instance: Instance,
+    solution: Solution,
+    *,
+    start_minute: int,
+    end_minute: int,
+) -> set[int]:
+    served: set[int] = set()
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            if (
+                start_minute <= operation.arrival < end_minute
+                and operation.quantity > 0
+                and operation.point in instance.customer_by_point
+            ):
+                served.add(operation.point)
+    return served
 
 
 def _score_key(score) -> tuple[int, int, int, float]:

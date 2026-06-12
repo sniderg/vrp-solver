@@ -68,6 +68,9 @@ uv run python scripts/compare_a_v1.py
 
 # Polish a Set A V1 benchmark solution without changing solver defaults
 uv run python scripts/improve_a_v1.py --instance V_1.11
+
+# Build a Set B V2 seed from scratch, separate from benchmark polishing
+uv run python scripts/build_b_v2.py --instance V2.12 --no-official
 ```
 
 ## Programmatic API
@@ -136,6 +139,7 @@ The scripts in `scripts/` are benchmark tooling, not default solver behavior:
 
 - `compare_a_v1.py` compares Set A V1 XML artifacts against `roadef_2016_data/hexaly_a_benchmarks.csv`.
 - `improve_a_v1.py` starts from an existing feasible XML seed and applies official-checker-gated polishing moves.
+- `build_b_v2.py` builds Set B V2 seeds from scratch, then optionally runs column-generation rescue with local and official-checker gating.
 - `notebooks/a_v1_benchmark_tutorial.ipynb` walks through comparison, polishing, and resume workflows.
 
 Keep historical V1 tuning separate from modern B/X or robust-rolling solver work because V1 uses different objective weights.
