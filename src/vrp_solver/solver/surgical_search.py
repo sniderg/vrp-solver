@@ -112,10 +112,17 @@ def surgical_search(
             }
             if (
                 structural_codes & {"DRI01", "TL01"}
-                and iteration % 2 == 1
+                and iteration % 4 == 1
             ):
                 operator_index = OPERATORS.index(
                     "relocate_within_shift",
+                )
+            elif (
+                structural_codes & {"DRI01", "TL01"}
+                and iteration % 4 == 3
+            ):
+                operator_index = OPERATORS.index(
+                    "relocate_between_shifts",
                 )
             else:
                 operator_index = OPERATORS.index("delete_operation")
@@ -202,6 +209,21 @@ def surgical_search(
             rng.shuffle(retimed)
             rng.shuffle(ordinary)
             candidates = retimed + ordinary
+        elif operator == "relocate_between_shifts":
+            reassigned = [
+                candidate
+                for candidate in candidates
+                if _same_route_points(current, candidate)
+            ]
+            reassigned_ids = {id(candidate) for candidate in reassigned}
+            ordinary = [
+                candidate
+                for candidate in candidates
+                if id(candidate) not in reassigned_ids
+            ]
+            rng.shuffle(reassigned)
+            rng.shuffle(ordinary)
+            candidates = reassigned + ordinary
         else:
             rng.shuffle(candidates)
         if progress:
@@ -791,7 +813,9 @@ def _swap_candidates(instance, solution, config, rng) -> list[Solution]:
 
 
 def _between_shift_candidates(instance, solution, config, rng) -> list[Solution]:
-    result = []
+    result = _resource_reassignment_candidates(
+        instance, solution, config,
+    )
     moves = [(a, o, b) for a, shift in enumerate(solution.shifts)
              for o in range(len(shift.operations)) for b in range(len(solution.shifts))
              if a != b and shift.trailer == solution.shifts[b].trailer]
@@ -814,6 +838,120 @@ def _between_shift_candidates(instance, solution, config, rng) -> list[Solution]
         shifts[b] = mutated_destination
         result.append(Solution(tuple(shifts)))
     return result
+
+
+def _resource_reassignment_candidates(
+    instance: Instance,
+    solution: Solution,
+    config: SurgicalSearchConfig,
+) -> list[Solution]:
+    """Recreate a conflicted route on an available compatible resource pair."""
+    derived = derive_solution(instance, solution)
+    targets = {
+        violation.shift
+        for violation in validate_solution(instance, solution)
+        if (
+            violation.severity == "error"
+            and violation.code in {"DRI01", "TL01"}
+            and violation.shift is not None
+        )
+    }
+    result: list[Solution] = []
+    per_target_cap = max(
+        4,
+        config.candidates_per_move * 2 // max(1, len(targets)),
+    )
+    for shift_position in sorted(targets):
+        shift = solution.shifts[shift_position]
+        added = 0
+        for driver in instance.drivers:
+            for trailer_id in driver.trailer_ids:
+                if (
+                    driver.index == shift.driver
+                    and trailer_id == shift.trailer
+                ):
+                    continue
+                if not _route_allows_trailer(
+                    instance, shift, trailer_id,
+                ):
+                    continue
+                reassigned = replace(
+                    shift,
+                    driver=driver.index,
+                    trailer=trailer_id,
+                )
+                reassigned = try_optimize_shift_times(
+                    instance, reassigned,
+                )
+                if reassigned is None:
+                    continue
+                trial_derived = derive_solution(
+                    instance,
+                    Solution((replace(reassigned, index=0),)),
+                )[0]
+                if _resource_overlap(
+                    instance,
+                    solution,
+                    derived,
+                    shift_position,
+                    reassigned,
+                    trial_derived.end,
+                ):
+                    continue
+                shifts = list(solution.shifts)
+                shifts[shift_position] = reassigned
+                result.append(normalize_source_loads(
+                    instance, _reindex(Solution(tuple(shifts))),
+                ))
+                added += 1
+                if added >= per_target_cap:
+                    break
+            if added >= per_target_cap:
+                break
+    return result
+
+
+def _route_allows_trailer(
+    instance: Instance,
+    shift: Shift,
+    trailer_id: int,
+) -> bool:
+    for operation in shift.operations:
+        customer = instance.customer_by_point.get(operation.point)
+        if customer is not None and trailer_id not in customer.allowed_trailers:
+            return False
+        source = instance.source_by_point.get(operation.point)
+        if source is not None and trailer_id not in source.allowed_trailers:
+            return False
+    return True
+
+
+def _resource_overlap(
+    instance: Instance,
+    solution: Solution,
+    derived,
+    replaced_position: int,
+    candidate: Shift,
+    candidate_end: int,
+) -> bool:
+    driver_gap = instance.drivers[
+        candidate.driver
+    ].min_inter_shift_duration
+    for position, other in enumerate(solution.shifts):
+        if position == replaced_position:
+            continue
+        other_end = derived[position].end
+        if other.driver == candidate.driver and (
+            candidate.start < other_end + driver_gap
+            and other.start < candidate_end + driver_gap
+        ):
+            return True
+        if other.trailer == candidate.trailer and (
+            candidate.start < other_end
+            and other.start < candidate_end
+        ):
+            return True
+    return False
 
 
 def _within_shift_candidates(instance, solution, config, rng) -> list[Solution]:
