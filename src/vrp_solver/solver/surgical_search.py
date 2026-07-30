@@ -110,7 +110,9 @@ def surgical_search(
                     and violation.code not in {"QS01", "QS02"}
                 )
             }
-            if (
+            if "SHI16" in structural_codes and iteration % 4 == 0:
+                operator_index = OPERATORS.index("insert_operation")
+            elif (
                 structural_codes & {"DRI01", "TL01"}
                 and iteration % 4 == 1
             ):
@@ -224,6 +226,23 @@ def surgical_search(
             rng.shuffle(reassigned)
             rng.shuffle(ordinary)
             candidates = reassigned + ordinary
+        elif operator == "insert_operation":
+            quantity_repairs = [
+                candidate
+                for candidate in candidates
+                if _same_route_points(current, candidate)
+            ]
+            quantity_ids = {
+                id(candidate) for candidate in quantity_repairs
+            }
+            ordinary = [
+                candidate
+                for candidate in candidates
+                if id(candidate) not in quantity_ids
+            ]
+            rng.shuffle(quantity_repairs)
+            rng.shuffle(ordinary)
+            candidates = quantity_repairs + ordinary
         else:
             rng.shuffle(candidates)
         if progress:
@@ -479,9 +498,10 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
 def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
     pressure = pressure_points(instance, solution, end_day=config.end_day)
     derived = derive_solution(instance, solution)
-    result = _call_in_insert_candidates(
+    result = _minimum_quantity_candidates(instance, solution)
+    result.extend(_call_in_insert_candidates(
         instance, solution, config, derived,
-    )
+    ))
     if len(result) >= config.candidates_per_move * 2:
         return result[: config.candidates_per_move * 2]
     for point in pressure[: config.pressure_customers]:
@@ -507,6 +527,45 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 result.append(Solution(tuple(shifts)))
                 if len(result) >= config.candidates_per_move * 2:
                     return result
+    return result
+
+
+def _minimum_quantity_candidates(
+    instance: Instance,
+    solution: Solution,
+) -> list[Solution]:
+    """Raise one subminimum delivery to the customer's legal floor."""
+    result: list[Solution] = []
+    seen: set[tuple[int, int]] = set()
+    for violation in validate_solution(instance, solution):
+        if (
+            violation.severity != "error"
+            or violation.code != "SHI16"
+            or violation.shift is None
+            or violation.operation is None
+        ):
+            continue
+        position = (violation.shift, violation.operation)
+        if position in seen:
+            continue
+        seen.add(position)
+        shift = solution.shifts[violation.shift]
+        operations = list(shift.operations)
+        operation = operations[violation.operation]
+        customer = instance.customer_by_point.get(operation.point)
+        if customer is None:
+            continue
+        operations[violation.operation] = replace(
+            operation,
+            quantity=customer.min_operation_quantity,
+        )
+        shifts = list(solution.shifts)
+        shifts[violation.shift] = replace(
+            shift, operations=tuple(operations),
+        )
+        result.append(normalize_source_loads(
+            instance, _reindex(Solution(tuple(shifts))),
+        ))
     return result
 
 
@@ -980,6 +1039,7 @@ def _resource_retime_candidates(
     solution: Solution,
 ) -> list[Solution]:
     """Shift a conflicted route to its first legal resource availability."""
+    reassigned = _repair_resource_assignments(instance, solution)
     derived = derive_solution(instance, solution)
     targets = {
         violation.shift
@@ -991,6 +1051,8 @@ def _resource_retime_candidates(
         )
     }
     result: list[Solution] = []
+    if reassigned is not None:
+        result.append(reassigned)
     for shift_position in sorted(targets):
         shift = solution.shifts[shift_position]
         required_start = shift.start
@@ -1034,6 +1096,178 @@ def _resource_retime_candidates(
         if propagated is not None:
             result.append(propagated)
     return result
+
+
+def _repair_resource_assignments(
+    instance: Instance,
+    solution: Solution,
+) -> Solution | None:
+    """Recover the resource-feasible construction state expected by the EXE.
+
+    The seven recovered neighborhoods never change a shift's driver/trailer
+    pair: Solver.exe stores shifts inside a resource-pair matrix populated by
+    its constructor.  A native constructed seed can violate that invariant.
+    Reassign the fixed route intervals as a binary interval-colouring model
+    before handing the plan to the recovered local-search portfolio.
+    """
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    from scipy.sparse import coo_matrix
+
+    derived = derive_solution(instance, solution)
+    options: list[tuple[int, int, int]] = []
+    by_shift: list[list[int]] = [[] for _ in solution.shifts]
+    by_shift_driver: dict[tuple[int, int], list[int]] = {}
+    by_shift_trailer: dict[tuple[int, int], list[int]] = {}
+    source_by_point = instance.source_by_point
+    customer_by_point = instance.customer_by_point
+
+    for position, (shift, derived_shift) in enumerate(
+        zip(solution.shifts, derived)
+    ):
+        for trailer in instance.trailers:
+            allowed = all(
+                (
+                    operation.point not in source_by_point
+                    or trailer.index
+                    in source_by_point[operation.point].allowed_trailers
+                )
+                and (
+                    operation.point not in customer_by_point
+                    or trailer.index
+                    in customer_by_point[operation.point].allowed_trailers
+                )
+                for operation in shift.operations
+            )
+            if not allowed:
+                continue
+            for driver in instance.drivers:
+                if trailer.index not in driver.trailer_ids:
+                    continue
+                if not any(
+                    window.start <= shift.start
+                    and derived_shift.end <= window.end
+                    for window in driver.time_windows
+                ):
+                    continue
+                variable = len(options)
+                options.append((position, driver.index, trailer.index))
+                by_shift[position].append(variable)
+                by_shift_driver.setdefault(
+                    (position, driver.index), [],
+                ).append(variable)
+                by_shift_trailer.setdefault(
+                    (position, trailer.index), [],
+                ).append(variable)
+        if not by_shift[position]:
+            return None
+
+    row_indices: list[int] = []
+    column_indices: list[int] = []
+    values: list[float] = []
+    lower: list[float] = []
+    upper: list[float] = []
+
+    def add_constraint(
+        variables: list[int],
+        low: float,
+        high: float,
+    ) -> None:
+        row = len(lower)
+        row_indices.extend([row] * len(variables))
+        column_indices.extend(variables)
+        values.extend([1.0] * len(variables))
+        lower.append(low)
+        upper.append(high)
+
+    for variables in by_shift:
+        add_constraint(variables, 1.0, 1.0)
+
+    for left in range(len(solution.shifts)):
+        left_shift = solution.shifts[left]
+        for right in range(left + 1, len(solution.shifts)):
+            right_shift = solution.shifts[right]
+            if (
+                left_shift.start,
+                left_shift.index,
+            ) <= (
+                right_shift.start,
+                right_shift.index,
+            ):
+                early, late = left, right
+            else:
+                early, late = right, left
+            for driver in instance.drivers:
+                if (
+                    solution.shifts[late].start
+                    < derived[early].end
+                    + driver.min_inter_shift_duration
+                ):
+                    variables = (
+                        by_shift_driver.get((left, driver.index), [])
+                        + by_shift_driver.get((right, driver.index), [])
+                    )
+                    if variables:
+                        add_constraint(variables, 0.0, 1.0)
+            if solution.shifts[late].start < derived[early].end:
+                for trailer in instance.trailers:
+                    variables = (
+                        by_shift_trailer.get((left, trailer.index), [])
+                        + by_shift_trailer.get((right, trailer.index), [])
+                    )
+                    if variables:
+                        add_constraint(variables, 0.0, 1.0)
+
+    matrix = coo_matrix(
+        (values, (row_indices, column_indices)),
+        shape=(len(lower), len(options)),
+    ).tocsr()
+    objective = np.array(
+        [
+            0.0
+            if (
+                driver == solution.shifts[position].driver
+                and trailer == solution.shifts[position].trailer
+            )
+            else 1.0
+            + (
+                0.0
+                if trailer == solution.shifts[position].trailer
+                else 0.25
+            )
+            for position, driver, trailer in options
+        ],
+        dtype=float,
+    )
+    result = milp(
+        objective,
+        integrality=np.ones(len(options)),
+        bounds=Bounds(0.0, 1.0),
+        constraints=LinearConstraint(
+            matrix, np.asarray(lower), np.asarray(upper),
+        ),
+        options={"time_limit": 30.0, "mip_rel_gap": 0.0},
+    )
+    if result.x is None:
+        return None
+
+    shifts = list(solution.shifts)
+    for position, variables in enumerate(by_shift):
+        selected = max(variables, key=lambda variable: result.x[variable])
+        _, driver, trailer = options[selected]
+        shifts[position] = replace(
+            shifts[position], driver=driver, trailer=trailer,
+        )
+    candidate = normalize_source_loads(
+        instance, _reindex(Solution(tuple(shifts))),
+    )
+    if any(
+        violation.severity == "error"
+        and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
+        for violation in validate_solution(instance, candidate)
+    ):
+        return None
+    return candidate
 
 
 def _propagate_resource_retimes(
