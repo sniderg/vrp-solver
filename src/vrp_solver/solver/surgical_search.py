@@ -116,9 +116,23 @@ def surgical_search(
         perturbation = min(64, 8 * stagnation)
         candidates = _candidates(instance, current, operator, config, rng)
         # The EXE perturbs enumeration after stagnation. Sampling a seeded
-        # permutation gives the capped native scorer the same expanding
-        # coverage instead of repeatedly testing the first candidate block.
-        rng.shuffle(candidates)
+        # permutation gives the capped native scorer expanding coverage. Keep
+        # every compound delete endpoint inside the cap, though: these are the
+        # scored equivalents of a neutral multi-step delete bridge.
+        if operator == "delete_operation":
+            compound = [
+                candidate for candidate in candidates
+                if len(candidate.shifts) < len(current.shifts)
+            ]
+            ordinary = [
+                candidate for candidate in candidates
+                if len(candidate.shifts) >= len(current.shifts)
+            ]
+            rng.shuffle(compound)
+            rng.shuffle(ordinary)
+            candidates = compound + ordinary
+        else:
+            rng.shuffle(candidates)
         if progress:
             progress(
                 f"surgical_generated,{iteration},operator,{operator},"
