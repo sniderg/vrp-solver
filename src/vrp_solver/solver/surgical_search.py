@@ -263,6 +263,41 @@ def surgical_search(
                             f"errors,{candidate_score.feasibility_errors},"
                             f"deficit,{candidate_score.safety_kg_min:.3f}"
                         )
+        elif operator == "relocate_within_shift" and structural_errors:
+            error_allowance = perturbation // 8
+            structurally_safe = [
+                (candidate, candidate_score)
+                for candidate, candidate_score in scored
+                if (
+                    candidate_score.hard_violations
+                    <= current_score.hard_violations
+                    and candidate_score.feasibility_errors
+                    <= current_score.feasibility_errors + error_allowance
+                )
+            ]
+            if structurally_safe:
+                ranked = [
+                    (
+                        _structural_shift_errors(instance, candidate),
+                        _key(candidate_score),
+                        candidate,
+                        candidate_score,
+                    )
+                    for candidate, candidate_score in structurally_safe
+                ]
+                structural, _, candidate, candidate_score = min(
+                    ranked, key=lambda item: (item[0], item[1]),
+                )
+                if structural < structural_errors:
+                    move_candidate, move_score = candidate, candidate_score
+                    move_structural = structural
+                    if progress:
+                        progress(
+                            f"surgical_structural_candidate,{iteration},"
+                            f"structural,{structural},"
+                            f"errors,{candidate_score.feasibility_errors},"
+                            f"deficit,{candidate_score.safety_kg_min:.3f}"
+                        )
 
         # Solver.exe's insert primitive can invoke the global quantity and
         # inventory MIP after its local timing MIP. Do the same once for each
