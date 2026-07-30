@@ -11,12 +11,13 @@ from typing import Callable
 from ..contest import ContestScore, score_prefix_with_feasibility_tail
 from ..highs_time_opt import optimize_shift_times
 from ..model import Instance, Operation, Shift, Solution
-from ..rules import derive_solution
+from ..rules import derive_solution, validate_solution
 from .pressure import pressure_points
 from .targeted_rescue import (
     RescueConfig,
     generate_chain_rescue_candidates,
     generate_rescue_candidates,
+    normalize_source_loads,
 )
 
 
@@ -202,8 +203,15 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
     )
     shifts = generate_rescue_candidates(instance, solution, pressure, config=rescue)
     shifts += generate_chain_rescue_candidates(instance, solution, pressure, config=rescue)
-    return [_reindex(Solution((*solution.shifts, replace(shift, index=len(solution.shifts)))))
-            for shift in shifts]
+    result = [
+        _reindex(Solution((*solution.shifts, replace(shift, index=len(solution.shifts)))))
+        for shift in shifts
+    ]
+    # Pressure points deliberately exclude call-in customers, but the EXE's
+    # create-shift operator enumerates every admissible customer point. Include
+    # focused call-in columns so QS01 orders are not an unreachable state.
+    result.extend(_call_in_shift_candidates(instance, solution, config))
+    return result
 
 
 def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
@@ -234,9 +242,24 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
 
 def _delete_operation_candidates(instance, solution, config, rng) -> list[Solution]:
     result = []
-    positions = [(s, o) for s, shift in enumerate(solution.shifts)
-                 for o in range(len(shift.operations))]
-    rng.shuffle(positions)
+    positions = [
+        (s, o)
+        for s, shift in enumerate(solution.shifts)
+        for o in range(len(shift.operations))
+    ]
+    # The binary enumerates the existing operation vectors in their current
+    # plan context. Put operations from locally invalid shifts first; otherwise
+    # uniform capping can spend whole rounds deleting already-valid work.
+    invalid_shifts = {
+        violation.shift
+        for violation in validate_solution(instance, solution)
+        if violation.severity == "error" and violation.shift is not None
+    }
+    priority = [position for position in positions if position[0] in invalid_shifts]
+    remainder = [position for position in positions if position[0] not in invalid_shifts]
+    rng.shuffle(priority)
+    rng.shuffle(remainder)
+    positions = priority + remainder
     for s, o in positions[: config.candidates_per_move * 2]:
         shift = solution.shifts[s]
         operations = list(shift.operations)
@@ -248,6 +271,120 @@ def _delete_operation_candidates(instance, solution, config, rng) -> list[Soluti
             shifts.pop(s)
         result.append(_reindex(Solution(tuple(shifts))))
     return result
+
+
+def _call_in_shift_candidates(instance, solution, config) -> list[Solution]:
+    """Construct single-order shifts for currently unsatisfied call-ins."""
+    result: list[Solution] = []
+    seen: set[tuple[object, ...]] = set()
+    cutoff = config.end_day * 1440
+    for point, order_index, remaining in _unsatisfied_call_ins(instance, solution, cutoff):
+        customer = instance.customer_by_point[point]
+        order = customer.orders[order_index]
+        quantity = min(
+            customer.capacity,
+            max(remaining, customer.min_operation_quantity),
+        )
+        for driver in instance.drivers:
+            for trailer_id in driver.trailer_ids:
+                if trailer_id not in customer.allowed_trailers:
+                    continue
+                trailer = instance.trailers[trailer_id]
+                if quantity > trailer.capacity + 1e-6:
+                    continue
+                for source in instance.sources:
+                    if trailer_id not in source.allowed_trailers:
+                        continue
+                    lead = (
+                        instance.time_matrix[instance.base_index][source.index]
+                        + source.setup_time
+                        + instance.time_matrix[source.index][point]
+                    )
+                    return_time = instance.time_matrix[point][instance.base_index]
+                    for customer_window in customer.time_windows:
+                        earliest = max(order.earliest_time, customer_window.start)
+                        latest = min(
+                            order.latest_time - customer.setup_time,
+                            customer_window.end - customer.setup_time,
+                            cutoff - 1,
+                        )
+                        if earliest > latest:
+                            continue
+                        arrivals = _even_samples(
+                            earliest, latest, config.samples_per_customer,
+                        )
+                        for arrival in arrivals:
+                            start = arrival - lead
+                            end = arrival + customer.setup_time + return_time
+                            if not any(
+                                window.start <= start and end <= window.end
+                                for window in driver.time_windows
+                            ):
+                                continue
+                            source_arrival = (
+                                start
+                                + instance.time_matrix[instance.base_index][source.index]
+                            )
+                            shift = Shift(
+                                index=len(solution.shifts),
+                                driver=driver.index,
+                                trailer=trailer_id,
+                                start=start,
+                                operations=(
+                                    Operation(source.index, source_arrival, -quantity),
+                                    Operation(point, arrival, quantity),
+                                ),
+                            )
+                            signature = (
+                                shift.driver, shift.trailer, shift.start,
+                                tuple((op.point, op.arrival) for op in shift.operations),
+                            )
+                            if signature in seen:
+                                continue
+                            seen.add(signature)
+                            candidate = _reindex(
+                                Solution((*solution.shifts, shift))
+                            )
+                            result.append(
+                                normalize_source_loads(instance, candidate)
+                            )
+    return result
+
+
+def _unsatisfied_call_ins(instance, solution, cutoff):
+    delivered: dict[tuple[int, int], float] = {}
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            customer = instance.customer_by_point.get(operation.point)
+            if customer is None or not customer.call_in:
+                continue
+            for order_index, order in enumerate(customer.orders):
+                if order.earliest_time <= operation.arrival <= order.latest_time:
+                    key = (customer.index, order_index)
+                    delivered[key] = delivered.get(key, 0.0) + operation.quantity
+    missing = []
+    for customer in instance.customers:
+        if not customer.call_in:
+            continue
+        for order_index, order in enumerate(customer.orders):
+            if order.latest_time > cutoff:
+                continue
+            remaining = (
+                order.min_quantity_to_satisfy
+                - delivered.get((customer.index, order_index), 0.0)
+            )
+            if remaining > 1e-6:
+                missing.append((customer.index, order_index, remaining))
+    return missing
+
+
+def _even_samples(start: int, end: int, count: int) -> tuple[int, ...]:
+    if count <= 1 or start == end:
+        return (end,)
+    return tuple(sorted({
+        start + round((end - start) * index / (count - 1))
+        for index in range(count)
+    }))
 
 
 def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]:
