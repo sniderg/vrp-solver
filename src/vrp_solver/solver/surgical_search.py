@@ -95,13 +95,30 @@ def surgical_search(
         structural_errors = _structural_shift_errors(instance, current)
         # Match the EXE's recency-aware adaptive portfolio once a valid plan
         # exists. The original starts from a feasible construction; our
-        # constructed seed does not, so first run the recovered deletion
-        # primitive until the seven-move portfolio has a structurally valid
-        # state from which to operate.
+        # constructed seed does not, so first combine the recovered deletion
+        # primitive with resource-preserving retiming until the portfolio has
+        # a structurally valid state from which to operate.
         if iteration == 0 and config.first_operator in OPERATORS:
             operator_index = OPERATORS.index(config.first_operator)
         elif structural_errors:
-            operator_index = OPERATORS.index("delete_operation")
+            structural_codes = {
+                violation.code
+                for violation in validate_solution(instance, current)
+                if (
+                    violation.severity == "error"
+                    and violation.shift is not None
+                    and violation.code not in {"QS01", "QS02"}
+                )
+            }
+            if (
+                structural_codes & {"DRI01", "TL01"}
+                and iteration % 2 == 1
+            ):
+                operator_index = OPERATORS.index(
+                    "relocate_within_shift",
+                )
+            else:
+                operator_index = OPERATORS.index("delete_operation")
         else:
             operator_index = _select_operator(
                 rewards, attempts, last_used, iteration, rng,
