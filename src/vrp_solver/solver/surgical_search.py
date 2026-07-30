@@ -1135,7 +1135,9 @@ def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]
             if mutated is None:
                 continue
             shifts[s] = mutated
-            result.append(Solution(tuple(shifts)))
+            result.append(normalize_source_loads(
+                instance, _reindex(Solution(tuple(shifts))),
+            ))
             if len(result) >= config.candidates_per_move * 2:
                 return result
     return result
