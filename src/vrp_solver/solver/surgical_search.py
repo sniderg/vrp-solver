@@ -270,15 +270,23 @@ def surgical_search(
         previous_feasibility = _feasibility_key(best_score)
         accepted = False
         if move_candidate is not None and move_score is not None:
-            accepted = (
+            candidate_structural = _structural_shift_errors(
+                instance, move_candidate,
+            )
+            structural_gateway = (
                 move_structural is not None
                 and move_structural < structural_errors
                 and move_score.hard_violations <= current_score.hard_violations
                 and move_score.feasibility_errors
                 <= current_score.feasibility_errors + perturbation // 8
-            ) or _accept_move(
-                current_score, move_score, perturbation, rng,
             )
+            ordinary_gateway = (
+                candidate_structural <= structural_errors
+                and _accept_move(
+                    current_score, move_score, perturbation, rng,
+                )
+            )
+            accepted = structural_gateway or ordinary_gateway
         if accepted:
             current, current_score = move_candidate, move_score
         improved_best = _key(current_score) < _key(best_score)
