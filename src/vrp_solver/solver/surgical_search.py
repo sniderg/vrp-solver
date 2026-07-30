@@ -888,10 +888,83 @@ def _resource_retime_candidates(
             continue
         shifts = list(solution.shifts)
         shifts[shift_position] = shifted
-        result.append(normalize_source_loads(
+        candidate = normalize_source_loads(
             instance, _reindex(Solution(tuple(shifts))),
-        ))
+        )
+        result.append(candidate)
+        propagated = _propagate_resource_retimes(instance, candidate)
+        if propagated is not None:
+            result.append(propagated)
     return result
+
+
+def _propagate_resource_retimes(
+    instance: Instance,
+    solution: Solution,
+) -> Solution | None:
+    """Push a resource-conflict repair through its successor shifts."""
+    shifts = list(solution.shifts)
+    for _ in range(max(1, len(shifts) * 2)):
+        derived = derive_solution(instance, Solution(tuple(shifts)))
+        ordered = sorted(
+            range(len(shifts)),
+            key=lambda position: (
+                shifts[position].start,
+                shifts[position].index,
+            ),
+        )
+        changed = False
+        for rank, position in enumerate(ordered):
+            shift = shifts[position]
+            required_start = shift.start
+            for previous_position in ordered[:rank]:
+                previous = shifts[previous_position]
+                if previous.driver == shift.driver:
+                    required_start = max(
+                        required_start,
+                        derived[previous_position].end
+                        + instance.drivers[
+                            shift.driver
+                        ].min_inter_shift_duration,
+                    )
+                if previous.trailer == shift.trailer:
+                    required_start = max(
+                        required_start,
+                        derived[previous_position].end,
+                    )
+            if required_start <= shift.start:
+                continue
+            delta = required_start - shift.start
+            shifted = replace(
+                shift,
+                start=required_start,
+                operations=tuple(
+                    replace(
+                        operation,
+                        arrival=operation.arrival + delta,
+                    )
+                    for operation in shift.operations
+                ),
+            )
+            shifted = try_optimize_shift_times(instance, shifted)
+            if shifted is None:
+                return None
+            shifts[position] = shifted
+            changed = True
+            break
+        if changed:
+            continue
+        candidate = normalize_source_loads(
+            instance, _reindex(Solution(tuple(shifts))),
+        )
+        if not any(
+            violation.severity == "error"
+            and violation.code in {"DRI01", "TL01"}
+            for violation in validate_solution(instance, candidate)
+        ):
+            return candidate
+        return None
+    return None
 
 
 def _same_route_points(left: Solution, right: Solution) -> bool:
