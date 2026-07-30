@@ -4,7 +4,7 @@ import logging
 from dataclasses import replace
 import numpy as np
 
-from .model import Instance, Solution, Shift
+from .model import Instance, Solution, Shift, TimeWindow
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,12 @@ def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
     n = len(shift.operations)
     if n == 0:
         return shift
+    operation_windows = [
+        _feasible_operation_windows(instance, operation)
+        for operation in shift.operations
+    ]
+    if any(not windows for windows in operation_windows):
+        return None
         
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", False)
@@ -35,13 +41,7 @@ def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
     y_cols = {}
     col_count = 2 * n
     
-    for i, op in enumerate(shift.operations):
-        if op.point in instance.customer_by_point:
-            windows = instance.customer_by_point[op.point].time_windows
-        else:
-            from .model import TimeWindow
-            windows = [TimeWindow(start=0, end=instance.horizon * instance.unit)]
-            
+    for i, windows in enumerate(operation_windows):
         for w in range(len(windows)):
             y_cols[(i, w)] = col_count
             col_count += 1
@@ -56,13 +56,7 @@ def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
         highs.addCol(1.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
         
     # y_{i, w}: obj = 0.0, bounds = [0, 1], integer
-    for i, op in enumerate(shift.operations):
-        if op.point in instance.customer_by_point:
-            windows = instance.customer_by_point[op.point].time_windows
-        else:
-            from .model import TimeWindow
-            windows = [TimeWindow(start=0, end=instance.horizon * instance.unit)]
-            
+    for i, windows in enumerate(operation_windows):
         for w in range(len(windows)):
             y_idx = y_cols[(i, w)]
             highs.addCol(0.0, 0.0, 1.0, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
@@ -82,11 +76,7 @@ def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
     M = 30000.0
     for i, op in enumerate(shift.operations):
         setup = instance.setup_time_for_point(op.point)
-        if op.point in instance.customer_by_point:
-            windows = instance.customer_by_point[op.point].time_windows
-        else:
-            from .model import TimeWindow
-            windows = [TimeWindow(start=0, end=instance.horizon * instance.unit)]
+        windows = operation_windows[i]
             
         y_indices = [y_cols[(i, w)] for w in range(len(windows))]
         highs.addRow(1.0, 1.0, len(y_indices), np.array(y_indices, dtype=np.int32), np.array([1.0]*len(y_indices), dtype=np.float64))
@@ -147,3 +137,37 @@ def optimize_solution_times(instance: Instance, solution: Solution) -> Solution:
     for shift in solution.shifts:
         new_shifts.append(optimize_shift_times(instance, shift))
     return Solution(shifts=tuple(new_shifts))
+
+
+def _feasible_operation_windows(
+    instance: Instance,
+    operation,
+) -> tuple[TimeWindow, ...]:
+    customer = instance.customer_by_point.get(operation.point)
+    if customer is None:
+        return (
+            TimeWindow(
+                start=0,
+                end=instance.horizon * instance.unit,
+            ),
+        )
+    if not customer.call_in or not customer.orders:
+        return tuple(customer.time_windows)
+    # The service-quality checker assigns a call-in delivery to an order when
+    # its arrival lies in that order's interval. Intersect those intervals
+    # with the physical customer windows so retiming cannot silently turn a
+    # satisfied order back into QS01.
+    setup = instance.setup_time_for_point(operation.point)
+    intersections = {
+        (
+            max(window.start, order.earliest_time),
+            min(window.end, order.latest_time + setup),
+        )
+        for window in customer.time_windows
+        for order in customer.orders
+    }
+    return tuple(
+        TimeWindow(start=start, end=end)
+        for start, end in sorted(intersections)
+        if start + setup <= end
+    )
