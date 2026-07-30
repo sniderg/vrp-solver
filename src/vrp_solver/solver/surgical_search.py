@@ -709,7 +709,11 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
         instance, solution, config, derived,
     ))
     if len(result) >= config.candidates_per_move * 2:
-        return result[: config.candidates_per_move * 2]
+        return _repair_mutation_resource_conflicts(
+            instance,
+            result[: config.candidates_per_move * 2],
+            config.candidates_per_move * 2,
+        )
     for point in pressure[: config.pressure_customers]:
         customer = instance.customer_by_point[point.customer]
         for shift_pos, shift in enumerate(solution.shifts):
@@ -724,7 +728,11 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 anchor = operations[op_pos - 1]
                 operations.insert(op_pos, Operation(customer.index, anchor.arrival, quantity))
                 mutated = try_optimize_shift_times(
-                    instance, replace(shift, operations=tuple(operations)),
+                    instance,
+                    replace(shift, operations=tuple(operations)),
+                    latest_end=_resource_slot_end(
+                        instance, solution, derived, shift_pos,
+                    ),
                 )
                 if mutated is None:
                     continue
@@ -732,7 +740,83 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 shifts[shift_pos] = mutated
                 result.append(Solution(tuple(shifts)))
                 if len(result) >= config.candidates_per_move * 2:
-                    return result
+                    return _repair_mutation_resource_conflicts(
+                        instance,
+                        result,
+                        config.candidates_per_move * 2,
+                    )
+    return _repair_mutation_resource_conflicts(
+        instance,
+        result,
+        config.candidates_per_move * 2,
+    )
+
+
+def _resource_slot_end(
+    instance: Instance,
+    solution: Solution,
+    derived,
+    position: int,
+) -> int:
+    """Latest legal return before this route's next resource commitment."""
+    shift = solution.shifts[position]
+    driver = instance.drivers[shift.driver]
+    latest = max(
+        (
+            window.end
+            for window in driver.time_windows
+            if window.start <= shift.start <= window.end
+        ),
+        default=instance.latest_time,
+    )
+    for other_position, other in enumerate(solution.shifts):
+        if (
+            other_position == position
+            or other.start < derived[position].end
+        ):
+            continue
+        if other.driver == shift.driver:
+            latest = min(
+                latest,
+                other.start - driver.min_inter_shift_duration,
+            )
+        if other.trailer == shift.trailer:
+            latest = min(latest, other.start)
+    return latest
+
+
+def _repair_mutation_resource_conflicts(
+    instance: Instance,
+    candidates: list[Solution],
+    cap: int,
+) -> list[Solution]:
+    """Commit an insertion only after its affected resource chain is legal."""
+    result: list[Solution] = []
+    for candidate in candidates:
+        violations = [
+            violation
+            for violation in validate_solution(instance, candidate)
+            if (
+                violation.severity == "error"
+                and violation.code not in {"QS01", "QS02"}
+            )
+        ]
+        if not violations:
+            result.append(candidate)
+        elif all(
+            violation.code in {"DRI01", "TL01"}
+            for violation in violations
+        ):
+            repaired = _propagate_resource_retimes(
+                instance, candidate,
+            )
+            if (
+                repaired is not None
+                and _structural_shift_errors(instance, repaired) == 0
+            ):
+                result.append(repaired)
+        if len(result) >= cap:
+            break
     return result
 
 

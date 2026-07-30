@@ -8,7 +8,12 @@ from .model import Instance, Solution, Shift, TimeWindow
 
 logger = logging.getLogger(__name__)
 
-def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
+def try_optimize_shift_times(
+    instance: Instance,
+    shift: Shift,
+    *,
+    latest_end: int | None = None,
+) -> Shift | None:
     """Return a retimed shift, or ``None`` when its timing MIP is infeasible.
 
     This mirrors Solver.exe's affected-shift callback: a structural mutation is
@@ -111,6 +116,21 @@ def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
             highs.addRow(-inf, driver.layover_duration + travel + prev_setup - 1, 2, np.array([a_idx, prev_idx], dtype=np.int32), np.array([1.0, -1.0], dtype=np.float64))
             
         last_point = op.point
+
+    if latest_end is not None:
+        last_setup = instance.setup_time_for_point(
+            shift.operations[-1].point,
+        )
+        return_time = instance.time_matrix[
+            shift.operations[-1].point
+        ][instance.base_index]
+        highs.addRow(
+            -inf,
+            latest_end - last_setup - return_time,
+            1,
+            np.array([n - 1], dtype=np.int32),
+            np.array([1.0], dtype=np.float64),
+        )
         
     highs.run()
     
