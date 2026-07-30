@@ -78,7 +78,9 @@ def surgical_search(
         else time.monotonic() + config.time_limit_seconds
     )
     current = _reindex(initial)
-    score = _score(instance, current, config.end_day)
+    current_score = _score(instance, current, config.end_day)
+    best = current
+    best_score = current_score
     rewards = [1.0] * 7
     attempts = [0] * 7
     last_used = [-10_000] * 7
@@ -100,14 +102,15 @@ def surgical_search(
         else:
             operator_index = _select_operator(
                 rewards, attempts, last_used, iteration, rng,
-                feasibility_bias=not score.feasible,
+                feasibility_bias=not best_score.feasible,
             )
         operator = OPERATORS[operator_index]
         if progress:
             progress(
                 f"surgical_start,{iteration},operator,{operator},"
-                f"errors,{score.feasibility_errors},"
-                f"deficit,{score.safety_kg_min:.3f},"
+                f"errors,{current_score.feasibility_errors},"
+                f"best_errors,{best_score.feasibility_errors},"
+                f"deficit,{current_score.safety_kg_min:.3f},"
                 f"structural,{structural_errors}"
             )
         candidates = _candidates(instance, current, operator, config, rng)
@@ -120,8 +123,8 @@ def surgical_search(
                 f"surgical_generated,{iteration},operator,{operator},"
                 f"candidates,{len(candidates)}"
             )
-        best_candidate = current
-        best_score = score
+        move_candidate = None
+        move_score = None
         evaluated = 0
         limited_candidates = candidates[: config.candidates_per_move]
         scored = _score_candidates(
@@ -129,47 +132,62 @@ def surgical_search(
         )
         for candidate, candidate_score in scored:
             evaluated += 1
-            if _key(candidate_score) < _key(best_score):
-                best_candidate, best_score = candidate, candidate_score
+            if move_score is None or _key(candidate_score) < _key(move_score):
+                move_candidate, move_score = candidate, candidate_score
                 if progress:
                     progress(
                         f"surgical_candidate,{iteration},operator,{operator},evaluated,{evaluated},"
-                        f"errors,{best_score.feasibility_errors},hard,{best_score.hard_violations},"
-                        f"deficit,{best_score.safety_kg_min:.3f}"
+                        f"errors,{move_score.feasibility_errors},hard,{move_score.hard_violations},"
+                        f"deficit,{move_score.safety_kg_min:.3f}"
                     )
 
-        accepted = _key(best_score) < _key(score)
-        previous_scalar = _scalar(score)
+        previous_scalar = _scalar(best_score)
+        perturbation = min(64, 8 * stagnation)
+        accepted = False
+        if move_candidate is not None and move_score is not None:
+            accepted = _accept_move(
+                current_score, move_score, perturbation, rng,
+            )
         if accepted:
-            current, score = best_candidate, best_score
+            current, current_score = move_candidate, move_score
+        improved_best = _key(current_score) < _key(best_score)
+        if improved_best:
+            best, best_score = current, current_score
             stagnation = 0
-            gain = max(0.0, previous_scalar - _scalar(score))
+            gain = max(0.0, previous_scalar - _scalar(best_score))
             rewards[operator_index] = 0.5 * rewards[operator_index] + 0.5 * min(3584.0, 1.0 + gain)
             if config.output_xml:
-                save_solution(current, config.output_xml)
+                save_solution(best, config.output_xml)
         else:
             stagnation += 1
             rewards[operator_index] *= 0.5
+            # The recovered controller restores the stored incumbent on one
+            # draw in four. Otherwise it keeps walking from the perturbed plan,
+            # which permits multi-step repairs across a neutral/worse bridge.
+            if accepted and rng.randrange(4) == 0:
+                current, current_score = best, best_score
         attempts[operator_index] += 1
         last_used[operator_index] = iteration
 
         step = SurgicalStep(
             iteration, operator, evaluated, accepted,
-            score.feasibility_errors, score.hard_violations,
-            score.safety_kg_min, score.scored_estimated_cost,
-            _logistic_ratio(score),
+            best_score.feasibility_errors, best_score.hard_violations,
+            best_score.safety_kg_min, best_score.scored_estimated_cost,
+            _logistic_ratio(best_score),
         )
         steps.append(step)
         if progress:
             progress(
                 f"surgical_step,{iteration},operator,{operator},evaluated,{evaluated},"
-                f"accepted,{accepted},errors,{step.errors},hard,{step.hard},"
+                f"accepted,{accepted},new_best,{improved_best},"
+                f"current_errors,{current_score.feasibility_errors},"
+                f"errors,{step.errors},hard,{step.hard},"
                 f"deficit,{step.safety_kg_min:.3f},cost,{step.cost:.3f},"
                 f"lr,{step.logistic_ratio:.10f}"
             )
-        if score.feasible or stagnation >= config.no_improvement_limit:
+        if best_score.feasible or stagnation >= config.no_improvement_limit:
             break
-    return current, tuple(steps)
+    return best, tuple(steps)
 
 
 def _candidates(
@@ -519,6 +537,29 @@ def _score_candidates(instance, candidates, end_day, workers):
         indexed_scores = list(pool.imap_unordered(_score_candidate_index, range(len(candidates)), chunksize=1))
     indexed_scores.sort(key=lambda item: item[0])
     return [(candidates[index], score) for index, score in indexed_scores]
+
+
+def _accept_move(
+    current: ContestScore,
+    candidate: ContestScore,
+    perturbation: int,
+    rng: random.Random,
+) -> bool:
+    if _key(candidate) < _key(current):
+        return True
+    if perturbation <= 0:
+        return False
+    if candidate.hard_violations > current.hard_violations:
+        return False
+    error_allowance = max(1, perturbation // 8)
+    if candidate.feasibility_errors > current.feasibility_errors + error_allowance:
+        return False
+    deficit_allowance = perturbation * 50_000.0
+    if candidate.safety_kg_min > current.safety_kg_min + deficit_allowance:
+        return False
+    # Keep a small stochastic refusal separate from the controller's verified
+    # one-in-four incumbent restore draw.
+    return rng.random() >= 0.05
 
 
 def _key(score: ContestScore):
