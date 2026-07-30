@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 from ..contest import ContestScore, score_prefix_with_feasibility_tail
+from ..highs_repair import repair_quantities_with_highs
 from ..highs_time_opt import try_optimize_shift_times
 from ..model import Instance, Operation, Shift, Solution
 from ..rules import derive_solution, validate_solution
@@ -86,6 +87,7 @@ def surgical_search(
     last_used = [-10_000] * 7
     stagnation = 0
     steps: list[SurgicalStep] = []
+    quantity_repaired_structures: set[tuple[object, ...]] = set()
 
     for iteration in range(config.iterations):
         if deadline is not None and time.monotonic() >= deadline:
@@ -227,6 +229,41 @@ def surgical_search(
                             f"structural,{structural},"
                             f"errors,{candidate_score.feasibility_errors},"
                             f"deficit,{candidate_score.safety_kg_min:.3f}"
+                        )
+
+        # Solver.exe's insert primitive can invoke the global quantity and
+        # inventory MIP after its local timing MIP. Do the same once for each
+        # structurally valid route skeleton. While reconstructing from an
+        # infeasible seed, retain the raw candidate if the continuation model
+        # is infeasible; once feasible, this becomes the EXE's commit gateway.
+        if (
+            move_candidate is not None
+            and move_score is not None
+            and operator in {"create_shift", "insert_operation"}
+            and _structural_shift_errors(instance, move_candidate) == 0
+        ):
+            structure = _structure_signature(move_candidate)
+            if structure not in quantity_repaired_structures:
+                quantity_repaired_structures.add(structure)
+                repaired, report = repair_quantities_with_highs(
+                    instance,
+                    move_candidate,
+                    score_days=config.end_day,
+                    feasibility_days=config.end_day,
+                    ignore_tail_call_ins=True,
+                    quantity_objective="max-delivered",
+                )
+                repaired_score = _score(
+                    instance, repaired, config.end_day,
+                )
+                if _key(repaired_score) < _key(move_score):
+                    move_candidate, move_score = repaired, repaired_score
+                    if progress:
+                        progress(
+                            f"surgical_quantity_repair,{iteration},"
+                            f"status,{report.status},"
+                            f"errors,{repaired_score.feasibility_errors},"
+                            f"deficit,{repaired_score.safety_kg_min:.3f}"
                         )
 
         previous_scalar = _scalar(best_score)
@@ -833,6 +870,21 @@ def _logistic_ratio(score: ContestScore) -> float:
 
 def _reindex(solution: Solution) -> Solution:
     return Solution(tuple(replace(shift, index=i) for i, shift in enumerate(solution.shifts)))
+
+
+def _structure_signature(solution: Solution) -> tuple[object, ...]:
+    return tuple(
+        (
+            shift.driver,
+            shift.trailer,
+            shift.start,
+            tuple(
+                (operation.point, operation.arrival)
+                for operation in shift.operations
+            ),
+        )
+        for shift in solution.shifts
+    )
 
 
 def _structural_shift_errors(instance: Instance, solution: Solution) -> int:
