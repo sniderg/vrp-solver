@@ -279,6 +279,16 @@ def _delete_operation_candidates(instance, solution, config, rng) -> list[Soluti
         for violation in validate_solution(instance, solution)
         if violation.severity == "error" and violation.shift is not None
     }
+    # A full-shift removal is the exact end state of repeatedly applying the
+    # recovered delete-operation primitive. Emit that compound candidate when
+    # perturbation is cleaning an invalid route so the search does not require
+    # every neutral intermediate deletion to survive incumbent restoration.
+    for shift_position in sorted(invalid_shifts):
+        shifts = list(solution.shifts)
+        shifts.pop(shift_position)
+        result.append(normalize_source_loads(
+            instance, _reindex(Solution(tuple(shifts))),
+        ))
     priority = [position for position in positions if position[0] in invalid_shifts]
     remainder = [position for position in positions if position[0] not in invalid_shifts]
     rng.shuffle(priority)
