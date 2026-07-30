@@ -8,7 +8,12 @@ from .model import Instance, Solution, Shift
 
 logger = logging.getLogger(__name__)
 
-def optimize_shift_times(instance: Instance, shift: Shift) -> Shift:
+def try_optimize_shift_times(instance: Instance, shift: Shift) -> Shift | None:
+    """Return a retimed shift, or ``None`` when its timing MIP is infeasible.
+
+    This mirrors Solver.exe's affected-shift callback: a structural mutation is
+    committed only when the timing model can produce a schedule.
+    """
     try:
         import highspy
     except ModuleNotFoundError as exc:
@@ -129,7 +134,13 @@ def optimize_shift_times(instance: Instance, shift: Shift) -> Shift:
         return replace(shift, operations=tuple(new_ops))
     else:
         logger.warning("Shift %d time optimization failed with status %s", shift.index, status)
-        return shift
+        return None
+
+
+def optimize_shift_times(instance: Instance, shift: Shift) -> Shift:
+    """Best-effort compatibility wrapper used by non-transactional callers."""
+    optimized = try_optimize_shift_times(instance, shift)
+    return shift if optimized is None else optimized
 
 def optimize_solution_times(instance: Instance, solution: Solution) -> Solution:
     new_shifts = []

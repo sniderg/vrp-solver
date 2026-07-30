@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 from ..contest import ContestScore, score_prefix_with_feasibility_tail
-from ..highs_time_opt import optimize_shift_times
+from ..highs_time_opt import try_optimize_shift_times
 from ..model import Instance, Operation, Shift, Solution
 from ..rules import derive_solution, validate_solution
 from .pressure import pressure_points
@@ -358,7 +358,11 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 operations = list(shift.operations)
                 anchor = operations[op_pos - 1]
                 operations.insert(op_pos, Operation(customer.index, anchor.arrival, quantity))
-                mutated = optimize_shift_times(instance, replace(shift, operations=tuple(operations)))
+                mutated = try_optimize_shift_times(
+                    instance, replace(shift, operations=tuple(operations)),
+                )
+                if mutated is None:
+                    continue
                 shifts = list(solution.shifts)
                 shifts[shift_pos] = mutated
                 result.append(Solution(tuple(shifts)))
@@ -435,10 +439,12 @@ def _call_in_insertions_for_order(
             operations.insert(
                 op_pos, Operation(point, desired, quantity),
             )
-            mutated = optimize_shift_times(
+            mutated = try_optimize_shift_times(
                 instance,
                 replace(shift, operations=tuple(operations)),
             )
+            if mutated is None:
+                continue
             inserted = mutated.operations[op_pos]
             if not (
                 order.earliest_time
@@ -493,7 +499,12 @@ def _delete_operation_candidates(instance, solution, config, rng) -> list[Soluti
         operations.pop(o)
         shifts = list(solution.shifts)
         if operations:
-            shifts[s] = optimize_shift_times(instance, replace(shift, operations=tuple(operations)))
+            mutated = try_optimize_shift_times(
+                instance, replace(shift, operations=tuple(operations)),
+            )
+            if mutated is None:
+                continue
+            shifts[s] = mutated
         else:
             shifts.pop(s)
         result.append(_reindex(Solution(tuple(shifts))))
@@ -630,7 +641,12 @@ def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]
             old = operations[o]
             operations[o] = replace(old, point=target, quantity=min(old.quantity, customer.capacity))
             shifts = list(solution.shifts)
-            shifts[s] = optimize_shift_times(instance, replace(shift, operations=tuple(operations)))
+            mutated = try_optimize_shift_times(
+                instance, replace(shift, operations=tuple(operations)),
+            )
+            if mutated is None:
+                continue
+            shifts[s] = mutated
             result.append(Solution(tuple(shifts)))
             if len(result) >= config.candidates_per_move * 2:
                 return result
@@ -647,7 +663,12 @@ def _swap_candidates(instance, solution, config, rng) -> list[Solution]:
         operations = list(shift.operations)
         operations[a], operations[b] = operations[b], operations[a]
         shifts = list(solution.shifts)
-        shifts[s] = optimize_shift_times(instance, replace(shift, operations=tuple(operations)))
+        mutated = try_optimize_shift_times(
+            instance, replace(shift, operations=tuple(operations)),
+        )
+        if mutated is None:
+            continue
+        shifts[s] = mutated
         result.append(Solution(tuple(shifts)))
     return result
 
@@ -664,8 +685,16 @@ def _between_shift_candidates(instance, solution, config, rng) -> list[Solution]
         source_ops, destination_ops = list(source.operations), list(destination.operations)
         operation = source_ops.pop(o)
         destination_ops.append(operation)
-        shifts[a] = optimize_shift_times(instance, replace(source, operations=tuple(source_ops)))
-        shifts[b] = optimize_shift_times(instance, replace(destination, operations=tuple(destination_ops)))
+        mutated_source = try_optimize_shift_times(
+            instance, replace(source, operations=tuple(source_ops)),
+        )
+        mutated_destination = try_optimize_shift_times(
+            instance, replace(destination, operations=tuple(destination_ops)),
+        )
+        if mutated_source is None or mutated_destination is None:
+            continue
+        shifts[a] = mutated_source
+        shifts[b] = mutated_destination
         result.append(Solution(tuple(shifts)))
     return result
 
@@ -681,7 +710,12 @@ def _within_shift_candidates(instance, solution, config, rng) -> list[Solution]:
         operation = operations.pop(a)
         operations.insert(b, operation)
         shifts = list(solution.shifts)
-        shifts[s] = optimize_shift_times(instance, replace(shift, operations=tuple(operations)))
+        mutated = try_optimize_shift_times(
+            instance, replace(shift, operations=tuple(operations)),
+        )
+        if mutated is None:
+            continue
+        shifts[s] = mutated
         result.append(Solution(tuple(shifts)))
     return result
 
