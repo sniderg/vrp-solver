@@ -270,6 +270,15 @@ def surgical_search(
         )
         for candidate, candidate_score in scored:
             evaluated += 1
+            # Solver.exe starts from a constructor-feasible shift matrix and
+            # validates every affected route before committing its mutation.
+            # Once that invariant exists, never trade it away for a lower
+            # aggregate QS error count.
+            if (
+                structural_errors == 0
+                and _structural_shift_errors(instance, candidate) != 0
+            ):
+                continue
             if move_score is None or _key(candidate_score) < _key(move_score):
                 move_candidate, move_score = candidate, candidate_score
                 if progress:
@@ -315,8 +324,22 @@ def surgical_search(
                             f"errors,{candidate_score.feasibility_errors},"
                             f"deficit,{candidate_score.safety_kg_min:.3f}"
                         )
-        elif operator == "relocate_within_shift" and structural_errors:
-            error_allowance = perturbation // 8
+        elif (
+            operator in {
+                "relocate_between_shifts",
+                "relocate_within_shift",
+            }
+            and structural_errors
+        ):
+            # A create+inter-shift relocation endpoint can remove an illegal
+            # layover while exposing one temporary resource collision.  Keep
+            # that one-error bridge reachable; the EXE's transactional
+            # perturbation serves the same purpose around a valid constructor
+            # state.
+            error_allowance = max(
+                int(operator == "relocate_between_shifts"),
+                perturbation // 8,
+            )
             structurally_safe = [
                 (candidate, candidate_score)
                 for candidate, candidate_score in scored
@@ -503,7 +526,179 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
     # create-shift operator enumerates every admissible customer point. Include
     # focused call-in columns so QS01 orders are not an unreachable state.
     result.extend(_call_in_shift_candidates(instance, solution, config))
+    return _resource_safe_created_candidates(
+        instance, solution, result, config,
+    )
+
+
+def _resource_safe_created_candidates(
+    instance: Instance,
+    solution: Solution,
+    candidates: list[Solution],
+    config: SurgicalSearchConfig,
+) -> list[Solution]:
+    """Place each newly created route on a compatible idle resource pair."""
+    current_derived = derive_solution(instance, solution)
+    result: list[Solution] = []
+    cap = max(64, config.candidates_per_move * 8)
+    resource_pairs = tuple(
+        (driver.index, trailer_id)
+        for driver in instance.drivers
+        for trailer_id in driver.trailer_ids
+    )
+    for candidate in candidates:
+        if len(candidate.shifts) != len(solution.shifts) + 1:
+            continue
+        created = candidate.shifts[-1]
+        preferred = [(created.driver, created.trailer)]
+        alternatives = [
+            (driver_id, trailer_id)
+            for driver_id, trailer_id in resource_pairs
+            if (driver_id, trailer_id) not in preferred
+        ]
+        for driver_id, trailer_id in (*preferred, *alternatives):
+            if not _route_allows_trailer(
+                instance, created, trailer_id,
+            ):
+                continue
+            placed = _place_created_shift_in_resource_gap(
+                instance,
+                solution,
+                current_derived,
+                replace(
+                    created,
+                    driver=driver_id,
+                    trailer=trailer_id,
+                ),
+            )
+            if placed is None:
+                continue
+            result.append(normalize_source_loads(
+                instance,
+                _reindex(Solution((*solution.shifts, placed))),
+            ))
+            break
+        if len(result) >= cap:
+            break
     return result
+
+
+def _place_created_shift_in_resource_gap(
+    instance: Instance,
+    solution: Solution,
+    derived,
+    shift: Shift,
+) -> Shift | None:
+    """Uniformly translate a valid new route into an idle resource interval."""
+    trial = derive_solution(
+        instance, Solution((replace(shift, index=0),)),
+    )[0]
+    duration = trial.end - shift.start
+    delta_low = -shift.start
+    delta_high = instance.latest_time - trial.end
+    for operation, derived_operation in zip(
+        shift.operations, trial.operations,
+    ):
+        customer = instance.customer_by_point.get(operation.point)
+        if customer is None:
+            continue
+        containing = [
+            window
+            for window in customer.time_windows
+            if (
+                window.start <= operation.arrival
+                and derived_operation.departure <= window.end
+            )
+        ]
+        if not containing:
+            return None
+        delta_low = max(
+            delta_low,
+            min(window.start - operation.arrival for window in containing),
+        )
+        delta_high = min(
+            delta_high,
+            max(
+                window.end - derived_operation.departure
+                for window in containing
+            ),
+        )
+        if customer.call_in and customer.orders:
+            orders = [
+                order
+                for order in customer.orders
+                if (
+                    order.earliest_time
+                    <= operation.arrival
+                    <= order.latest_time
+                )
+            ]
+            if not orders:
+                return None
+            delta_low = max(
+                delta_low,
+                min(
+                    order.earliest_time - operation.arrival
+                    for order in orders
+                ),
+            )
+            delta_high = min(
+                delta_high,
+                max(
+                    order.latest_time - operation.arrival
+                    for order in orders
+                ),
+            )
+    if delta_low > delta_high:
+        return None
+
+    driver = instance.drivers[shift.driver]
+    starts: set[int] = set()
+    for window in driver.time_windows:
+        low = max(shift.start + delta_low, window.start)
+        high = min(
+            shift.start + delta_high,
+            window.end - duration,
+        )
+        if low > high:
+            continue
+        starts.add(int(low))
+        for other, other_derived in zip(solution.shifts, derived):
+            if other.driver == shift.driver:
+                candidate_start = (
+                    other_derived.end
+                    + driver.min_inter_shift_duration
+                )
+                if low <= candidate_start <= high:
+                    starts.add(candidate_start)
+            if other.trailer == shift.trailer:
+                candidate_start = other_derived.end
+                if low <= candidate_start <= high:
+                    starts.add(candidate_start)
+    for start in sorted(starts):
+        delta = start - shift.start
+        placed = replace(
+            shift,
+            start=start,
+            operations=tuple(
+                replace(
+                    operation,
+                    arrival=operation.arrival + delta,
+                )
+                for operation in shift.operations
+            ),
+        )
+        placed_end = start + duration
+        if not _resource_overlap(
+            instance,
+            solution,
+            derived,
+            -1,
+            placed,
+            placed_end,
+        ):
+            return placed
+    return None
 
 
 def _insert_operation_candidates(instance, solution, config) -> list[Solution]:

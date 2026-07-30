@@ -1,0 +1,25 @@
+LIBRARY gurobi65
+EXPORTS
+    GRBsetintparam=gurobi130.GRBsetintparam
+    GRBloadenv=gurobi130.GRBloadenv
+    GRBfreeenv=gurobi130.GRBfreeenv
+    GRBgeterrormsg=gurobi130.GRBgeterrormsg
+    GRBgetattrinfo=gurobi130.GRBgetattrinfo
+    GRBgetdblattrelement=gurobi130.GRBgetdblattrelement
+    GRBgetintattr=gurobi130.GRBgetintattr
+    GRBsetintattr=gurobi130.GRBsetintattr
+    GRBgetdblattr=gurobi130.GRBgetdblattr
+    GRBoptimize=gurobi130.GRBoptimize
+    GRBnewmodel=gurobi130.GRBnewmodel
+    GRBaddvars=gurobi130.GRBaddvars
+    GRBaddconstrs=gurobi130.GRBaddconstrs
+    GRBaddrangeconstrs=gurobi130.GRBaddrangeconstrs
+    GRBdelvars=gurobi130.GRBdelvars
+    GRBdelconstrs=gurobi130.GRBdelconstrs
+    GRBdelsos=gurobi130.GRBdelsos
+    GRBdelqconstrs=gurobi130.GRBdelqconstrs
+    GRBupdatemodel=gurobi130.GRBupdatemodel
+    GRBfreemodel=gurobi130.GRBfreemodel
+    GRBclean2=gurobi130.GRBclean2
+    GRBgetenv=gurobi130.GRBgetenv
+    GRBgetintparam=gurobi130.GRBgetintparam
