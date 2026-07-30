@@ -131,6 +131,42 @@ def surgical_search(
             rng.shuffle(compound)
             rng.shuffle(ordinary)
             candidates = compound + ordinary
+        elif operator == "create_shift":
+            call_in_points = {
+                customer.index
+                for customer in instance.customers
+                if customer.call_in
+            }
+            call_in_candidates = [
+                candidate
+                for candidate in candidates
+                if (
+                    len(candidate.shifts) > len(current.shifts)
+                    and any(
+                        operation.point in call_in_points
+                        for operation in candidate.shifts[-1].operations
+                    )
+                )
+            ]
+            call_in_ids = {id(candidate) for candidate in call_in_candidates}
+            ordinary = [
+                candidate
+                for candidate in candidates
+                if id(candidate) not in call_in_ids
+            ]
+            rng.shuffle(call_in_candidates)
+            rng.shuffle(ordinary)
+            reserve = min(
+                len(call_in_candidates),
+                max(1, config.candidates_per_move // 2),
+            )
+            ordinary_cap = config.candidates_per_move - reserve
+            candidates = (
+                call_in_candidates[:reserve]
+                + ordinary[:ordinary_cap]
+                + call_in_candidates[reserve:]
+                + ordinary[ordinary_cap:]
+            )
         else:
             rng.shuffle(candidates)
         if progress:
