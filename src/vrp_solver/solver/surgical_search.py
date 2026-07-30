@@ -212,20 +212,31 @@ def surgical_search(
             rng.shuffle(ordinary)
             candidates = retimed + ordinary
         elif operator == "relocate_between_shifts":
+            split = [
+                candidate
+                for candidate in candidates
+                if len(candidate.shifts) > len(current.shifts)
+            ]
             reassigned = [
                 candidate
                 for candidate in candidates
-                if _same_route_points(current, candidate)
+                if (
+                    len(candidate.shifts) == len(current.shifts)
+                    and _same_route_points(current, candidate)
+                )
             ]
-            reassigned_ids = {id(candidate) for candidate in reassigned}
+            priority_ids = {
+                id(candidate) for candidate in (*split, *reassigned)
+            }
             ordinary = [
                 candidate
                 for candidate in candidates
-                if id(candidate) not in reassigned_ids
+                if id(candidate) not in priority_ids
             ]
+            rng.shuffle(split)
             rng.shuffle(reassigned)
             rng.shuffle(ordinary)
-            candidates = reassigned + ordinary
+            candidates = split + reassigned + ordinary
         elif operator == "insert_operation":
             quantity_repairs = [
                 candidate
@@ -872,9 +883,12 @@ def _swap_candidates(instance, solution, config, rng) -> list[Solution]:
 
 
 def _between_shift_candidates(instance, solution, config, rng) -> list[Solution]:
-    result = _resource_reassignment_candidates(
+    result = _split_invalid_shift_candidates(
         instance, solution, config,
     )
+    result.extend(_resource_reassignment_candidates(
+        instance, solution, config,
+    ))
     moves = [(a, o, b) for a, shift in enumerate(solution.shifts)
              for o in range(len(shift.operations)) for b in range(len(solution.shifts))
              if a != b and shift.trailer == solution.shifts[b].trailer]
@@ -896,6 +910,82 @@ def _between_shift_candidates(instance, solution, config, rng) -> list[Solution]
         shifts[a] = mutated_source
         shifts[b] = mutated_destination
         result.append(Solution(tuple(shifts)))
+    return result
+
+
+def _split_invalid_shift_candidates(
+    instance: Instance,
+    solution: Solution,
+    config: SurgicalSearchConfig,
+) -> list[Solution]:
+    """Split routes whose implicit layover cannot satisfy the driving rules.
+
+    The recovered EXE applies create-shift followed by inter-shift relocation
+    transactionally.  A constructed seed may need both edits before either
+    intermediate plan is acceptable, so expose the equivalent compound
+    endpoint as a structural bridge while retaining the recovered primitives.
+    Deliveries and their order are preserved exactly.
+    """
+    invalid = {
+        violation.shift
+        for violation in validate_solution(instance, solution)
+        if (
+            violation.severity == "error"
+            and violation.code in {"LAY02", "DRI03"}
+            and violation.shift is not None
+        )
+    }
+    result: list[Solution] = []
+    cap = max(config.candidates_per_move * 2, len(invalid) * 8)
+    for position in sorted(invalid):
+        shift = solution.shifts[position]
+        for cut in range(1, len(shift.operations)):
+            prefix = try_optimize_shift_times(
+                instance,
+                replace(shift, operations=shift.operations[:cut]),
+            )
+            if prefix is None:
+                continue
+            suffix_operations = shift.operations[cut:]
+            for driver in instance.drivers:
+                compatible_trailers = [
+                    trailer_id
+                    for trailer_id in driver.trailer_ids
+                    if _route_allows_trailer(
+                        instance,
+                        replace(
+                            shift,
+                            driver=driver.index,
+                            trailer=trailer_id,
+                            operations=suffix_operations,
+                        ),
+                        trailer_id,
+                    )
+                ]
+                if not compatible_trailers:
+                    continue
+                # Timing depends on the driver and route, not the trailer.
+                suffix = try_optimize_shift_times(
+                    instance,
+                    replace(
+                        shift,
+                        index=len(solution.shifts),
+                        driver=driver.index,
+                        trailer=compatible_trailers[0],
+                        operations=suffix_operations,
+                    ),
+                )
+                if suffix is None:
+                    continue
+                for trailer_id in compatible_trailers:
+                    shifts = list(solution.shifts)
+                    shifts[position] = prefix
+                    shifts.append(replace(suffix, trailer=trailer_id))
+                    result.append(normalize_source_loads(
+                        instance, _reindex(Solution(tuple(shifts))),
+                    ))
+                    if len(result) >= cap:
+                        return result
     return result
 
 
