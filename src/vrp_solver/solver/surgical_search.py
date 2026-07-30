@@ -289,7 +289,11 @@ def surgical_search(
             accepted = structural_gateway or ordinary_gateway
         if accepted:
             current, current_score = move_candidate, move_score
-        improved_best = _key(current_score) < _key(best_score)
+        improved_best = _repair_key(
+            instance, current, current_score,
+        ) < _repair_key(
+            instance, best, best_score,
+        )
         if improved_best:
             best, best_score = current, current_score
             if _feasibility_key(best_score) < previous_feasibility:
@@ -848,6 +852,26 @@ def _key(score: ContestScore):
     return (
         score.hard_violations,
         score.feasibility_errors,
+        score.safety_kg_min,
+        _logistic_ratio(score),
+    )
+
+
+def _repair_key(
+    instance: Instance,
+    solution: Solution,
+    score: ContestScore,
+):
+    """Continuation ordering for an infeasible constructed seed.
+
+    The EXE normally starts from a feasible plan, so structural feasibility is
+    implicit. During reconstruction, preserve a neutral structural cleanup as
+    an incumbent checkpoint instead of losing it on restart.
+    """
+    return (
+        score.hard_violations,
+        score.feasibility_errors,
+        _structural_shift_errors(instance, solution),
         score.safety_kg_min,
         _logistic_ratio(score),
     )
