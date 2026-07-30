@@ -142,6 +142,7 @@ def surgical_search(
                     )
 
         previous_scalar = _scalar(best_score)
+        previous_feasibility = _feasibility_key(best_score)
         perturbation = min(64, 8 * stagnation)
         accepted = False
         if move_candidate is not None and move_score is not None:
@@ -153,7 +154,12 @@ def surgical_search(
         improved_best = _key(current_score) < _key(best_score)
         if improved_best:
             best, best_score = current, current_score
-            stagnation = 0
+            if _feasibility_key(best_score) < previous_feasibility:
+                stagnation = 0
+            else:
+                # LR-only polishing must not suppress the EXE's escalating
+                # perturbation while feasibility is still unchanged.
+                stagnation += 1
             gain = max(0.0, previous_scalar - _scalar(best_score))
             rewards[operator_index] = 0.5 * rewards[operator_index] + 0.5 * min(3584.0, 1.0 + gain)
             if config.output_xml:
@@ -578,6 +584,14 @@ def _key(score: ContestScore):
         score.feasibility_errors,
         score.safety_kg_min,
         _logistic_ratio(score),
+    )
+
+
+def _feasibility_key(score: ContestScore):
+    return (
+        score.hard_violations,
+        score.feasibility_errors,
+        score.safety_kg_min,
     )
 
 
