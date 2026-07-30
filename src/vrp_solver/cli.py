@@ -92,6 +92,13 @@ from .solver.rolling_highs import RollingHighsConfig, rolling_highs_select
 from .solver.targeted_rescue import RescueConfig, targeted_rescue
 from .solver.column_loop import ColumnLoopConfig, column_generation_rescue
 from .solver.alns import ALNSConfig, alns_rescue
+from .solver.recovered_search import (
+    PowerfulRepairConfig,
+    RecoveredSearchConfig,
+    powerful_repair_search,
+    recovered_adaptive_search,
+)
+from .solver.surgical_search import SurgicalSearchConfig, surgical_search
 from .solver.rolling_cg import RollingCGConfig, robust_rolling_rescue
 from .solver.scenario import (
     load_forecast_distribution,
@@ -314,6 +321,89 @@ def cmd_alns_rescue(args: argparse.Namespace) -> int:
             f"{step.best_errors},{step.best_hard},"
             f"{step.first_safety_breach_minute}"
         )
+    return 0
+
+
+def cmd_recovered_search(args: argparse.Namespace) -> int:
+    instance = load_instance(args.instance_xml)
+    initial = load_solution(args.solution_xml)
+    solution, steps = recovered_adaptive_search(
+        instance,
+        initial,
+        config=RecoveredSearchConfig(
+            end_day=args.end_day,
+            replace_from_day=args.replace_from_day,
+            iterations=args.iterations,
+            repair_iterations=args.repair_iterations,
+            seed=args.seed,
+            max_no_improve=args.max_no_improve,
+        ),
+        time_limit_seconds=args.time_limit,
+    )
+    save_solution(solution, args.output_xml)
+    print(f"Saved recovered-search solution to {args.output_xml}")
+    print("iteration,operator,accepted,improved_best,no_improve,candidate_errors,candidate_hard,best_errors,best_hard")
+    for step in steps:
+        print(
+            f"{step.iteration},{step.operator},{step.accepted},{step.improved_best},"
+            f"{step.no_improve},{step.candidate_errors},{step.candidate_hard},"
+            f"{step.best_errors},{step.best_hard}"
+        )
+    return 0
+
+
+def cmd_powerful_repair(args: argparse.Namespace) -> int:
+    instance = load_instance(args.instance_xml)
+    initial = load_solution(args.solution_xml)
+    solution, _steps = powerful_repair_search(
+        instance,
+        initial,
+        config=PowerfulRepairConfig(
+            end_day=args.end_day,
+            replace_from_day=args.replace_from_day,
+            iterations=args.iterations,
+            seed=args.seed,
+            time_limit_seconds=args.time_limit,
+            base_removed_shifts=args.base_removed_shifts,
+            max_removed_shifts=args.max_removed_shifts,
+            base_pressure_customers=args.base_pressure_customers,
+            max_pressure_customers=args.max_pressure_customers,
+            base_candidates=args.base_candidates,
+            max_candidates=args.max_candidates,
+            selector_time_limit=args.selector_time_limit,
+            stagnation_window=args.stagnation_window,
+            restart_every=args.restart_every,
+        ),
+        progress=print,
+    )
+    save_solution(solution, args.output_xml)
+    print(f"Saved powerful-repair solution to {args.output_xml}")
+    return 0
+
+
+def cmd_surgical_search(args: argparse.Namespace) -> int:
+    instance = load_instance(args.instance_xml)
+    initial = load_solution(args.solution_xml)
+    solution, _steps = surgical_search(
+        instance,
+        initial,
+        config=SurgicalSearchConfig(
+            end_day=args.end_day,
+            iterations=args.iterations,
+            candidates_per_move=args.candidates_per_move,
+            pressure_customers=args.pressure_customers,
+            samples_per_customer=args.samples_per_customer,
+            seed=args.seed,
+            time_limit_seconds=args.time_limit,
+            no_improvement_limit=args.no_improvement_limit,
+            workers=args.workers,
+            first_operator=args.first_operator,
+            output_xml=str(args.output_xml),
+        ),
+        progress=print,
+    )
+    save_solution(solution, args.output_xml)
+    print(f"Saved surgical-search solution to {args.output_xml}")
     return 0
 
 
@@ -1856,6 +1946,68 @@ def build_parser() -> argparse.ArgumentParser:
         default="max-delivered",
     )
     alns_cmd.set_defaults(func=cmd_alns_rescue)
+
+    recovered = subparsers.add_parser(
+        "recovered-search",
+        help="run the reconstructed seven-neighborhood Solver.exe controller",
+    )
+    recovered.add_argument("instance_xml", type=Path)
+    recovered.add_argument("solution_xml", type=Path)
+    recovered.add_argument("output_xml", type=Path)
+    recovered.add_argument("--end-day", type=int, default=21)
+    recovered.add_argument("--replace-from-day", type=int, default=0)
+    recovered.add_argument("--iterations", type=int, default=100)
+    recovered.add_argument("--repair-iterations", type=int, default=2)
+    recovered.add_argument("--seed", type=int, default=0)
+    recovered.add_argument("--max-no-improve", type=int, default=32)
+    recovered.add_argument("--time-limit", type=float, default=None)
+    recovered.set_defaults(func=cmd_recovered_search)
+
+    powerful = subparsers.add_parser(
+        "powerful-repair",
+        help="run severity-aware escalating search based on the recovered EXE controller",
+    )
+    powerful.add_argument("instance_xml", type=Path)
+    powerful.add_argument("solution_xml", type=Path)
+    powerful.add_argument("output_xml", type=Path)
+    powerful.add_argument("--end-day", type=int, default=21)
+    powerful.add_argument("--replace-from-day", type=int, default=0)
+    powerful.add_argument("--iterations", type=int, default=80)
+    powerful.add_argument("--seed", type=int, default=0)
+    powerful.add_argument("--time-limit", type=float, default=None)
+    powerful.add_argument("--base-removed-shifts", type=int, default=6)
+    powerful.add_argument("--max-removed-shifts", type=int, default=24)
+    powerful.add_argument("--base-pressure-customers", type=int, default=10)
+    powerful.add_argument("--max-pressure-customers", type=int, default=32)
+    powerful.add_argument("--base-candidates", type=int, default=700)
+    powerful.add_argument("--max-candidates", type=int, default=2600)
+    powerful.add_argument("--selector-time-limit", type=float, default=90.0)
+    powerful.add_argument("--stagnation-window", type=int, default=4)
+    powerful.add_argument("--restart-every", type=int, default=12)
+    powerful.set_defaults(func=cmd_powerful_repair)
+
+    surgical = subparsers.add_parser(
+        "surgical-search",
+        help="run the seven transactional neighborhoods recovered from Solver.exe",
+    )
+    surgical.add_argument("instance_xml", type=Path)
+    surgical.add_argument("solution_xml", type=Path)
+    surgical.add_argument("output_xml", type=Path)
+    surgical.add_argument("--end-day", type=int, required=True)
+    surgical.add_argument("--iterations", type=int, default=500)
+    surgical.add_argument("--candidates-per-move", type=int, default=300)
+    surgical.add_argument("--pressure-customers", type=int, default=20)
+    surgical.add_argument("--samples-per-customer", type=int, default=12)
+    surgical.add_argument("--seed", type=int, default=0)
+    surgical.add_argument("--time-limit", type=float, default=None)
+    surgical.add_argument("--no-improvement-limit", type=int, default=64)
+    surgical.add_argument("--workers", type=int, default=6)
+    surgical.add_argument("--first-operator", choices=(
+        "create_shift", "insert_operation", "delete_operation",
+        "replace_operation_point", "swap_operations",
+        "relocate_between_shifts", "relocate_within_shift",
+    ))
+    surgical.set_defaults(func=cmd_surgical_search)
 
     rolling_cg = subparsers.add_parser("robust-rolling-rescue")
     rolling_cg.add_argument("instance_xml", type=Path)

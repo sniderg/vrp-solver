@@ -8,6 +8,7 @@ import os
 from ..model import Instance, Solution, Shift, Operation
 from ..inventory import project_customer_inventory, tank_events
 from ..rules import derive_solution
+from .gurobi_bridge import _shared_gurobi_env
 from .ml_priors import MLRoutePriors
 
 EPSILON = 1e-6
@@ -210,6 +211,7 @@ def select_shifts_with_highs(
 
     if solved_by_gurobi:
         status, values = highs.optimize()
+        highs.close()
         print(f"Gurobi Status: {status}")
         if status == "GurobiError":
             print("Falling back to HiGHS selector for this window.")
@@ -258,7 +260,7 @@ class _GurobiSelectorModel:
             raise RuntimeError("gurobipy is not installed but ROADEF_SOLVER=gurobi was requested.") from exc
 
         self.gp = gp
-        self.model = gp.Model("roadef_selector")
+        self.model = gp.Model("roadef_selector", env=_shared_gurobi_env(gp))
         self.model.Params.OutputFlag = 1 if config.output else 0
         self.model.Params.TimeLimit = config.time_limit
         if config.mip_gap is not None:
@@ -323,6 +325,9 @@ class _GurobiSelectorModel:
         if self.model.SolCount <= 0:
             return status, None
         return status, [var.X for var in self.vars]
+
+    def close(self) -> None:
+        self.model.dispose()
 
 
 def _inventory_pressure_by_customer(

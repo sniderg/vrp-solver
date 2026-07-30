@@ -34,6 +34,10 @@ uv.lock
 .pytest_cache/
 roadef_2016_data
 
+# Local search runs and generated diagnostics
+/scratch/*/
+/scratch/*.log
+
 # OS-specific
 .DS_Store
 Thumbs.db

@@ -8,6 +8,7 @@ A standalone, Cython-optimized combinatorial optimization toolkit for the Invent
 - **Column-generation-style rescue**: Generates priced route candidates around pressure customers, then repeatedly selects and repairs routes to remove stockouts and capacity violations.
 - **Rolling robust planning**: Supports deterministic, hedged, and robust rolling-horizon rescue using forecast scenarios, quantiles, and committed-window validation.
 - **ALNS and local search**: Includes destroy/repair ALNS, route swaps, route pruning, source cleanup, quantity trimming, and benchmark-specific polishing scripts.
+- **Recovered surgical search**: Implements the seven transactional neighborhoods verified by static analysis of the legacy Windows solver: create shift, insert/delete/replace operation, swap points, and inter-/intra-shift relocation.
 - **ML-guided priorities**: Provides hooks for ML route/customer priors that influence candidate generation and MILP objective prizes.
 - **Fast simulation and validation**: Uses Cython inventory simulation where available, plus local rule checks and optional bundled official-checker validation.
 - **Benchmark tooling**: Includes Set A V1 comparison/polishing scripts and a tutorial notebook for comparing against Hexaly V1 scores.
@@ -71,7 +72,27 @@ uv run python scripts/improve_a_v1.py --instance V_1.11
 
 # Build a Set B V2 seed from scratch, separate from benchmark polishing
 uv run python scripts/build_b_v2.py --instance V2.12 --no-official
+
+# Improve a constructed seed with the recovered seven-neighborhood search
+vrp-solver surgical-search \
+  /path/to/V2.12-instance.xml \
+  /path/to/constructed-seed.xml \
+  /path/to/improved.xml \
+  --end-day 10 \
+  --iterations 500 \
+  --workers 6
 ```
+
+The surgical-search trace reports feasibility errors, hard violations,
+inventory deficit, estimated cost, and logistic ratio (`lr`) as incumbents
+move. Candidate mutations are evaluated transactionally and only committed
+after the affected shifts have been retimed and the complete solution has
+been rescored.
+
+The reconstructed controller follows the legacy binary's verified structure:
+seven surgical operators, adaptive per-operator rewards, recency-aware
+selection, escalating perturbation, and incumbent preservation. Gurobi is
+optional and is not called by these neighborhoods.
 
 ## Programmatic API
 

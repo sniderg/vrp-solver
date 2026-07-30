@@ -39,6 +39,7 @@ class ALNSConfig:
     nearest_chain_neighbors: int = 4
     multi_reload_columns: bool = False
     max_multi_reload_per_batch: int = 8
+    selector_time_limit: float = 300.0
     normalize_source_loads: bool = True
     quantity_objective: str = "max-delivered"
     output_xml: str | None = None
@@ -160,6 +161,7 @@ def _repair(instance: Instance, destroyed: DestroyResult, config: ALNSConfig) ->
         nearest_chain_neighbors=config.nearest_chain_neighbors,
         multi_reload_columns=config.multi_reload_columns,
         max_multi_reload_per_batch=config.max_multi_reload_per_batch,
+        selector_time_limit=config.selector_time_limit,
         normalize_source_loads=config.normalize_source_loads,
         quantity_objective=config.quantity_objective,
     )
