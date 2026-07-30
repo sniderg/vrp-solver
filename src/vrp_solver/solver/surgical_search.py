@@ -169,6 +169,21 @@ def surgical_search(
                 + call_in_candidates[reserve:]
                 + ordinary[ordinary_cap:]
             )
+        elif operator == "relocate_within_shift":
+            retimed = [
+                candidate
+                for candidate in candidates
+                if _same_route_points(current, candidate)
+            ]
+            retimed_ids = {id(candidate) for candidate in retimed}
+            ordinary = [
+                candidate
+                for candidate in candidates
+                if id(candidate) not in retimed_ids
+            ]
+            rng.shuffle(retimed)
+            rng.shuffle(ordinary)
+            candidates = retimed + ordinary
         else:
             rng.shuffle(candidates)
         if progress:
@@ -749,7 +764,7 @@ def _between_shift_candidates(instance, solution, config, rng) -> list[Solution]
 
 
 def _within_shift_candidates(instance, solution, config, rng) -> list[Solution]:
-    result = []
+    result = _resource_retime_candidates(instance, solution)
     moves = [(s, a, b) for s, shift in enumerate(solution.shifts)
              for a in range(len(shift.operations)) for b in range(len(shift.operations)) if a != b]
     rng.shuffle(moves)
@@ -767,6 +782,74 @@ def _within_shift_candidates(instance, solution, config, rng) -> list[Solution]:
         shifts[s] = mutated
         result.append(Solution(tuple(shifts)))
     return result
+
+
+def _resource_retime_candidates(
+    instance: Instance,
+    solution: Solution,
+) -> list[Solution]:
+    """Shift a conflicted route to its first legal resource availability."""
+    derived = derive_solution(instance, solution)
+    targets = {
+        violation.shift
+        for violation in validate_solution(instance, solution)
+        if (
+            violation.severity == "error"
+            and violation.code in {"DRI01", "TL01"}
+            and violation.shift is not None
+        )
+    }
+    result: list[Solution] = []
+    for shift_position in sorted(targets):
+        shift = solution.shifts[shift_position]
+        required_start = shift.start
+        for other_position, other in enumerate(solution.shifts):
+            if (
+                other_position == shift_position
+                or other.start > shift.start
+            ):
+                continue
+            if other.driver == shift.driver:
+                required_start = max(
+                    required_start,
+                    derived[other_position].end
+                    + instance.drivers[shift.driver].min_inter_shift_duration,
+                )
+            if other.trailer == shift.trailer:
+                required_start = max(
+                    required_start, derived[other_position].end,
+                )
+        if required_start <= shift.start:
+            continue
+        delta = required_start - shift.start
+        shifted = replace(
+            shift,
+            start=required_start,
+            operations=tuple(
+                replace(operation, arrival=operation.arrival + delta)
+                for operation in shift.operations
+            ),
+        )
+        shifted = try_optimize_shift_times(instance, shifted)
+        if shifted is None:
+            continue
+        shifts = list(solution.shifts)
+        shifts[shift_position] = shifted
+        result.append(normalize_source_loads(
+            instance, _reindex(Solution(tuple(shifts))),
+        ))
+    return result
+
+
+def _same_route_points(left: Solution, right: Solution) -> bool:
+    return (
+        len(left.shifts) == len(right.shifts)
+        and all(
+            tuple(operation.point for operation in left_shift.operations)
+            == tuple(operation.point for operation in right_shift.operations)
+            for left_shift, right_shift in zip(left.shifts, right.shifts)
+        )
+    )
 
 
 def _select_operator(rewards, attempts, last_used, iteration, rng, feasibility_bias):
