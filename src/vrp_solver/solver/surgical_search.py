@@ -213,7 +213,7 @@ def surgical_search(
             # The recovered controller restores the stored incumbent on one
             # draw in four. Otherwise it keeps walking from the perturbed plan,
             # which permits multi-step repairs across a neutral/worse bridge.
-            if accepted and rng.randrange(4) == 0:
+            if accepted and move_structural is None and rng.randrange(4) == 0:
                 current, current_score = best, best_score
         attempts[operator_index] += 1
         last_used[operator_index] = iteration
