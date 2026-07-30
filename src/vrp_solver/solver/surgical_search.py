@@ -157,7 +157,7 @@ def surgical_search(
             iteration, operator, evaluated, accepted,
             score.feasibility_errors, score.hard_violations,
             score.safety_kg_min, score.scored_estimated_cost,
-            score.scored_estimated_cost / max(1.0, score.scored_delivered_quantity),
+            _logistic_ratio(score),
         )
         steps.append(step)
         if progress:
@@ -526,12 +526,23 @@ def _key(score: ContestScore):
         score.hard_violations,
         score.feasibility_errors,
         score.safety_kg_min,
-        score.scored_estimated_cost,
+        _logistic_ratio(score),
     )
 
 
 def _scalar(score: ContestScore):
-    return 1_000_000 * score.hard_violations + 1_000 * score.feasibility_errors + score.safety_kg_min * 1e-5
+    return (
+        1_000_000 * score.hard_violations
+        + 1_000 * score.feasibility_errors
+        + score.safety_kg_min * 1e-5
+        + _logistic_ratio(score)
+    )
+
+
+def _logistic_ratio(score: ContestScore) -> float:
+    return score.scored_estimated_cost / max(
+        1.0, score.scored_delivered_quantity,
+    )
 
 
 def _reindex(solution: Solution) -> Solution:
