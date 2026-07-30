@@ -290,7 +290,11 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
 def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
     pressure = pressure_points(instance, solution, end_day=config.end_day)
     derived = derive_solution(instance, solution)
-    result: list[Solution] = []
+    result = _call_in_insert_candidates(
+        instance, solution, config, derived,
+    )
+    if len(result) >= config.candidates_per_move * 2:
+        return result[: config.candidates_per_move * 2]
     for point in pressure[: config.pressure_customers]:
         customer = instance.customer_by_point[point.customer]
         for shift_pos, shift in enumerate(solution.shifts):
@@ -310,6 +314,96 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 result.append(Solution(tuple(shifts)))
                 if len(result) >= config.candidates_per_move * 2:
                     return result
+    return result
+
+
+def _call_in_insert_candidates(instance, solution, config, derived) -> list[Solution]:
+    """Insert missing call-in orders into existing compatible source routes."""
+    result: list[Solution] = []
+    cutoff = config.end_day * 1440
+    missing = _unsatisfied_call_ins(
+        instance, solution, cutoff,
+    )
+    total_cap = config.candidates_per_move * 2
+    per_order_cap = max(8, total_cap // max(1, len(missing)))
+    for point, order_index, remaining in missing:
+        result.extend(
+            _call_in_insertions_for_order(
+                instance,
+                solution,
+                derived,
+                point,
+                order_index,
+                remaining,
+                per_order_cap,
+            )
+        )
+    return result[:total_cap]
+
+
+def _call_in_insertions_for_order(
+    instance,
+    solution,
+    derived,
+    point,
+    order_index,
+    remaining,
+    candidate_cap,
+) -> list[Solution]:
+    customer = instance.customer_by_point[point]
+    order = customer.orders[order_index]
+    quantity = min(
+        customer.capacity,
+        max(remaining, customer.min_operation_quantity),
+    )
+    result: list[Solution] = []
+    for shift_pos, shift in enumerate(solution.shifts):
+        if shift.trailer not in customer.allowed_trailers:
+            continue
+        if not any(
+            operation.point in instance.source_by_point
+            for operation in shift.operations
+        ):
+            continue
+        for op_pos in range(1, len(shift.operations) + 1):
+            available = derived[shift_pos].operations[
+                op_pos - 1
+            ].trailer_quantity
+            if available + 1e-6 < quantity:
+                continue
+            operations = list(shift.operations)
+            desired = order.earliest_time
+            if op_pos > 0:
+                desired = max(
+                    desired, operations[op_pos - 1].arrival,
+                )
+            if op_pos < len(operations):
+                desired = min(
+                    max(desired, order.earliest_time),
+                    operations[op_pos].arrival,
+                )
+            operations.insert(
+                op_pos, Operation(point, desired, quantity),
+            )
+            mutated = optimize_shift_times(
+                instance,
+                replace(shift, operations=tuple(operations)),
+            )
+            inserted = mutated.operations[op_pos]
+            if not (
+                order.earliest_time
+                <= inserted.arrival
+                <= order.latest_time
+            ):
+                continue
+            shifts = list(solution.shifts)
+            shifts[shift_pos] = mutated
+            candidate = normalize_source_loads(
+                instance, _reindex(Solution(tuple(shifts))),
+            )
+            result.append(candidate)
+            if len(result) >= candidate_cap:
+                return result
     return result
 
 
