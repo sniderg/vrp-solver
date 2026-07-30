@@ -288,6 +288,45 @@ def surgical_search(
                         f"deficit,{move_score.safety_kg_min:.3f}"
                     )
 
+        if operator == "replace_operation_point" and scored:
+            repair_pool = sorted(
+                scored,
+                key=lambda item: (
+                    item[1].feasibility_errors
+                    - item[1].hard_violations,
+                    item[1].safety_kg_min,
+                    _logistic_ratio(item[1]),
+                ),
+            )[:3]
+            for raw_candidate, _ in repair_pool:
+                repaired, report = repair_quantities_with_highs(
+                    instance,
+                    raw_candidate,
+                    score_days=config.end_day,
+                    feasibility_days=config.end_day,
+                    ignore_tail_call_ins=True,
+                    quantity_objective="max-delivered",
+                )
+                repaired_score = _score(
+                    instance, repaired, config.end_day,
+                )
+                if (
+                    _structural_shift_errors(instance, repaired) == 0
+                    and (
+                        move_score is None
+                        or _key(repaired_score) < _key(move_score)
+                    )
+                ):
+                    move_candidate = repaired
+                    move_score = repaired_score
+                    if progress:
+                        progress(
+                            f"surgical_quantity_repair,{iteration},"
+                            f"status,{report.status},"
+                            f"errors,{repaired_score.feasibility_errors},"
+                            f"deficit,{repaired_score.safety_kg_min:.3f}"
+                        )
+
         move_structural = None
         if operator == "delete_operation" and structural_errors:
             error_allowance = perturbation // 8
@@ -1114,14 +1153,39 @@ def _even_samples(start: int, end: int, count: int) -> tuple[int, ...]:
 
 
 def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]:
-    targets = [p.customer for p in pressure_points(instance, solution, end_day=config.end_day)]
+    targets = pressure_points(
+        instance, solution, end_day=config.end_day,
+    )
     result = []
     positions = [(s, o) for s, shift in enumerate(solution.shifts)
                  for o, op in enumerate(shift.operations) if op.quantity > 0]
     rng.shuffle(positions)
-    for s, o in positions:
-        shift = solution.shifts[s]
-        for target in targets[: config.pressure_customers]:
+    selected_targets = targets[: config.pressure_customers]
+    total_cap = config.candidates_per_move * 2
+    per_target_cap = max(
+        4, total_cap // max(1, len(selected_targets)),
+    )
+    for pressure in selected_targets:
+        target = pressure.customer
+        added = 0
+        target_positions = sorted(
+            positions,
+            key=lambda position: (
+                solution.shifts[position[0]].operations[
+                    position[1]
+                ].arrival > pressure.first_minute,
+                abs(
+                    solution.shifts[position[0]].operations[
+                        position[1]
+                    ].arrival - pressure.first_minute
+                ),
+                -solution.shifts[position[0]].operations[
+                    position[1]
+                ].quantity,
+            ),
+        )
+        for s, o in target_positions:
+            shift = solution.shifts[s]
             customer = instance.customer_by_point[target]
             if shift.trailer not in customer.allowed_trailers:
                 continue
@@ -1138,8 +1202,117 @@ def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]
             result.append(normalize_source_loads(
                 instance, _reindex(Solution(tuple(shifts))),
             ))
-            if len(result) >= config.candidates_per_move * 2:
-                return result
+            added += 1
+            if len(result) >= total_cap:
+                return (
+                    result
+                    + _compound_replace_point_candidates(
+                        instance,
+                        solution,
+                        selected_targets,
+                        total_cap,
+                    )
+                )
+            if added >= per_target_cap:
+                break
+    return result + _compound_replace_point_candidates(
+        instance,
+        solution,
+        selected_targets,
+        total_cap,
+    )
+
+
+def _compound_replace_point_candidates(
+    instance: Instance,
+    solution: Solution,
+    pressures,
+    cap: int,
+) -> list[Solution]:
+    """Expose two sequential point replacements as one scored endpoint."""
+    result: list[Solution] = []
+    selected = tuple(pressures[: min(8, len(pressures))])
+    for left_index, left in enumerate(selected):
+        for right in selected[left_index + 1:]:
+            ranked_shifts = sorted(
+                enumerate(solution.shifts),
+                key=lambda item: sum(
+                    min(
+                        (
+                            abs(operation.arrival - pressure.first_minute)
+                            for operation in item[1].operations
+                            if operation.quantity > 0
+                        ),
+                        default=instance.latest_time,
+                    )
+                    for pressure in (left, right)
+                ),
+            )
+            added = 0
+            for shift_position, shift in ranked_shifts:
+                left_customer = instance.customer_by_point[left.customer]
+                right_customer = instance.customer_by_point[right.customer]
+                if (
+                    shift.trailer not in left_customer.allowed_trailers
+                    or shift.trailer not in right_customer.allowed_trailers
+                ):
+                    continue
+                deliveries = [
+                    position
+                    for position, operation in enumerate(shift.operations)
+                    if operation.quantity > 0
+                ]
+                if len(deliveries) < 2:
+                    continue
+                left_position = min(
+                    deliveries,
+                    key=lambda position: abs(
+                        shift.operations[position].arrival
+                        - left.first_minute
+                    ),
+                )
+                right_choices = [
+                    position
+                    for position in deliveries
+                    if position != left_position
+                ]
+                right_position = min(
+                    right_choices,
+                    key=lambda position: abs(
+                        shift.operations[position].arrival
+                        - right.first_minute
+                    ),
+                )
+                operations = list(shift.operations)
+                for position, customer in (
+                    (left_position, left_customer),
+                    (right_position, right_customer),
+                ):
+                    operation = operations[position]
+                    operations[position] = replace(
+                        operation,
+                        point=customer.index,
+                        quantity=min(
+                            operation.quantity, customer.capacity,
+                        ),
+                    )
+                mutated = try_optimize_shift_times(
+                    instance,
+                    replace(shift, operations=tuple(operations)),
+                )
+                if mutated is None:
+                    continue
+                shifts = list(solution.shifts)
+                shifts[shift_position] = mutated
+                result.append(normalize_source_loads(
+                    instance,
+                    _reindex(Solution(tuple(shifts))),
+                ))
+                added += 1
+                if len(result) >= cap:
+                    return result
+                if added >= 4:
+                    break
     return result
 
 
