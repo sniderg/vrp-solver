@@ -113,6 +113,7 @@ def surgical_search(
                 f"deficit,{current_score.safety_kg_min:.3f},"
                 f"structural,{structural_errors}"
             )
+        perturbation = min(64, 8 * stagnation)
         candidates = _candidates(instance, current, operator, config, rng)
         # The EXE perturbs enumeration after stagnation. Sampling a seeded
         # permutation gives the capped native scorer the same expanding
@@ -141,12 +142,54 @@ def surgical_search(
                         f"deficit,{move_score.safety_kg_min:.3f}"
                     )
 
+        move_structural = None
+        if operator == "delete_operation" and structural_errors:
+            error_allowance = perturbation // 8
+            compound = [
+                (candidate, candidate_score)
+                for candidate, candidate_score in scored
+                if (
+                    len(candidate.shifts) < len(current.shifts)
+                    and candidate_score.hard_violations <= current_score.hard_violations
+                    and candidate_score.feasibility_errors
+                    <= current_score.feasibility_errors + error_allowance
+                )
+            ]
+            if compound:
+                ranked = [
+                    (
+                        _structural_shift_errors(instance, candidate),
+                        _key(candidate_score),
+                        candidate,
+                        candidate_score,
+                    )
+                    for candidate, candidate_score in compound
+                ]
+                structural, _, candidate, candidate_score = min(
+                    ranked, key=lambda item: (item[0], item[1]),
+                )
+                if structural < structural_errors:
+                    move_candidate, move_score = candidate, candidate_score
+                    move_structural = structural
+                    if progress:
+                        progress(
+                            f"surgical_structural_candidate,{iteration},"
+                            f"structural,{structural},"
+                            f"errors,{candidate_score.feasibility_errors},"
+                            f"deficit,{candidate_score.safety_kg_min:.3f}"
+                        )
+
         previous_scalar = _scalar(best_score)
         previous_feasibility = _feasibility_key(best_score)
-        perturbation = min(64, 8 * stagnation)
         accepted = False
         if move_candidate is not None and move_score is not None:
-            accepted = _accept_move(
+            accepted = (
+                move_structural is not None
+                and move_structural < structural_errors
+                and move_score.hard_violations <= current_score.hard_violations
+                and move_score.feasibility_errors
+                <= current_score.feasibility_errors + perturbation // 8
+            ) or _accept_move(
                 current_score, move_score, perturbation, rng,
             )
         if accepted:
