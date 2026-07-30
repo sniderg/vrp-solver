@@ -93,13 +93,14 @@ def surgical_search(
         if deadline is not None and time.monotonic() >= deadline:
             break
         structural_errors = _structural_shift_errors(instance, current)
-        # Match the EXE's recency-aware adaptive portfolio. Force creation and
-        # insertion early while inventory is infeasible. When the constructed
-        # seed itself contains invalid shifts, interleave targeted operation
-        # deletion until the create/insert moves have conflict-free resources.
+        # Match the EXE's recency-aware adaptive portfolio once a valid plan
+        # exists. The original starts from a feasible construction; our
+        # constructed seed does not, so first run the recovered deletion
+        # primitive until the seven-move portfolio has a structurally valid
+        # state from which to operate.
         if iteration == 0 and config.first_operator in OPERATORS:
             operator_index = OPERATORS.index(config.first_operator)
-        elif structural_errors and iteration % 2 == 0:
+        elif structural_errors:
             operator_index = OPERATORS.index("delete_operation")
         else:
             operator_index = _select_operator(
