@@ -88,10 +88,15 @@ def surgical_search(
     for iteration in range(config.iterations):
         if deadline is not None and time.monotonic() >= deadline:
             break
+        structural_errors = _structural_shift_errors(instance, current)
         # Match the EXE's recency-aware adaptive portfolio. Force creation and
-        # insertion early while inventory is infeasible.
+        # insertion early while inventory is infeasible. When the constructed
+        # seed itself contains invalid shifts, interleave targeted operation
+        # deletion until the create/insert moves have conflict-free resources.
         if iteration == 0 and config.first_operator in OPERATORS:
             operator_index = OPERATORS.index(config.first_operator)
+        elif structural_errors and iteration % 2 == 0:
+            operator_index = OPERATORS.index("delete_operation")
         else:
             operator_index = _select_operator(
                 rewards, attempts, last_used, iteration, rng,
@@ -102,7 +107,8 @@ def surgical_search(
             progress(
                 f"surgical_start,{iteration},operator,{operator},"
                 f"errors,{score.feasibility_errors},"
-                f"deficit,{score.safety_kg_min:.3f}"
+                f"deficit,{score.safety_kg_min:.3f},"
+                f"structural,{structural_errors}"
             )
         candidates = _candidates(instance, current, operator, config, rng)
         # The EXE perturbs enumeration after stagnation. Sampling a seeded
@@ -530,3 +536,15 @@ def _scalar(score: ContestScore):
 
 def _reindex(solution: Solution) -> Solution:
     return Solution(tuple(replace(shift, index=i) for i, shift in enumerate(solution.shifts)))
+
+
+def _structural_shift_errors(instance: Instance, solution: Solution) -> int:
+    return sum(
+        1
+        for violation in validate_solution(instance, solution)
+        if (
+            violation.severity == "error"
+            and violation.shift is not None
+            and violation.code not in {"QS01", "QS02"}
+        )
+    )
