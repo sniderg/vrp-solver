@@ -1249,7 +1249,7 @@ def _repair_resource_assignments(
         options={"time_limit": 30.0, "mip_rel_gap": 0.0},
     )
     if result.x is None:
-        return None
+        return _greedy_rebuild_resource_assignments(instance, solution)
 
     shifts = list(solution.shifts)
     for position, variables in enumerate(by_shift):
@@ -1260,6 +1260,98 @@ def _repair_resource_assignments(
         )
     candidate = normalize_source_loads(
         instance, _reindex(Solution(tuple(shifts))),
+    )
+    if any(
+        violation.severity == "error"
+        and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
+        for violation in validate_solution(instance, candidate)
+    ):
+        return None
+    return candidate
+
+
+def _greedy_rebuild_resource_assignments(
+    instance: Instance,
+    solution: Solution,
+) -> Solution | None:
+    """Rebuild the constructor's resource-pair invariant with local timing MIPs."""
+    scheduled: list[Shift] = []
+    driver_end: dict[int, int] = {}
+    trailer_end: dict[int, int] = {}
+    source_by_point = instance.source_by_point
+    customer_by_point = instance.customer_by_point
+
+    for original in sorted(
+        solution.shifts, key=lambda shift: (shift.start, shift.index),
+    ):
+        choices: list[tuple[tuple[float, ...], Shift, int]] = []
+        for trailer in instance.trailers:
+            if not all(
+                (
+                    operation.point not in source_by_point
+                    or trailer.index
+                    in source_by_point[operation.point].allowed_trailers
+                )
+                and (
+                    operation.point not in customer_by_point
+                    or trailer.index
+                    in customer_by_point[operation.point].allowed_trailers
+                )
+                for operation in original.operations
+            ):
+                continue
+            for driver in instance.drivers:
+                if trailer.index not in driver.trailer_ids:
+                    continue
+                earliest = max(
+                    original.start,
+                    trailer_end.get(trailer.index, -10**9),
+                    driver_end.get(driver.index, -10**9)
+                    + driver.min_inter_shift_duration,
+                )
+                delta = earliest - original.start
+                trial = replace(
+                    original,
+                    driver=driver.index,
+                    trailer=trailer.index,
+                    start=earliest,
+                    operations=tuple(
+                        replace(
+                            operation,
+                            arrival=operation.arrival + delta,
+                        )
+                        for operation in original.operations
+                    ),
+                )
+                timed = try_optimize_shift_times(instance, trial)
+                if timed is None:
+                    continue
+                timed_derived = derive_solution(
+                    instance, Solution((replace(timed, index=0),)),
+                )[0]
+                choices.append(
+                    (
+                        (
+                            float(timed.start - original.start),
+                            float(
+                                (driver.index != original.driver)
+                                + (trailer.index != original.trailer)
+                            ),
+                            float(timed_derived.end),
+                        ),
+                        timed,
+                        timed_derived.end,
+                    )
+                )
+        if not choices:
+            return None
+        _, selected, end = min(choices, key=lambda item: item[0])
+        scheduled.append(selected)
+        driver_end[selected.driver] = end
+        trailer_end[selected.trailer] = end
+
+    candidate = normalize_source_loads(
+        instance, _reindex(Solution(tuple(scheduled))),
     )
     if any(
         violation.severity == "error"
