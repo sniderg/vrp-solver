@@ -5,6 +5,7 @@ __pycache__/
 *.so
 *.pyd
 *.dll
+*.exe
 *.pyc
 
 # Cython generated C files
