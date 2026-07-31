@@ -5,6 +5,7 @@ import random
 import time
 import multiprocessing
 import logging
+from itertools import combinations
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -26,7 +27,7 @@ from .targeted_rescue import (
 class SurgicalSearchConfig:
     end_day: int
     iterations: int = 500
-    candidates_per_move: int = 300
+    candidates_per_move: int = 8
     pressure_customers: int = 20
     samples_per_customer: int = 12
     seed: int = 0
@@ -82,7 +83,7 @@ def surgical_search(
     current_score = _score(instance, current, config.end_day)
     best = current
     best_score = current_score
-    rewards = [1.0] * 7
+    rewards = [1024.0] * 7
     attempts = [0] * 7
     last_used = [-10_000] * 7
     stagnation = 0
@@ -237,6 +238,36 @@ def surgical_search(
             rng.shuffle(reassigned)
             rng.shuffle(ordinary)
             candidates = split + reassigned + ordinary
+        elif operator == "replace_operation_point":
+            rebuilt = [
+                candidate
+                for candidate in candidates
+                if (
+                    _operation_count_difference(current, candidate)
+                    or _is_direct_route_rebuild(current, candidate)
+                )
+            ]
+            rebuilt_ids = {id(candidate) for candidate in rebuilt}
+            compound = [
+                candidate
+                for candidate in candidates
+                if (
+                    id(candidate) not in rebuilt_ids
+                    and _point_difference_count(current, candidate) >= 2
+                )
+            ]
+            priority_ids = {
+                id(candidate) for candidate in (*rebuilt, *compound)
+            }
+            ordinary = [
+                candidate
+                for candidate in candidates
+                if id(candidate) not in priority_ids
+            ]
+            rng.shuffle(rebuilt)
+            rng.shuffle(compound)
+            rng.shuffle(ordinary)
+            candidates = rebuilt + compound + ordinary
         elif operator == "insert_operation":
             quantity_repairs = [
                 candidate
@@ -289,7 +320,7 @@ def surgical_search(
                     )
 
         if operator == "replace_operation_point" and scored:
-            repair_pool = sorted(
+            ranked_repair_pool = sorted(
                 scored,
                 key=lambda item: (
                     item[1].feasibility_errors
@@ -297,7 +328,27 @@ def surgical_search(
                     item[1].safety_kg_min,
                     _logistic_ratio(item[1]),
                 ),
-            )[:3]
+            )
+            repair_pool = list(ranked_repair_pool[:5])
+            repaired_targets: set[int] = set()
+            pressure_targets = {
+                pressure.customer
+                for pressure in pressure_points(
+                    instance, current, end_day=config.end_day,
+                )
+            }
+            for item in ranked_repair_pool:
+                target = _rebuilt_route_target(
+                    current, item[0], pressure_targets,
+                )
+                if (
+                    target is None
+                    or target in repaired_targets
+                ):
+                    continue
+                repaired_targets.add(target)
+                if item not in repair_pool:
+                    repair_pool.append(item)
             for raw_candidate, _ in repair_pool:
                 repaired, report = repair_quantities_with_highs(
                     instance,
@@ -484,13 +535,16 @@ def surgical_search(
                 # LR-only polishing must not suppress the EXE's escalating
                 # perturbation while feasibility is still unchanged.
                 stagnation += 1
-            gain = max(0.0, previous_scalar - _scalar(best_score))
-            rewards[operator_index] = 0.5 * rewards[operator_index] + 0.5 * min(3584.0, 1.0 + gain)
+            # Verified EWMA constants from Ghidra (0x140023580):
+            # strong reward (3584) when new best solution is found
+            rewards[operator_index] = 0.5 * rewards[operator_index] + 0.5 * 3584.0
             if config.output_xml:
                 save_solution(best, config.output_xml)
         else:
             stagnation += 1
-            rewards[operator_index] *= 0.5
+            # large improvement reward (1024) for accepted move, failure reward (512) for rejected move
+            target_reward = 1024.0 if accepted else 512.0
+            rewards[operator_index] = 0.5 * rewards[operator_index] + 0.5 * target_reward
             # The recovered controller restores the stored incumbent on one
             # draw in four. Otherwise it keeps walking from the perturbed plan,
             # which permits multi-step repairs across a neutral/worse bridge.
@@ -1158,7 +1212,14 @@ def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]
     )
     result = []
     positions = [(s, o) for s, shift in enumerate(solution.shifts)
-                 for o, op in enumerate(shift.operations) if op.quantity > 0]
+                 for o, op in enumerate(shift.operations)
+                 if (
+                     op.quantity > 0
+                     and (
+                         op.point not in instance.customer_by_point
+                         or not instance.customer_by_point[op.point].call_in
+                     )
+                 )]
     rng.shuffle(positions)
     selected_targets = targets[: config.pressure_customers]
     total_cap = config.candidates_per_move * 2
@@ -1206,7 +1267,7 @@ def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]
             if len(result) >= total_cap:
                 return (
                     result
-                    + _compound_replace_point_candidates(
+                    + _extended_replace_candidates(
                         instance,
                         solution,
                         selected_targets,
@@ -1215,12 +1276,223 @@ def _replace_point_candidates(instance, solution, config, rng) -> list[Solution]
                 )
             if added >= per_target_cap:
                 break
-    return result + _compound_replace_point_candidates(
-        instance,
-        solution,
-        selected_targets,
-        total_cap,
+    return (
+        result
+        + _extended_replace_candidates(
+            instance,
+            solution,
+            selected_targets,
+            total_cap,
+        )
     )
+
+
+def _extended_replace_candidates(
+    instance: Instance,
+    solution: Solution,
+    pressures,
+    cap: int,
+) -> list[Solution]:
+    point_compounds = _compound_replace_point_candidates(
+        instance, solution, pressures, cap,
+    )
+    rebuilt = _route_rebuild_candidates(
+        instance, solution, pressures, cap,
+    )
+    return (
+        point_compounds
+        + rebuilt
+        + _compound_rebuilt_route_candidates(
+            instance, solution, rebuilt, pressures, cap,
+        )
+    )
+
+
+def _compound_rebuilt_route_candidates(
+    instance: Instance,
+    solution: Solution,
+    rebuilt: list[Solution],
+    pressures,
+    cap: int,
+) -> list[Solution]:
+    """Combine two independent route-slot rebuilds before quantity repair."""
+    pressure_targets = {
+        pressure.customer for pressure in pressures
+    }
+    grouped: dict[int, list[tuple[int, Shift]]] = {}
+    for candidate in rebuilt:
+        target = _rebuilt_route_target(
+            solution, candidate, pressure_targets,
+        )
+        if target is None:
+            continue
+        for position, (old_shift, new_shift) in enumerate(
+            zip(solution.shifts, candidate.shifts)
+        ):
+            if (
+                old_shift.operations != new_shift.operations
+                and len(new_shift.operations) == 2
+                and new_shift.operations[0].quantity < 0
+                and new_shift.operations[1].point == target
+                and new_shift.operations[1].quantity > 0
+            ):
+                grouped.setdefault(target, []).append(
+                    (position, new_shift),
+                )
+                break
+    result: list[Solution] = []
+    for left_target, right_target in combinations(
+        sorted(grouped), 2,
+    ):
+        for left_position, left_shift in grouped[
+            left_target
+        ][:3]:
+            for right_position, right_shift in grouped[
+                right_target
+            ][:3]:
+                if left_position == right_position:
+                    continue
+                shifts = list(solution.shifts)
+                shifts[left_position] = left_shift
+                shifts[right_position] = right_shift
+                result.append(normalize_source_loads(
+                    instance,
+                    _reindex(Solution(tuple(shifts))),
+                ))
+                if len(result) >= cap:
+                    return result
+    return result
+
+
+def _route_rebuild_candidates(
+    instance: Instance,
+    solution: Solution,
+    pressures,
+    cap: int,
+) -> list[Solution]:
+    """Replace one saturated route slot with a direct pressure delivery."""
+    derived = derive_solution(instance, solution)
+    result: list[Solution] = []
+    per_target_cap = max(4, cap // max(1, len(pressures)))
+    for pressure in pressures:
+        customer = instance.customer_by_point[pressure.customer]
+        added = 0
+        eligible_hosts = [
+            item
+            for item in enumerate(solution.shifts)
+            if item[1].start < pressure.first_minute
+        ]
+        hosts: list[tuple[int, Shift]] = []
+        used_positions: set[int] = set()
+        for anchor in _even_samples(
+            0,
+            pressure.first_minute,
+            per_target_cap,
+        ):
+            choices = [
+                item
+                for item in eligible_hosts
+                if item[0] not in used_positions
+            ]
+            if not choices:
+                break
+            selected = min(
+                choices,
+                key=lambda item: abs(item[1].start - anchor),
+            )
+            hosts.append(selected)
+            used_positions.add(selected[0])
+        for position, host in hosts:
+            if (
+                host.start >= pressure.first_minute
+                or host.trailer not in customer.allowed_trailers
+            ):
+                continue
+            trailer = instance.trailers[host.trailer]
+            quantity = min(customer.capacity, trailer.capacity)
+            if quantity + 1e-6 < customer.min_operation_quantity:
+                continue
+            latest_end = _resource_slot_end(
+                instance, solution, derived, position,
+            )
+            for source in instance.sources:
+                if host.trailer not in source.allowed_trailers:
+                    continue
+                source_arrival = (
+                    host.start
+                    + instance.time_matrix[
+                        instance.base_index
+                    ][source.index]
+                )
+                earliest_customer = (
+                    source_arrival
+                    + source.setup_time
+                    + instance.time_matrix[
+                        source.index
+                    ][customer.index]
+                )
+                desired = min(
+                    pressure.first_minute,
+                    max(
+                        earliest_customer,
+                        min(
+                            (
+                                window.start
+                                for window in customer.time_windows
+                                if window.end >= earliest_customer
+                            ),
+                            default=earliest_customer,
+                        ),
+                    ),
+                )
+                rebuilt = replace(
+                    host,
+                    operations=(
+                        Operation(
+                            source.index,
+                            source_arrival,
+                            -quantity,
+                        ),
+                        Operation(
+                            customer.index,
+                            desired,
+                            quantity,
+                        ),
+                    ),
+                )
+                rebuilt = try_optimize_shift_times(
+                    instance,
+                    rebuilt,
+                    latest_end=latest_end,
+                )
+                if rebuilt is None:
+                    continue
+                rebuilt_derived = derive_solution(
+                    instance,
+                    Solution((replace(rebuilt, index=0),)),
+                )[0]
+                if _resource_overlap(
+                    instance,
+                    solution,
+                    derived,
+                    position,
+                    rebuilt,
+                    rebuilt_derived.end,
+                ):
+                    continue
+                shifts = list(solution.shifts)
+                shifts[position] = rebuilt
+                result.append(normalize_source_loads(
+                    instance,
+                    _reindex(Solution(tuple(shifts))),
+                ))
+                added += 1
+                break
+            if len(result) >= cap:
+                return result
+            if added >= per_target_cap:
+                break
+    return result
 
 
 def _compound_replace_point_candidates(
@@ -1313,6 +1585,77 @@ def _compound_replace_point_candidates(
                     return result
                 if added >= 4:
                     break
+    for group in combinations(selected[:6], 3):
+        ranked_shifts = sorted(
+            enumerate(solution.shifts),
+            key=lambda item: sum(
+                min(
+                    (
+                        abs(operation.arrival - pressure.first_minute)
+                        for operation in item[1].operations
+                        if operation.quantity > 0
+                    ),
+                    default=instance.latest_time,
+                )
+                for pressure in group
+            ),
+        )
+        added = 0
+        for shift_position, shift in ranked_shifts:
+            customers = tuple(
+                instance.customer_by_point[pressure.customer]
+                for pressure in group
+            )
+            if any(
+                shift.trailer not in customer.allowed_trailers
+                for customer in customers
+            ):
+                continue
+            available = [
+                position
+                for position, operation in enumerate(shift.operations)
+                if operation.quantity > 0
+            ]
+            if len(available) < 3:
+                continue
+            replacements: list[tuple[int, object]] = []
+            for pressure, customer in zip(group, customers):
+                position = min(
+                    available,
+                    key=lambda item: abs(
+                        shift.operations[item].arrival
+                        - pressure.first_minute
+                    ),
+                )
+                available.remove(position)
+                replacements.append((position, customer))
+            operations = list(shift.operations)
+            for position, customer in replacements:
+                operation = operations[position]
+                operations[position] = replace(
+                    operation,
+                    point=customer.index,
+                    quantity=min(
+                        operation.quantity, customer.capacity,
+                    ),
+                )
+            mutated = try_optimize_shift_times(
+                instance,
+                replace(shift, operations=tuple(operations)),
+            )
+            if mutated is None:
+                continue
+            shifts = list(solution.shifts)
+            shifts[shift_position] = mutated
+            result.append(normalize_source_loads(
+                instance,
+                _reindex(Solution(tuple(shifts))),
+            ))
+            added += 1
+            if len(result) >= cap:
+                return result
+            if added >= 2:
+                break
     return result
 
 
@@ -1986,23 +2329,91 @@ def _same_route_points(left: Solution, right: Solution) -> bool:
     )
 
 
+def _point_difference_count(
+    left: Solution,
+    right: Solution,
+) -> int:
+    if len(left.shifts) != len(right.shifts):
+        return max(len(left.shifts), len(right.shifts))
+    return sum(
+        left_operation.point != right_operation.point
+        for left_shift, right_shift in zip(left.shifts, right.shifts)
+        for left_operation, right_operation in zip(
+            left_shift.operations, right_shift.operations,
+        )
+    )
+
+
+def _operation_count_difference(
+    left: Solution,
+    right: Solution,
+) -> bool:
+    return (
+        len(left.shifts) != len(right.shifts)
+        or any(
+            len(left_shift.operations) != len(right_shift.operations)
+            for left_shift, right_shift in zip(
+                left.shifts, right.shifts,
+            )
+        )
+    )
+
+
+def _is_direct_route_rebuild(
+    current: Solution,
+    candidate: Solution,
+) -> bool:
+    if len(current.shifts) != len(candidate.shifts):
+        return False
+    return any(
+        old_shift.operations != new_shift.operations
+        and len(new_shift.operations) == 2
+        and new_shift.operations[0].quantity < 0
+        and new_shift.operations[1].quantity > 0
+        for old_shift, new_shift in zip(
+            current.shifts, candidate.shifts,
+        )
+    )
+
+
+def _rebuilt_route_target(
+    current: Solution,
+    candidate: Solution,
+    pressure_targets: set[int],
+) -> int | None:
+    if len(current.shifts) != len(candidate.shifts):
+        return None
+    for current_shift, candidate_shift in zip(
+        current.shifts, candidate.shifts,
+    ):
+        if (
+            current_shift.operations == candidate_shift.operations
+            or len(candidate_shift.operations) != 2
+            or candidate_shift.operations[0].quantity >= 0
+            or candidate_shift.operations[1].quantity <= 0
+        ):
+            continue
+        targets = [
+            operation.point
+            for operation in candidate_shift.operations
+            if (
+                operation.quantity > 0
+                and operation.point in pressure_targets
+            )
+        ]
+        if len(targets) == 1:
+            return targets[0]
+    return None
+
+
 def _select_operator(rewards, attempts, last_used, iteration, rng, feasibility_bias):
-    # The EXE maintains both learned reward and usage/recency state. Do not let
-    # one high-reward move starve untried neighborhoods: once its attempt lead
-    # reaches six, select among the least-used operators.
-    minimum_attempts = min(attempts)
-    if max(attempts) - minimum_attempts >= 6:
-        least_used = [i for i, count in enumerate(attempts) if count == minimum_attempts]
-        if feasibility_bias:
-            preferred = [i for i in least_used if i in (0, 1, 3)]
-            if preferred:
-                least_used = preferred
-        return min(least_used, key=lambda i: (last_used[i], i))
+    # Match the adaptive selection mechanics from Ghidra (0x140023580):
+    # Operator score = EWMA reward * recency multiplier (2.0 if unused for >=33 iterations) * feasibility bias
     scores = []
     for i in range(7):
-        recency = 2.0 if iteration - last_used[i] >= 33 else 1.0
+        recency = 2.0 if (iteration - last_used[i]) >= 33 else 1.0
         bias = 4.0 if feasibility_bias and i in (0, 1, 3) else 1.0
-        scores.append(max(0.01, rewards[i]) * recency * bias / (1.0 + 0.05 * attempts[i]))
+        scores.append(max(1.0, rewards[i]) * recency * bias)
     draw = rng.random() * sum(scores)
     for i, value in enumerate(scores):
         draw -= value
