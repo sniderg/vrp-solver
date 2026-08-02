@@ -176,9 +176,10 @@ def _resource_conflict_moves(
 
     for point in top_pressure:
         customer = instance.customer_by_point[point.customer]
-        if customer.call_in:
-            continue
-        latest_arrival = min(point.first_minute - instance.unit, end_minute - 1)
+        latest_arrival = min(
+            point.first_minute if customer.call_in else point.first_minute - instance.unit,
+            end_minute - 1,
+        )
         if latest_arrival < start_minute:
             latest_arrival = end_minute - 1
 

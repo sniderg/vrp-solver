@@ -798,6 +798,14 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
     pressure = pressure_points(instance, solution, end_day=config.end_day)
     derived = derive_solution(instance, solution)
     result = _minimum_quantity_candidates(instance, solution)
+    # A safety delivery may fit immediately before a route's first stop when
+    # that route already has a planned layover later in the day.  The generic
+    # timing MIP deliberately models a no-layover chain, so it cannot discover
+    # this otherwise valid mutation.  Preserve the route's existing timestamps
+    # and validate the complete resource/inventory state transactionally.
+    result.extend(_vmi_safety_prepend_candidates(
+        instance, solution, pressure, derived, config,
+    ))
     result.extend(_call_in_insert_candidates(
         instance, solution, config, derived,
     ))
@@ -843,6 +851,98 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
         result,
         config.candidates_per_move * 2,
     )
+
+
+def _vmi_safety_prepend_candidates(
+    instance: Instance,
+    solution: Solution,
+    pressure,
+    derived,
+    config: SurgicalSearchConfig,
+) -> list[Solution]:
+    """Move a later VMI delivery into a route's preserved early layover.
+
+    This is intentionally a paired move: inserting stock before the first
+    stop without reducing a later delivery can overfill the tank.  The
+    source-load normalizer then reconciles the two affected trailers from
+    their real route histories.
+    """
+    result: list[Solution] = []
+    cap = config.candidates_per_move * 2
+    for point in pressure[: config.pressure_customers]:
+        customer = instance.customer_by_point[point.customer]
+        if customer.call_in:
+            continue
+        later = [
+            (shift_pos, operation_pos, operation)
+            for shift_pos, shift in enumerate(solution.shifts)
+            for operation_pos, operation in enumerate(shift.operations)
+            if (
+                operation.point == customer.index
+                and operation.quantity >= customer.min_operation_quantity
+                and operation.arrival >= point.first_minute
+            )
+        ]
+        if not later:
+            continue
+        for shift_pos, shift in enumerate(solution.shifts):
+            if (
+                not shift.operations
+                or shift.start >= point.first_minute
+                or shift.trailer not in customer.allowed_trailers
+            ):
+                continue
+            first = shift.operations[0]
+            for window in customer.time_windows:
+                arrival = max(
+                    window.start,
+                    shift.start + instance.time_matrix[
+                        instance.base_index
+                    ][customer.index],
+                )
+                if arrival + customer.setup_time > window.end:
+                    continue
+                # Keep the original downstream timetable untouched.  It may
+                # intentionally contain the one legal layover that the MIP
+                # retimer does not model.
+                if arrival > first.arrival:
+                    continue
+                for later_shift_pos, later_operation_pos, later_operation in later:
+                    if later_shift_pos == shift_pos:
+                        continue
+                    quantity = min(
+                        1_000.0,
+                        customer.capacity * 0.25,
+                        later_operation.quantity - customer.min_operation_quantity,
+                    )
+                    if quantity + 1e-6 < customer.min_operation_quantity:
+                        continue
+                    shifts = list(solution.shifts)
+                    shifts[shift_pos] = replace(
+                        shift,
+                        operations=(
+                            Operation(customer.index, arrival, quantity),
+                            *shift.operations,
+                        ),
+                    )
+                    target_shift = shifts[later_shift_pos]
+                    target_operations = list(target_shift.operations)
+                    target_operations[later_operation_pos] = replace(
+                        later_operation,
+                        quantity=later_operation.quantity - quantity,
+                    )
+                    shifts[later_shift_pos] = replace(
+                        target_shift, operations=tuple(target_operations),
+                    )
+                    candidate = normalize_source_loads(
+                        instance,
+                        _reindex(Solution(tuple(shifts))),
+                    )
+                    if _structural_shift_errors(instance, candidate) == 0:
+                        result.append(candidate)
+                    if len(result) >= cap:
+                        return result
+    return result
 
 
 def _resource_slot_end(

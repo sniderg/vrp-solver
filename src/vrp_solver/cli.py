@@ -11,7 +11,7 @@ from pathlib import Path
 from .analysis import customer_inventory_summary, summarize_solution
 from .contest import score_prefix_with_feasibility_tail
 from .solver.greedy import construct_solution
-from .solver.cluster_greedy import construct_cluster_solution
+from .solver.cluster_greedy import construct_cluster_solution, construct_paper_solution
 from .evaluate import evaluate_solution
 from .improve import (
     prune_redundant_shifts,
@@ -224,6 +224,7 @@ def cmd_targeted_rescue(args: argparse.Namespace) -> int:
         pressure_pricing=not args.no_pressure_pricing,
         normalize_source_loads=not args.no_normalize_source_loads,
         quantity_objective=args.quantity_objective,
+        prioritize_severity=args.prioritize_severity,
     )
     rescued, report = targeted_rescue(instance, baseline, config=config)
     save_solution(rescued, args.output_xml)
@@ -373,8 +374,10 @@ def cmd_powerful_repair(args: argparse.Namespace) -> int:
             selector_time_limit=args.selector_time_limit,
             stagnation_window=args.stagnation_window,
             restart_every=args.restart_every,
+            stop_when_feasible=not args.continue_after_feasible,
         ),
         progress=print,
+        checkpoint=lambda solution: save_solution(solution, args.output_xml),
     )
     save_solution(solution, args.output_xml)
     print(f"Saved powerful-repair solution to {args.output_xml}")
@@ -938,6 +941,14 @@ def cmd_cluster_construct_solution(args: argparse.Namespace) -> int:
         max_shifts=args.max_shifts,
         score_cutoff_minute=score_cutoff_minute,
         terminal_buffer_days=args.terminal_buffer_days,
+        max_smoothing=args.max_smoothing,
+        global_pressure_fill=args.global_pressure_fill,
+        global_pressure_offset=args.global_pressure_offset,
+        tie_break_seed=args.tie_break_seed,
+        limit_reload_after_empty_start=args.limit_reload_after_empty_start,
+        terminal_preload=not args.no_terminal_preload,
+        first_stop_targeted=not args.opportunity_first,
+        prioritize_early_callins=not args.no_early_callin_priority,
     )
     save_solution(solution, args.output_xml)
     print(f"wrote,{args.output_xml}")
@@ -951,6 +962,31 @@ def cmd_cluster_construct_solution(args: argparse.Namespace) -> int:
             "unscheduled_customer_ids,"
             + " ".join(str(point) for point in report.unscheduled_customers[: args.limit])
         )
+    return 0
+
+
+def cmd_paper_construct_solution(args: argparse.Namespace) -> int:
+    """Run the published HUST/S24 construction without Solver.exe output."""
+    instance = load_instance(args.instance_xml)
+    solution, report = construct_paper_solution(
+        instance,
+        seed=args.seed,
+        retries=args.retries,
+        selection_range=args.selection_range,
+        refill_coefficient=args.refill_coefficient,
+        candidate_pool_size=args.candidate_pool_size,
+        economic_urgency_minutes=args.economic_urgency_minutes,
+    )
+    save_solution(solution, args.output_xml)
+    print(f"wrote,{args.output_xml}")
+    print(f"attempts,{report.attempts}")
+    print(f"shifts,{report.shifts}")
+    print(f"operations,{report.operations}")
+    print(f"delivered_quantity,{report.delivered_quantity:.6f}")
+    print(f"exhausted_resources,{report.exhausted_resources}")
+    print(f"unscheduled_customers,{len(report.unscheduled_customers)}")
+    if report.unscheduled_customers:
+        print("unscheduled_customer_ids," + " ".join(str(point) for point in report.unscheduled_customers[: args.limit]))
     return 0
 
 
@@ -1658,8 +1694,47 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_construct.add_argument("--max-shifts", type=int)
     cluster_construct.add_argument("--score-days", type=int)
     cluster_construct.add_argument("--terminal-buffer-days", type=float, default=0.0)
+    cluster_construct.add_argument("--max-smoothing", type=int, default=0)
+    cluster_construct.add_argument("--global-pressure-fill", type=int, default=0)
+    cluster_construct.add_argument("--global-pressure-offset", type=int, default=0)
+    cluster_construct.add_argument("--tie-break-seed", type=int, default=0)
+    cluster_construct.add_argument(
+        "--limit-reload-after-empty-start",
+        action="store_true",
+        help="defer a second mid-route reload after a mandatory empty-trailer reload",
+    )
+    cluster_construct.add_argument(
+        "--no-terminal-preload",
+        action="store_true",
+        help="do not stage a full trailer load at the end of a shift",
+    )
+    cluster_construct.add_argument(
+        "--opportunity-first",
+        action="store_true",
+        help="allow cluster ranking to choose a first stop other than the global target",
+    )
+    cluster_construct.add_argument(
+        "--no-early-callin-priority",
+        action="store_true",
+        help="do not reserve the first resource windows for call-in orders",
+    )
     cluster_construct.add_argument("--limit", type=int, default=25)
     cluster_construct.set_defaults(func=cmd_cluster_construct_solution)
+
+    paper_construct = subparsers.add_parser(
+        "paper-construct-solution",
+        help="cold start following Su et al. (2020), Section 5.2",
+    )
+    paper_construct.add_argument("instance_xml")
+    paper_construct.add_argument("output_xml")
+    paper_construct.add_argument("--seed", type=int, default=1)
+    paper_construct.add_argument("--retries", type=int, default=100)
+    paper_construct.add_argument("--selection-range", type=float, default=1.5)
+    paper_construct.add_argument("--refill-coefficient", type=float, default=2.0)
+    paper_construct.add_argument("--candidate-pool-size", type=int, default=64)
+    paper_construct.add_argument("--economic-urgency-minutes", type=int, default=0)
+    paper_construct.add_argument("--limit", type=int, default=25)
+    paper_construct.set_defaults(func=cmd_paper_construct_solution)
 
     matrix_summary = subparsers.add_parser("matrix-summary")
     matrix_summary.add_argument("instance_xml")
@@ -1881,6 +1956,11 @@ def build_parser() -> argparse.ArgumentParser:
     targeted_rescue_cmd.add_argument("--no-pressure-pricing", action="store_true")
     targeted_rescue_cmd.add_argument("--no-normalize-source-loads", action="store_true")
     targeted_rescue_cmd.add_argument(
+        "--prioritize-severity",
+        action="store_true",
+        help="target the largest inventory deficits before the earliest breaches",
+    )
+    targeted_rescue_cmd.add_argument(
         "--quantity-objective",
         choices=("min-delivered", "max-delivered"),
         default="max-delivered",
@@ -1984,6 +2064,11 @@ def build_parser() -> argparse.ArgumentParser:
     powerful.add_argument("--selector-time-limit", type=float, default=90.0)
     powerful.add_argument("--stagnation-window", type=int, default=4)
     powerful.add_argument("--restart-every", type=int, default=12)
+    powerful.add_argument(
+        "--continue-after-feasible",
+        action="store_true",
+        help="Use the remaining budget to improve a feasible incumbent's cost.",
+    )
     powerful.set_defaults(func=cmd_powerful_repair)
 
     surgical = subparsers.add_parser(

@@ -75,6 +75,42 @@ try:
 except ImportError:
     _HAS_FAST_CORE = False
 
+
+def project_customer_inventory_arrays(
+    instance: Instance,
+    customer: Customer,
+    deliveries: dict[int, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return compact ending-inventory and safety-breach arrays.
+
+    Candidate generation needs scalar inventory facts far more often than it
+    needs user-facing ``TankEvent`` objects.  Keeping this path array-based
+    avoids allocating one Python dataclass per horizon bucket for every
+    tentative route extension.
+    """
+    if _HAS_FAST_CORE and customer.forecast is not None:
+        deliveries_by_step = np.zeros(instance.horizon, dtype=np.float64)
+        for arrival, quantity in deliveries.items():
+            step = min(max(arrival // instance.unit, 0), instance.horizon - 1)
+            deliveries_by_step[step] += quantity
+        return project_inventory_core(
+            customer.initial_tank_quantity,
+            np.asarray(customer.forecast, dtype=np.float64),
+            deliveries_by_step,
+            customer.capacity,
+            customer.safety_level,
+            instance.horizon,
+            customer.index,
+            instance.unit,
+            1 if customer.call_in else 0,
+        )
+
+    events = project_customer_inventory(instance, customer, deliveries)
+    return (
+        np.asarray([event.ending_inventory for event in events], dtype=np.float64),
+        np.asarray([event.safety_breach for event in events], dtype=np.int32),
+    )
+
 def project_customer_inventory(
     instance: Instance,
     customer: Customer,

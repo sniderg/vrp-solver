@@ -65,6 +65,40 @@ def pressure_points(
         data["negative"] += 1.0 if event.ending_inventory < -EPSILON else 0.0
         data["overfill"] += 1.0 if overfill > EPSILON else 0.0
 
+    # A call-in has no inventory trajectory, so it was previously invisible
+    # to every destroy/repair operator.  Treat an unmet flexible minimum as a
+    # deadline-pressure point.  The deadline (rather than its opening) is the
+    # relevant first minute: it is the last instant at which a route can still
+    # repair the violation.
+    delivered_by_order: dict[tuple[int, int], float] = {}
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            if operation.quantity <= EPSILON:
+                continue
+            customer = instance.customer_by_point.get(operation.point)
+            if customer is None or not customer.call_in:
+                continue
+            for order_index, order in enumerate(customer.orders):
+                if order.earliest_time <= operation.arrival <= order.latest_time:
+                    key = (customer.index, order_index)
+                    delivered_by_order[key] = delivered_by_order.get(key, 0.0) + operation.quantity
+    for customer in instance.customers:
+        if not customer.call_in:
+            continue
+        for order_index, order in enumerate(customer.orders):
+            if order.latest_time >= cutoff_minute:
+                continue
+            missing = order.min_quantity_to_satisfy - delivered_by_order.get((customer.index, order_index), 0.0)
+            if missing <= EPSILON:
+                continue
+            data = by_customer.setdefault(
+                customer.index,
+                {"first": float(order.latest_time), "area": 0.0, "safety": 0.0, "negative": 0.0, "overfill": 0.0},
+            )
+            data["first"] = min(data["first"], float(order.latest_time))
+            data["area"] += missing
+            data["safety"] += 1.0
+
     return tuple(
         PressurePoint(
             customer=customer,

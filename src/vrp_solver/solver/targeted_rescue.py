@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from itertools import combinations, permutations
 
 from ..inventory import tank_events
 from ..model import Instance, Operation, Shift, Solution
@@ -64,6 +65,7 @@ class RescueConfig:
     pressure_pricing: bool = True
     normalize_source_loads: bool = True
     quantity_objective: str = "max-delivered"
+    prioritize_severity: bool = False
 
 
 @dataclass(frozen=True)
@@ -229,6 +231,17 @@ def generate_rescue_candidates(
     for customer_id in failing_customers:
         customer = instance.customer_by_point[customer_id]
         if customer.call_in:
+            candidates.extend(
+                _generate_callin_rescue_candidates(
+                    instance,
+                    baseline,
+                    customer,
+                    start_minute=start_minute,
+                    end_minute=end_minute,
+                    samples_per_customer=config.samples_per_customer,
+                    seen=seen,
+                )
+            )
             continue
         breach_minute = _first_breach_minute(instance, baseline, customer_id, event_cache)
         if breach_minute is None:
@@ -361,7 +374,240 @@ def generate_rescue_candidates(
                         continue
                     candidates.append(replace(shift, index=len(candidates)))
 
+    callin_customers = [
+        customer_id
+        for customer_id in failing_customers
+        if instance.customer_by_point[customer_id].call_in
+        and _next_unsatisfied_callin_order(instance.customer_by_point[customer_id], baseline) is not None
+    ]
+    candidates.extend(
+        _generate_callin_chain_rescue_candidates(
+            instance,
+            baseline,
+            callin_customers,
+            start_minute=start_minute,
+            end_minute=end_minute,
+            samples_per_customer=config.samples_per_customer,
+            seen=seen,
+        )
+    )
     return candidates
+
+
+def _generate_callin_rescue_candidates(
+    instance: Instance,
+    baseline: Solution,
+    customer,
+    *,
+    start_minute: int,
+    end_minute: int,
+    samples_per_customer: int,
+    seen: set[tuple[object, ...]],
+) -> list[Shift]:
+    """Generate source-backed columns for the first unmet call-in order."""
+    order_info = _next_unsatisfied_callin_order(customer, baseline)
+    if order_info is None:
+        return []
+    _order_index, order = order_info
+    quantity = order.min_quantity_to_satisfy
+    candidates: list[Shift] = []
+    for driver in instance.drivers:
+        for trailer in instance.trailers:
+            if trailer.index not in driver.trailer_ids or trailer.index not in customer.allowed_trailers:
+                continue
+            if quantity > trailer.capacity + EPSILON:
+                continue
+            for source in instance.sources:
+                if trailer.index not in source.allowed_trailers:
+                    continue
+                lead = (
+                    instance.time_matrix[instance.base_index][source.index]
+                    + source.setup_time
+                    + instance.time_matrix[source.index][customer.index]
+                )
+                trail = customer.setup_time + instance.time_matrix[customer.index][instance.base_index]
+                for driver_window in driver.time_windows:
+                    earliest = max(
+                        order.earliest_time,
+                        start_minute + lead,
+                        driver_window.start + lead,
+                    )
+                    latest = min(
+                        order.latest_time - customer.setup_time,
+                        end_minute - trail,
+                        driver_window.end - trail,
+                    )
+                    if earliest > latest:
+                        continue
+                    for arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
+                        shift_start = arrival - lead
+                        source_arrival = shift_start + instance.time_matrix[instance.base_index][source.index]
+                        departure = arrival + customer.setup_time
+                        end = departure + instance.time_matrix[customer.index][instance.base_index]
+                        if not is_time_window_valid(shift_start, end, driver.time_windows):
+                            continue
+                        if not is_time_window_valid(arrival, departure, customer.time_windows):
+                            continue
+                        shift = Shift(
+                            index=0,
+                            driver=driver.index,
+                            trailer=trailer.index,
+                            start=shift_start,
+                            operations=(
+                                Operation(source.index, source_arrival, -quantity),
+                                Operation(customer.index, arrival, quantity),
+                            ),
+                        )
+                        key = _shift_key(shift)
+                        if key in seen or not _is_shift_route_valid(instance, shift):
+                            continue
+                        seen.add(key)
+                        candidates.append(replace(shift, index=len(candidates)))
+    return candidates
+
+
+def _next_unsatisfied_callin_order(customer, solution: Solution):
+    for order_index, order in enumerate(customer.orders):
+        delivered = sum(
+            operation.quantity
+            for shift in solution.shifts
+            for operation in shift.operations
+            if operation.point == customer.index
+            and operation.quantity > EPSILON
+            and order.earliest_time <= operation.arrival <= order.latest_time
+        )
+        if delivered + EPSILON < order.min_quantity_to_satisfy:
+            return order_index, order
+    return None
+
+
+def _generate_callin_chain_rescue_candidates(
+    instance: Instance,
+    baseline: Solution,
+    customer_ids: list[int],
+    *,
+    start_minute: int,
+    end_minute: int,
+    samples_per_customer: int,
+    seen: set[tuple[object, ...]],
+) -> list[Shift]:
+    """Build two/three-stop call-in routes, reloading whenever capacity requires.
+
+    Direct call-in columns cannot express V2.12's early 136 -> reload ->
+    314/124 pattern.  These are still ordinary native route columns: every
+    stop, source visit, time window, and driving bound is checked locally.
+    """
+    tasks = [
+        (customer_id, order_info[0], order_info[1])
+        for customer_id in customer_ids
+        if (order_info := _next_unsatisfied_callin_order(instance.customer_by_point[customer_id], baseline)) is not None
+    ]
+    candidates: list[Shift] = []
+    for size in range(2, min(3, len(tasks)) + 1):
+        for subset in combinations(tasks, size):
+            allowed = set(instance.customer_by_point[subset[0][0]].allowed_trailers)
+            for customer_id, _order_index, _order in subset[1:]:
+                allowed &= set(instance.customer_by_point[customer_id].allowed_trailers)
+            if not allowed:
+                continue
+            for route in permutations(subset):
+                first_customer = instance.customer_by_point[route[0][0]]
+                first_order = route[0][2]
+                for driver in instance.drivers:
+                    for trailer_id in driver.trailer_ids:
+                        if trailer_id not in allowed:
+                            continue
+                        trailer = instance.trailers[trailer_id]
+                        if any(order.min_quantity_to_satisfy > trailer.capacity + EPSILON for _, _, order in route):
+                            continue
+                        for source in instance.sources:
+                            if trailer_id not in source.allowed_trailers:
+                                continue
+                            # A trailer which has not yet been used can leave
+                            # base preloaded.  V2.12's critical t14 route does
+                            # exactly that: it delivers 136, then refills
+                            # before 314/124.  Starting every chain at source
+                            # makes that physically impossible once trailer
+                            # state is enforced.
+                            initial_carried = trailer.initial_quantity
+                            if initial_carried + EPSILON >= first_order.min_quantity_to_satisfy:
+                                lead = instance.time_matrix[instance.base_index][first_customer.index]
+                            else:
+                                lead = (
+                                    instance.time_matrix[instance.base_index][source.index]
+                                    + source.setup_time
+                                    + instance.time_matrix[source.index][first_customer.index]
+                                )
+                            for window in driver.time_windows:
+                                earliest = max(first_order.earliest_time, start_minute + lead, window.start + lead)
+                                latest = min(first_order.latest_time - first_customer.setup_time, end_minute - lead, window.end - lead)
+                                if earliest > latest:
+                                    continue
+                                for first_arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
+                                    shift = _build_callin_chain(
+                                        instance,
+                                        route,
+                                        driver.index,
+                                        trailer_id,
+                                        source.index,
+                                        first_arrival - lead,
+                                        initial_carried,
+                                    )
+                                    if shift is None:
+                                        continue
+                                    derived = _derive_single_shift(instance, shift)
+                                    if derived.end > end_minute or not is_time_window_valid(shift.start, derived.end, driver.time_windows):
+                                        continue
+                                    key = _shift_key(shift)
+                                    if key in seen:
+                                        continue
+                                    seen.add(key)
+                                    candidates.append(replace(shift, index=len(candidates)))
+    return candidates
+
+
+def _build_callin_chain(
+    instance,
+    route,
+    driver_id: int,
+    trailer_id: int,
+    source_id: int,
+    start: int,
+    initial_carried: float,
+) -> Shift | None:
+    trailer = instance.trailers[trailer_id]
+    operations: list[Operation] = []
+    current_point = instance.base_index
+    current_time = start
+    carried = initial_carried
+    for customer_id, _order_index, order in route:
+        customer = instance.customer_by_point[customer_id]
+        quantity = order.min_quantity_to_satisfy
+        if carried + EPSILON < quantity:
+            source_arrival = current_time + instance.time_matrix[current_point][source_id]
+            load_quantity = trailer.capacity - carried
+            operations.append(Operation(source_id, source_arrival, -load_quantity))
+            current_time = source_arrival + instance.setup_time_for_point(source_id)
+            current_point = source_id
+            carried += load_quantity
+        raw_arrival = max(current_time + instance.time_matrix[current_point][customer_id], order.earliest_time)
+        arrival = next(
+            (
+                max(raw_arrival, window.start)
+                for window in customer.time_windows
+                if max(raw_arrival, window.start) + customer.setup_time <= window.end
+                and max(raw_arrival, window.start) + customer.setup_time <= order.latest_time
+            ),
+            None,
+        )
+        if arrival is None:
+            return None
+        operations.append(Operation(customer_id, arrival, quantity))
+        current_time = arrival + customer.setup_time
+        current_point = customer_id
+        carried -= quantity
+    shift = Shift(index=0, driver=driver_id, trailer=trailer_id, start=start, operations=tuple(operations))
+    return shift if _is_shift_route_valid(instance, shift) else None
 
 
 def generate_carryover_rescue_candidates(
@@ -1131,15 +1377,73 @@ def _failing_customers(
 ) -> list[int]:
     cutoff_step = min(instance.horizon, config.end_day * MINUTES_PER_DAY // instance.unit)
     first_by_customer: dict[int, int] = {}
+    severity_by_customer: dict[int, tuple[int, float]] = {}
     for event in tank_events(instance, solution):
         if event.step >= cutoff_step:
             continue
         if event.safety_breach:
             first_by_customer.setdefault(event.point, event.step)
+            negative_steps, deficit_area = severity_by_customer.get(event.point, (0, 0.0))
+            severity_by_customer[event.point] = (
+                negative_steps + int(event.ending_inventory < -EPSILON),
+                deficit_area + max(0.0, event.safety_level - event.ending_inventory),
+            )
+    # Call-ins have no inventory trajectory, so a VMI-only scan leaves a
+    # near-feasible solution with missed orders invisible to route repair.
+    # Include each unsatisfied flexible minimum at its order deadline.  This
+    # lets the same native candidate generator build the coupled resource
+    # alternatives needed to insert a call-in without treating it as a tank
+    # runout.
+    cutoff_minute = cutoff_step * instance.unit
+    delivered_by_order: dict[tuple[int, int], float] = {}
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            if operation.quantity <= EPSILON:
+                continue
+            customer = instance.customer_by_point.get(operation.point)
+            if customer is None or not customer.call_in:
+                continue
+            for order_index, order in enumerate(customer.orders):
+                if order.earliest_time <= operation.arrival <= order.latest_time:
+                    key = (customer.index, order_index)
+                    delivered_by_order[key] = (
+                        delivered_by_order.get(key, 0.0) + operation.quantity
+                    )
+    for customer in instance.customers:
+        if not customer.call_in:
+            continue
+        for order_index, order in enumerate(customer.orders):
+            if order.latest_time >= cutoff_minute:
+                continue
+            missing = order.min_quantity_to_satisfy - delivered_by_order.get(
+                (customer.index, order_index), 0.0
+            )
+            if missing <= EPSILON:
+                continue
+            deadline_step = min(order.latest_time // instance.unit, cutoff_step - 1)
+            first_by_customer[customer.index] = min(
+                first_by_customer.get(customer.index, deadline_step), deadline_step
+            )
+            negative_steps, deficit_area = severity_by_customer.get(customer.index, (0, 0.0))
+            severity_by_customer[customer.index] = (negative_steps, deficit_area + missing)
+    if config.prioritize_severity:
+        ordered = sorted(
+            first_by_customer,
+            key=lambda customer_id: (
+                -severity_by_customer[customer_id][0],
+                -severity_by_customer[customer_id][1],
+                first_by_customer[customer_id],
+                customer_id,
+            ),
+        )
+    else:
+        ordered = [
+            customer_id
+            for customer_id, _step in sorted(first_by_customer.items(), key=lambda item: item[1])
+        ]
     return [
-        customer_id
-        for customer_id, _step in sorted(first_by_customer.items(), key=lambda item: item[1])
-    ][: config.max_customers]
+        customer_id for customer_id in ordered[: config.max_customers]
+    ]
 
 
 def _first_breach_minute(

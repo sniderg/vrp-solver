@@ -78,6 +78,10 @@ class ColumnLoopConfig:
     protect_exact_prior_quantities: bool = False
     use_prior_incumbent: bool = True
     cap_new_candidate_quantities: bool = True
+    # Call-ins are discrete commitments rather than inventory targets.  When a
+    # repair has missed one, make just that known order hard in the selector so
+    # it cannot trade it for a cheaper VMI-only plan.
+    strict_missing_callin_orders: bool = False
 
 
 @dataclass(frozen=True)
@@ -237,6 +241,12 @@ def column_generation_rescue(
 
         prev_pool_size = len(pool)
         pool = _dedupe_reindex([*pool, *generated])
+
+        strict_order_keys = (
+            _missing_callin_order_keys(instance, current, config.end_day)
+            if config.strict_missing_callin_orders
+            else ()
+        )
         
         if len(pool) == prev_pool_size and no_improvement_streak >= 2:
             # Convergence: pool has stopped growing AND score hasn't improved
@@ -257,6 +267,9 @@ def column_generation_rescue(
                 mip_focus=config.selector_mip_focus,
                 node_limit=config.selector_node_limit,
                 selector_phase=_selector_phase_for_iteration(config, best_score),
+                strict_orders=bool(strict_order_keys),
+                strict_order_keys=strict_order_keys,
+                strict_trailer_inventory=config.strict_missing_callin_orders,
                 mip_start_shift_indices=_mip_start_indices(
                     instance,
                     pool,
@@ -387,6 +400,37 @@ def column_generation_rescue(
         shifts=tuple(replace(shift, index=index) for index, shift in enumerate(best_solution.shifts))
     )
     return reindexed, tuple(steps)
+
+
+def _missing_callin_order_keys(
+    instance: Instance,
+    solution: Solution,
+    end_day: int,
+) -> tuple[tuple[int, int], ...]:
+    """Return call-in orders due in this repair window below flexible minimum."""
+    end_minute = end_day * MINUTES_PER_DAY
+    delivered: dict[tuple[int, int], float] = {}
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            if operation.quantity <= 0.0:
+                continue
+            customer = instance.customer_by_point.get(operation.point)
+            if customer is None or not customer.call_in:
+                continue
+            for order_index, order in enumerate(customer.orders):
+                if order.earliest_time <= operation.arrival <= order.latest_time:
+                    key = (customer.index, order_index)
+                    delivered[key] = delivered.get(key, 0.0) + operation.quantity
+    missing: list[tuple[int, int]] = []
+    for customer in instance.customers:
+        if not customer.call_in:
+            continue
+        for order_index, order in enumerate(customer.orders):
+            if order.latest_time > end_minute:
+                continue
+            if delivered.get((customer.index, order_index), 0.0) + 1e-6 < order.min_quantity_to_satisfy:
+                missing.append((customer.index, order_index))
+    return tuple(missing)
 
 
 def _rescue_config(config: ColumnLoopConfig) -> RescueConfig:

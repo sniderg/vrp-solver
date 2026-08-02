@@ -40,6 +40,7 @@ class ALNSConfig:
     multi_reload_columns: bool = False
     max_multi_reload_per_batch: int = 8
     selector_time_limit: float = 300.0
+    strict_missing_callin_orders: bool = False
     normalize_source_loads: bool = True
     quantity_objective: str = "max-delivered"
     output_xml: str | None = None
@@ -147,7 +148,12 @@ def alns_rescue(
 
 
 def _repair(instance: Instance, destroyed: DestroyResult, config: ALNSConfig) -> Solution:
-    replace_from_day = max(config.replace_from_day, destroyed.start_minute // 1440)
+    # ``replace_from_day`` is the caller's hard horizon boundary.  Advancing it
+    # to a later sampled destroy band accidentally makes earlier missed
+    # call-ins impossible to repair (notably V2.12 customer 136).  The column
+    # selector already decides which shifts to retain, so retain the requested
+    # boundary and let it exchange the necessary earlier route chain.
+    replace_from_day = config.replace_from_day
     repair_config = ColumnLoopConfig(
         start_day=config.start_day,
         end_day=config.end_day,
@@ -162,6 +168,7 @@ def _repair(instance: Instance, destroyed: DestroyResult, config: ALNSConfig) ->
         multi_reload_columns=config.multi_reload_columns,
         max_multi_reload_per_batch=config.max_multi_reload_per_batch,
         selector_time_limit=config.selector_time_limit,
+        strict_missing_callin_orders=config.strict_missing_callin_orders,
         normalize_source_loads=config.normalize_source_loads,
         quantity_objective=config.quantity_objective,
     )

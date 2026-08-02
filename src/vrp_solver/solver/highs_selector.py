@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal, List, Dict, Tuple, Set
 import os
 
@@ -38,6 +39,25 @@ class SelectorConfig:
     mip_start_shift_indices: tuple[int, ...] = ()
     priority_shift_indices: tuple[int, ...] = ()
     priority_shift_bonus: float = 1_000_000.0
+    # Strict mode turns the route selector into a feasibility MIP: inventory
+    # and order requirements are constraints, rather than penalised slacks.
+    # This is deliberately opt-in because column generation normally benefits
+    # from returning the least-infeasible incumbent while its pool is sparse.
+    strict_feasibility: bool = False
+    strict_inventory: bool = False
+    strict_orders: bool = False
+    # If supplied, only these (customer, order) pairs are hard.  This lets a
+    # local repair model prove a specific call-in window feasible before its
+    # column pool covers every unrelated order in the full horizon.
+    strict_order_keys: tuple[tuple[int, int], ...] = ()
+    # Enforce trailer stock after every selected source/customer operation,
+    # rather than only at the end of the repair window.
+    strict_trailer_inventory: bool = False
+    # Gurobi-only audit artifacts.  `.lp` is human-readable and `.mps` is a
+    # portable standard interchange format; `.sol` records the incumbent.
+    model_export_path: Path | None = None
+    solution_export_path: Path | None = None
+    iis_export_path: Path | None = None
 
 
 def select_shifts_with_highs(
@@ -171,7 +191,10 @@ def select_shifts_with_highs(
     _add_driver_overlap_constraints(highs, instance, candidates, x_indices, intervals)
     _add_trailer_overlap_constraints(highs, candidates, x_indices, intervals)
     _add_prefix_conflict_constraints(highs, instance, prefix, candidates, x_indices, intervals)
-    if baseline is not None:
+    # The legacy ending-net equality is a coarse proxy for trailer continuity.
+    # Once the exact operation-by-operation state flow is enabled it becomes
+    # harmful: it forbids spending genuine residual stock on a new call-in.
+    if baseline is not None and not selector_config.strict_trailer_inventory:
         _add_trailer_ending_inventory_constraints(
             highs,
             instance,
@@ -182,6 +205,16 @@ def select_shifts_with_highs(
             q_indices,
             start_day,
             end_day,
+        )
+    if selector_config.strict_trailer_inventory:
+        _add_trailer_inventory_path_constraints(
+            highs,
+            instance,
+            prefix,
+            candidates,
+            x_indices,
+            q_variables,
+            q_indices,
         )
     if variable_quantities:
         _add_shift_quantity_capacity_constraints(highs, instance, candidates, x_indices, q_variables, q_indices)
@@ -196,6 +229,7 @@ def select_shifts_with_highs(
             q_indices,
             start_day,
             end_day,
+            strict=(selector_config.strict_feasibility or selector_config.strict_inventory),
         )
     else:
         _add_fixed_inventory_constraints_with_slacks(
@@ -206,11 +240,26 @@ def select_shifts_with_highs(
             x_indices,
             start_day,
             end_day,
+            strict=(selector_config.strict_feasibility or selector_config.strict_inventory),
         )
-    _add_order_coverage_constraints(highs, instance, prefix, candidates, x_indices)
+    _add_order_coverage_constraints(
+        highs,
+        instance,
+        prefix,
+        candidates,
+        x_indices,
+        strict=(selector_config.strict_feasibility or selector_config.strict_orders),
+        strict_keys=selector_config.strict_order_keys,
+    )
 
     if solved_by_gurobi:
+        if selector_config.model_export_path is not None:
+            highs.write_model(selector_config.model_export_path)
         status, values = highs.optimize()
+        if values is not None and selector_config.solution_export_path is not None:
+            highs.write_solution(selector_config.solution_export_path)
+        elif status == "Infeasible" and selector_config.iis_export_path is not None:
+            highs.write_iis(selector_config.iis_export_path)
         highs.close()
         print(f"Gurobi Status: {status}")
         if status == "GurobiError":
@@ -274,7 +323,13 @@ class _GurobiSelectorModel:
         self.vars = []
 
     def addCol(self, obj, lower, upper, _nnz, _indices, _coefficients):
-        var = self.model.addVar(lb=lower, ub=upper, obj=obj, vtype=self.gp.GRB.CONTINUOUS)
+        var = self.model.addVar(
+            lb=lower,
+            ub=upper,
+            obj=obj,
+            vtype=self.gp.GRB.CONTINUOUS,
+            name=f"v_{len(self.vars)}",
+        )
         var.Start = lower if lower == upper else 0.0
         self.vars.append(var)
 
@@ -328,6 +383,20 @@ class _GurobiSelectorModel:
 
     def close(self) -> None:
         self.model.dispose()
+
+    def write_model(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.model.update()
+        self.model.write(str(path))
+
+    def write_solution(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.model.write(str(path))
+
+    def write_iis(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.model.computeIIS()
+        self.model.write(str(path))
 
 
 def _inventory_pressure_by_customer(
@@ -576,6 +645,8 @@ def _add_inventory_constraints_with_slacks(
     q_indices,
     start_day,
     end_day,
+    *,
+    strict: bool = False,
 ):
     deliveries_by_customer: dict[int, list[tuple[int, _QuantityVariable]]] = {}
     candidate_delivery_steps = {}
@@ -607,7 +678,7 @@ def _add_inventory_constraints_with_slacks(
             end_step = min(instance.horizon - 1, end_day * 1440 // instance.unit)
             target_level = customer.safety_level
             slack_penalty = 10_000_000.0
-            if step == end_step:
+            if step == end_step and not strict:
                 target_level = customer.safety_level + 0.35 * (customer.capacity - customer.safety_level)
                 slack_penalty = 100_000.0
             
@@ -617,17 +688,19 @@ def _add_inventory_constraints_with_slacks(
             relevant = [
                 variable_index
                 for variable_index, variable in deliveries_by_customer.get(customer.index, ())
-                if variable.arrival <= step_time
+                # Inventory buckets use ``arrival // unit``; an arrival
+                # exactly at step_time belongs to the *next* bucket.
+                if variable.arrival < step_time
             ]
 
-            # Safety breach slack
-            highs.addCol(slack_penalty, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
-            slack_breach_idx = highs.getNumCol() - 1
-            
-            indices = [q_indices[variable_index] for variable_index in relevant] + [slack_breach_idx]
-            qtys = [1.0] * len(relevant) + [1.0]
-            
-            highs.addRow(rhs_lower, inf, len(indices), np.array(indices, dtype=np.int32), np.array(qtys, dtype=np.float64))
+            indices = [q_indices[variable_index] for variable_index in relevant]
+            qtys = [1.0] * len(relevant)
+            if strict:
+                highs.addRow(rhs_lower, inf, len(indices), np.array(indices, dtype=np.int32), np.array(qtys, dtype=np.float64))
+            else:
+                highs.addCol(slack_penalty, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
+                slack_breach_idx = highs.getNumCol() - 1
+                highs.addRow(rhs_lower, inf, len(indices) + 1, np.array([*indices, slack_breach_idx], dtype=np.int32), np.array([*qtys, 1.0], dtype=np.float64))
 
             # Overfill constraint (HARD) - Physical impossibility, must be avoided at all costs.
             indices_u = [q_indices[variable_index] for variable_index in relevant]
@@ -643,6 +716,8 @@ def _add_fixed_inventory_constraints_with_slacks(
     x_indices,
     start_day,
     end_day,
+    *,
+    strict: bool = False,
 ):
     shift_cust_deliveries = {}
     candidate_delivery_steps = {}
@@ -680,7 +755,7 @@ def _add_fixed_inventory_constraints_with_slacks(
             end_step = min(instance.horizon - 1, end_day * 1440 // instance.unit)
             target_level = customer.safety_level
             slack_penalty = 10_000_000.0
-            if step == end_step:
+            if step == end_step and not strict:
                 target_level = customer.safety_level + 0.35 * (customer.capacity - customer.safety_level)
                 slack_penalty = 100_000.0
 
@@ -691,15 +766,18 @@ def _add_fixed_inventory_constraints_with_slacks(
             for (shift_index, customer_id), deliveries in shift_cust_deliveries.items():
                 if customer_id != customer.index:
                     continue
-                total_qty = sum(qty for qty, arrival in deliveries if arrival <= step_time)
+                total_qty = sum(qty for qty, arrival in deliveries if arrival < step_time)
                 if total_qty > EPSILON:
                     relevant_shifts[shift_index] = total_qty
 
-            highs.addCol(slack_penalty, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
-            slack_breach_idx = highs.getNumCol() - 1
-            indices = [x_indices[shift_index] for shift_index in relevant_shifts] + [slack_breach_idx]
-            qtys = [relevant_shifts[shift_index] for shift_index in relevant_shifts] + [1.0]
-            highs.addRow(rhs_lower, inf, len(indices), np.array(indices, dtype=np.int32), np.array(qtys, dtype=np.float64))
+            qtys = [relevant_shifts[shift_index] for shift_index in relevant_shifts]
+            indices = [x_indices[shift_index] for shift_index in relevant_shifts]
+            if strict:
+                highs.addRow(rhs_lower, inf, len(indices), np.array(indices, dtype=np.int32), np.array(qtys, dtype=np.float64))
+            else:
+                highs.addCol(slack_penalty, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
+                slack_breach_idx = highs.getNumCol() - 1
+                highs.addRow(rhs_lower, inf, len(indices) + 1, np.array([*indices, slack_breach_idx], dtype=np.int32), np.array([*qtys, 1.0], dtype=np.float64))
 
             # Overfill constraint (HARD)
             indices_u = [x_indices[shift_index] for shift_index in relevant_shifts]
@@ -707,7 +785,16 @@ def _add_fixed_inventory_constraints_with_slacks(
             highs.addRow(-inf, rhs_upper, len(indices_u), np.array(indices_u, dtype=np.int32), np.array(qtys_u, dtype=np.float64))
 
 
-def _add_order_coverage_constraints(highs, instance, prefix, candidates, x_indices):
+def _add_order_coverage_constraints(
+    highs,
+    instance,
+    prefix,
+    candidates,
+    x_indices,
+    *,
+    strict: bool = False,
+    strict_keys: tuple[tuple[int, int], ...] = (),
+):
     prefix_deliveries: dict[tuple[int, int], float] = {}
     for shift in prefix.shifts:
         for operation in shift.operations:
@@ -742,17 +829,15 @@ def _add_order_coverage_constraints(highs, instance, prefix, candidates, x_indic
             if required <= EPSILON:
                 continue
             relevant = candidate_deliveries.get((customer.index, order_index), {})
-            highs.addCol(25_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
-            slack_idx = highs.getNumCol() - 1
-            indices = [x_indices[candidate_index] for candidate_index in relevant] + [slack_idx]
-            quantities = [relevant[candidate_index] for candidate_index in relevant] + [1.0]
-            highs.addRow(
-                required,
-                inf,
-                len(indices),
-                np.array(indices, dtype=np.int32),
-                np.array(quantities, dtype=np.float64),
-            )
+            indices = [x_indices[candidate_index] for candidate_index in relevant]
+            quantities = [relevant[candidate_index] for candidate_index in relevant]
+            is_strict = strict and (not strict_keys or (customer.index, order_index) in strict_keys)
+            if is_strict:
+                highs.addRow(required, inf, len(indices), np.array(indices, dtype=np.int32), np.array(quantities, dtype=np.float64))
+            else:
+                highs.addCol(25_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
+                slack_idx = highs.getNumCol() - 1
+                highs.addRow(required, inf, len(indices) + 1, np.array([*indices, slack_idx], dtype=np.int32), np.array([*quantities, 1.0], dtype=np.float64))
 
 
 def _apply_quantities_to_shift(
@@ -998,3 +1083,70 @@ def _add_trailer_ending_inventory_constraints(
             np.array(row_indices, dtype=np.int32),
             np.array(row_coeffs, dtype=np.float64),
         )
+
+
+def _add_trailer_inventory_path_constraints(
+    highs,
+    instance: Instance,
+    prefix: Solution,
+    candidates: List[Shift],
+    x_indices,
+    q_variables: list[_QuantityVariable],
+    q_indices,
+):
+    """Keep each selected trailer's stock in [0, capacity] throughout time.
+
+    A route column is locally valid, but two non-overlapping columns can still
+    be incompatible if the first leaves a different load from the load assumed
+    by the second.  These cumulative constraints make the hand-off explicit.
+    """
+    q_by_shift_op = {
+        (variable.shift_index, variable.operation_index): q_index
+        for variable, q_index in zip(q_variables, q_indices)
+    }
+    fixed_events: dict[int, dict[int, float]] = {}
+    for shift in prefix.shifts:
+        trailer_events = fixed_events.setdefault(shift.trailer, {})
+        for operation in shift.operations:
+            trailer_events[operation.arrival] = (
+                trailer_events.get(operation.arrival, 0.0) - operation.quantity
+            )
+
+    candidate_events: dict[int, dict[int, list[tuple[int, float]]]] = {}
+    for candidate_index, shift in enumerate(candidates):
+        trailer_events = candidate_events.setdefault(shift.trailer, {})
+        for operation_index, operation in enumerate(shift.operations):
+            variable_index = q_by_shift_op.get((candidate_index, operation_index))
+            if variable_index is not None:
+                contribution = -1.0
+                index = variable_index
+            else:
+                contribution = -operation.quantity
+                index = x_indices[candidate_index]
+            trailer_events.setdefault(operation.arrival, []).append((index, contribution))
+
+    inf = 1e20
+    for trailer in instance.trailers:
+        fixed_by_time = fixed_events.get(trailer.index, {})
+        candidate_by_time = candidate_events.get(trailer.index, {})
+        if not candidate_by_time:
+            continue
+        stock = trailer.initial_quantity
+        coefficients: dict[int, float] = {}
+        for minute in sorted(set(fixed_by_time) | set(candidate_by_time)):
+            stock += fixed_by_time.get(minute, 0.0)
+            for index, contribution in candidate_by_time.get(minute, ()):
+                coefficients[index] = coefficients.get(index, 0.0) + contribution
+            if minute not in candidate_by_time:
+                continue
+            nonzero = [(index, value) for index, value in coefficients.items() if abs(value) > EPSILON]
+            if not nonzero:
+                continue
+            indices, values = zip(*nonzero)
+            highs.addRow(
+                -stock,
+                trailer.capacity - stock,
+                len(indices),
+                np.array(indices, dtype=np.int32),
+                np.array(values, dtype=np.float64),
+            )

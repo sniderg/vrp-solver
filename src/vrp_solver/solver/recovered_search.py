@@ -88,6 +88,8 @@ class PowerfulRepairConfig:
     exploration: float = 1.25
     initial_temperature: float = 2.0
     cooling_rate: float = 0.96
+    stop_when_feasible: bool = True
+    strict_missing_callin_orders: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,7 @@ def powerful_repair_search(
     *,
     config: PowerfulRepairConfig = PowerfulRepairConfig(),
     progress: Callable[[str], None] | None = print,
+    checkpoint: Callable[[Solution], None] | None = None,
 ) -> tuple[Solution, tuple[PowerfulRepairStep, ...]]:
     """Run an adaptive, severity-aware, escalating destroy/repair search.
 
@@ -199,7 +202,9 @@ def powerful_repair_search(
                 f"candidate_deficit,{step.candidate_safety_kg_min:.3f},"
                 f"best_errors,{step.best_errors},best_deficit,{step.best_safety_kg_min:.3f}"
             )
-        if best_score.feasible:
+        if checkpoint is not None:
+            checkpoint(best)
+        if best_score.feasible and config.stop_when_feasible:
             break
     return best, tuple(steps)
 
@@ -249,6 +254,7 @@ def _powerful_apply(
         multi_reload_columns=level >= 2,
         max_multi_reload_per_batch=8 + 6 * level,
         selector_time_limit=config.selector_time_limit,
+        strict_missing_callin_orders=config.strict_missing_callin_orders,
     )
     return _repair(instance, destroyed, repair_config)
 
