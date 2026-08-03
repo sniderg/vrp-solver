@@ -389,7 +389,7 @@ def solve_numba_gurobi_mip(
     model = gp.Model("Numba_Gurobi_IRP")
     model.Params.OutputFlag = 1
     model.Params.TimeLimit = time_limit_sec
-    model.Params.Presolve = 2       # Aggressive presolve to simplify matrix
+    model.Params.Presolve = 1       # Standard presolve to avoid presolve time limits on V2.14 and V2.19
     model.Params.MIPGap = 0.0001    # Tight convergence tolerance to eliminate high-penalty slacks
     model.Params.MIPFocus = 1     # Focus on finding feasible zero-runout integer solutions fast
     model.Params.Heuristics = 0.5

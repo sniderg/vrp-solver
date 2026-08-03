@@ -5,7 +5,7 @@ set -e
 #
 # Examples:
 #   ./solve.sh roadef_2016_data/set_B/Instances_B_V25-11042016/V2.12.xml native_V2.12.xml
-#   ./solve.sh roadef_2016_data/set_X/Instances\ X/X1.xml native_X1.xml 120
+#   ./solve.sh roadef_2016_data/set_B/Instances_B_V25-11042016/V2.25.xml native_V2.25.xml 1800
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: $0 <instance_xml_path> <output_solution_xml_path> [timeout_seconds]"
@@ -14,7 +14,7 @@ fi
 
 INST_PATH="$1"
 OUT_PATH="$2"
-TIME_LIMIT="${3:-120}"
+TIME_LIMIT="${3:-1800}"  # Default 1800 seconds (30 minutes), matching official ROADEF 2016 rules
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -27,7 +27,7 @@ inst_path = sys.argv[1]
 out_path = sys.argv[2]
 time_limit = float(sys.argv[3])
 
-print(f'🚀 Native Numba + Gurobi Solver starting on {inst_path} (Time Limit: {time_limit}s)...')
+print(f'🚀 Native Numba + Gurobi Solver starting on {inst_path} (Time Limit: {time_limit}s / {time_limit/60:.1f} mins)...')
 inst = load_instance(inst_path)
 sol = solve_numba_gurobi_mip(inst, n_samples_per_driver=500, time_limit_sec=time_limit)
 save_solution(sol, out_path)

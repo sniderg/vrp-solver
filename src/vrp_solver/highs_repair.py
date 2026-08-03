@@ -87,18 +87,15 @@ def repair_with_highs_selection(
         has_source = any(op.point in instance.source_by_point for op in shift.operations)
         for op_index, op in enumerate(shift.operations):
             customer = instance.customer_by_point.get(op.point)
-            if customer and not customer.call_in:
-                if is_fixed:
+            if customer:
+                if is_fixed or customer.call_in:
                     min_quantity = op.quantity
                     max_quantity = op.quantity
                 else:
                     min_quantity = customer.min_operation_quantity
                     if customer.orders:
                         min_quantity = max(min_quantity, op.quantity)
-                    if not has_source:
-                        max_quantity = op.quantity
-                    else:
-                        max_quantity = customer.capacity
+                    max_quantity = customer.capacity
                 variables.append(
                     _DeliveryVariable(
                         shift_index=shift.index,
@@ -207,8 +204,8 @@ def repair_with_highs_selection(
             lower_zero = 0.0 - customer.initial_tank_quantity + cumulative_demand
             upper = customer.capacity - customer.initial_tank_quantity + cumulative_demand
 
-            # 1. Safety breach slack
-            highs.addCol(10_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
+            # 1. Safety breach slack (penalty: 100 Billion to eliminate safety level violations)
+            highs.addCol(100_000_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
             slack_breach_idx = highs.getNumCol() - 1
             
             indices_l = indices + [slack_breach_idx]

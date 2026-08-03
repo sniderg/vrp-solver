@@ -390,6 +390,21 @@ def _validate_shift_operations(
             previous_point = operation.point
             previous_derived_driving = derived_op.driving_since_layover
 
+        if derived.operations:
+            last_derived_op = derived.operations[-1]
+            return_travel = instance.time_matrix[last_derived_op.point][instance.base_index]
+            total_driving_with_return = last_derived_op.driving_since_layover + return_travel
+            if total_driving_with_return - driver.max_driving_duration > EPSILON:
+                violations.append(
+                    _violation(
+                        "DRI03",
+                        f"driving including return leg {total_driving_with_return} exceeds max {driver.max_driving_duration}",
+                        shift=shift.index,
+                        operation=len(shift.operations) - 1,
+                        point=last_derived_op.point,
+                    )
+                )
+
     return violations
 
 

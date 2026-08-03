@@ -1954,12 +1954,7 @@ def _paper_customer_candidate(
         driving_after = instance.time_matrix[point][customer.index]
     elif driving_after > instance.drivers[resource.driver].max_driving_duration:
         return None
-    return_layover = driving_after + return_travel > instance.drivers[resource.driver].max_driving_duration
-    if return_layover and not (has_layover_customer or customer.layover_customer):
-        return None
-    if return_layover and departure + return_travel + instance.drivers[resource.driver].layover_duration > window.end:
-        return None
-    if not return_layover and not is_driving_duration_valid(instance.drivers[resource.driver], driving_after + return_travel):
+    if not is_driving_duration_valid(instance.drivers[resource.driver], driving_after + return_travel):
         return None
     return _Candidate(
         customer=customer,
@@ -1969,7 +1964,7 @@ def _paper_customer_candidate(
         travel_time=travel,
         driving_after=driving_after,
         layover_before=layover_before,
-        return_layover=return_layover,
+        return_layover=False,
         source_arrival=source_arrival,
         load_quantity=load_quantity,
         source_index=source.index,

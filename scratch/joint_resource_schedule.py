@@ -48,6 +48,14 @@ def main() -> None:
     parser.add_argument("--time-limit", type=float, default=300)
     parser.add_argument("--max-dropped", type=int)
     parser.add_argument("--warm-start")
+    parser.add_argument(
+        "--max-delay", type=int,
+        help="forbid a route from starting more than this many minutes late",
+    )
+    parser.add_argument(
+        "--pin-point", type=int, action="append", default=[],
+        help="keep routes serving this inventory point at or before their seed time",
+    )
     args = parser.parse_args()
 
     instance = load_instance(args.instance)
@@ -95,14 +103,28 @@ def main() -> None:
     model.Params.Threads = 8
     model.Params.MIPGap = 0
     starts = {}
+    # A trailer can be used only with its owning driver, whose availability
+    # may contain several independent duty windows.  The original prototype
+    # assumed a single window and consequently rejected the Set-B instances
+    # before building the resource model.  Keep the selected window with the
+    # assignment so every route is explicitly placed in one legal duty span.
     assignments = {}
     deviations = {}
     dropped = {}
     for position, shift in enumerate(solution.shifts):
         low, high = bounds[position]
+        pinned = any(
+            operation.point in args.pin_point
+            for operation in shift.operations
+        )
         starts[position] = model.addVar(
             lb=shift.start + low,
-            ub=shift.start + high,
+            ub=min(
+                shift.start + high,
+                shift.start
+                if pinned else shift.start + args.max_delay
+                if args.max_delay is not None else shift.start + high,
+            ),
             vtype=GRB.CONTINUOUS,
             name=f"start_{position}",
         )
@@ -120,17 +142,14 @@ def main() -> None:
         )
         variables = []
         for trailer in compatible[position]:
-            variable = model.addVar(
-                vtype=GRB.BINARY, name=f"use_{position}_{trailer}",
-            )
-            assignments[position, trailer] = variable
-            variables.append(variable)
             driver = instance.drivers[trailer_driver[trailer]]
             for window_index, window in enumerate(driver.time_windows):
-                if window_index:
-                    raise RuntimeError(
-                        "prototype expects one driver window",
-                    )
+                variable = model.addVar(
+                    vtype=GRB.BINARY,
+                    name=f"use_{position}_{trailer}_{window_index}",
+                )
+                assignments[position, trailer, window_index] = variable
+                variables.append(variable)
                 model.addGenConstrIndicator(
                     variable, True, starts[position] >= window.start,
                 )
@@ -152,14 +171,14 @@ def main() -> None:
         for right in range(left + 1, len(solution.shifts)):
             for driver in instance.drivers:
                 left_vars = [
-                    assignments[left, trailer]
-                    for trailer in by_driver[driver.index]
-                    if (left, trailer) in assignments
+                    variable
+                    for (position, trailer, _), variable in assignments.items()
+                    if position == left and trailer in by_driver[driver.index]
                 ]
                 right_vars = [
-                    assignments[right, trailer]
-                    for trailer in by_driver[driver.index]
-                    if (right, trailer) in assignments
+                    variable
+                    for (position, trailer, _), variable in assignments.items()
+                    if position == right and trailer in by_driver[driver.index]
                 ]
                 if not left_vars or not right_vars:
                     continue
@@ -189,7 +208,7 @@ def main() -> None:
 
     changed = gp.quicksum(
         variable
-        for (position, trailer), variable in assignments.items()
+        for (position, trailer, _), variable in assignments.items()
         if trailer != solution.shifts[position].trailer
     )
     lost_delivery = gp.quicksum(
@@ -253,10 +272,14 @@ def main() -> None:
                 shift.start if warm_shift is None else warm_shift.start
             )
             for trailer in compatible[position]:
-                assignments[position, trailer].Start = float(
-                    warm_shift is not None
-                    and trailer == warm_shift.trailer
-                )
+                driver = instance.drivers[trailer_driver[trailer]]
+                for window_index, window in enumerate(driver.time_windows):
+                    assignments[position, trailer, window_index].Start = float(
+                        warm_shift is not None
+                        and trailer == warm_shift.trailer
+                        and window.start <= warm_shift.start
+                        and warm_shift.start + durations[position] <= window.end
+                    )
     model.optimize()
     if model.SolCount == 0:
         raise SystemExit(f"no resource schedule: {model.Status}")
@@ -267,7 +290,12 @@ def main() -> None:
             continue
         trailer = max(
             compatible[position],
-            key=lambda item: assignments[position, item].X,
+            key=lambda item: sum(
+                assignments[position, item, window_index].X
+                for window_index in range(
+                    len(instance.drivers[trailer_driver[item]].time_windows)
+                )
+            ),
         )
         driver = trailer_driver[trailer]
         start = int(round(starts[position].X))
@@ -294,7 +322,7 @@ def main() -> None:
     changed_count = sum(
         variable.X > 0.5
         and trailer != solution.shifts[position].trailer
-        for (position, trailer), variable in assignments.items()
+        for (position, trailer, _), variable in assignments.items()
     )
     print(
         "resource_schedule,"
