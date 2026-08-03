@@ -496,32 +496,40 @@ def solve_numba_gurobi_mip(
                 cust_visits[pt].append((s.shift_id, i, arr_step))
                 
     steps_per_day = 1440 // unit if unit > 0 else 24
-    daily_checkpoints = set(range(steps_per_day - 1, horizon, steps_per_day))
+    half_daily_checkpoints = set(range(steps_per_day // 2 - 1, horizon, steps_per_day // 2))
     
     for c in instance.customers:
         if c.call_in:
             continue
             
         visits = cust_visits.get(c.index, [])
+        arr_steps_set = {arr_step for _, _, arr_step in visits}
             
         cum_demand = 0.0
         step_demand_map = {}
+        runout_steps = set()
         for step in range(horizon):
             if step < len(c.forecast):
                 cum_demand += c.forecast[step]
             step_demand_map[step] = cum_demand
-            
-        # Check EVERY step from 0 to horizon-1 (complete step-by-step zero-runout protection)
-        for step in range(horizon):
+            if cum_demand > c.initial_tank_quantity:
+                runout_steps.add(step)
+                
+        # Smart Checkpoints: Shift Arrival Steps + Runout Steps + 12h Checkpoints
+        checkpoints = sorted(arr_steps_set | runout_steps | half_daily_checkpoints)
+        
+        # Enforce max tank capacity at shift arrival steps (where overfills occur)
+        for step in sorted(arr_steps_set):
             delivered_vars = [q[s_id, op_idx] for s_id, op_idx, arr_step in visits if arr_step <= step]
             c_demand = step_demand_map[step]
-            
-            # Enforce max tank capacity at EVERY arrival step (HARD constraint to eliminate overfills)
             max_delivered = c.capacity + c_demand - c.initial_tank_quantity
             if delivered_vars:
                 model.addConstr(gp.quicksum(delivered_vars) <= max_delivered, name=f"inv_cap_{c.index}_{step}")
-            
-            # Enforce High Penalty ZERO-RUNOUT (slack_zero obj=1e8) across ALL steps where cum_demand > initial_tank
+        
+        # Enforce High Penalty ZERO-RUNOUT (slack_zero obj=1e8) at all targeted checkpoints
+        for step in checkpoints:
+            delivered_vars = [q[s_id, op_idx] for s_id, op_idx, arr_step in visits if arr_step <= step]
+            c_demand = step_demand_map[step]
             req_zero = c_demand - c.initial_tank_quantity
             if req_zero > 0:
                 slack_zero = model.addVar(vtype=GRB.CONTINUOUS, lb=0.0, obj=1e8, name=f"slack_zero_{c.index}_{step}")
@@ -530,8 +538,8 @@ def solve_numba_gurobi_mip(
                 else:
                     model.addConstr(slack_zero >= req_zero, name=f"inv_zero_{c.index}_{step}")
             
-            # Enforce high-penalty safety level (slack_safe obj=5e7) at daily checkpoints to maintain safety cushions
-            if step in daily_checkpoints:
+            # Enforce high-penalty safety level (slack_safe obj=5e7) at 12h checkpoints
+            if step in half_daily_checkpoints:
                 req_safe = c.safety_level + c_demand - c.initial_tank_quantity
                 if req_safe > 0:
                     slack_safe = model.addVar(vtype=GRB.CONTINUOUS, lb=0.0, obj=5e7, name=f"slack_safe_{c.index}_{step}")

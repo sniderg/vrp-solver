@@ -5,7 +5,7 @@ set -e
 #
 # Examples:
 #   ./solve.sh roadef_2016_data/set_B/Instances_B_V25-11042016/V2.12.xml native_V2.12.xml
-#   ./solve.sh roadef_2016_data/set_B/Instances_B_V25-11042016/V2.25.xml native_V2.25.xml 1800
+#   ./solve.sh roadef_2016_data/set_B/Instances_B_V25-11042016/V2.25.xml native_V2.25.xml 300
 
 if [ "$#" -lt 2 ]; then
     echo "Usage: $0 <instance_xml_path> <output_solution_xml_path> [timeout_seconds]"
@@ -14,7 +14,7 @@ fi
 
 INST_PATH="$1"
 OUT_PATH="$2"
-TIME_LIMIT="${3:-1800}"  # Default 1800 seconds (30 minutes), matching official ROADEF 2016 rules
+TIME_LIMIT="${3:-300}"  # Default 300 seconds (5 minutes)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

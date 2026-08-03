@@ -48,7 +48,7 @@ for inst_path in instances:
         checker_cmd = ["python3", "-m", "vrp_solver.cli", "check", str(inst_path), str(out_xml_path)]
         res = subprocess.run(checker_cmd, capture_output=True, text=True)
         
-        checker_passed = "SOLUTION OK" in res.stdout or "CHECKING SUCCESSFUL" in res.stdout or res.returncode == 0
+        checker_passed = ("SOLUTION OK" in res.stdout or "CHECKING SUCCESSFUL" in res.stdout) and "CHECKING FAILED" not in res.stdout
         status_str = "PASSED" if checker_passed else "CHECKER_ISSUES"
         print(f"Checker Status: {status_str}")
         
