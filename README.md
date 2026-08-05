@@ -2,6 +2,12 @@
 
 A standalone, Cython-optimized combinatorial optimization toolkit for the Inventory Routing Problem (IRP), based on the ROADEF 2016 challenge. The project combines MILP-based route selection, column-generation-style rescue, rolling robust planning, ALNS/local search, fast inventory simulation, and optional ML-guided route priorities.
 
+> **Validation correction (2026-08-05):** the historical claim that all 20
+> tracked native Set B/Set X outputs were officially valid has been withdrawn.
+> A fail-closed run of the released checker rejects all 20 historical XMLs.
+> See [NATIVE_BENCHMARK_RESULTS.md](NATIVE_BENCHMARK_RESULTS.md) for the audited
+> status. Only outputs with `official_valid,True` may be described as valid.
+
 ## Features
 
 - **MILP route selection**: Selects compatible shifts under driver, trailer, timing, inventory, and order constraints using HiGHS or Gurobi.
@@ -30,6 +36,24 @@ If you have a Gurobi license, you can install the optional Gurobi bindings:
 ```bash
 pip install -e ".[gurobi]"
 ```
+This extra also installs Numba, which is required by the native Gurobi solver.
+
+## Solver entry points
+
+Both entry points prepare the project through `uv`, write a pending XML, and
+only publish it after the released ROADEF V2 checker accepts it.
+
+```bash
+# Native implementation (the default; solve.sh remains an alias for this)
+./solve_native.sh <instance.xml> <native-output.xml> [timeout-seconds]
+
+# Original Windows Solver.exe under Wine, for oracle/comparison experiments.
+# Extra arguments are seed, iterations (0 = constructor-only), and workers.
+./solve_oracle.sh <instance.xml> <oracle-output.xml> [timeout-seconds] [seed] [iterations] [workers]
+```
+
+`solve_oracle.sh` requires the prepared Wine/Gurobi compatibility runtime in
+`/private/tmp/solver-oracle`; set `WINEPREFIX` to use a different Wine prefix.
 
 ## Command Line Interface (CLI)
 

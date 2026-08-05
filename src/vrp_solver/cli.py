@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .analysis import customer_inventory_summary, summarize_solution
+from .audit import audit_solution
 from .contest import score_prefix_with_feasibility_tail
 from .solver.greedy import construct_solution
 from .solver.cluster_greedy import construct_cluster_solution, construct_paper_solution
@@ -38,6 +39,7 @@ from .replay import (
     status_overview,
 )
 from .rules import validate_solution
+from .official_verify import default_v2_archive, verify_v2_solution
 from .rolling import rolling_days, rolling_summary
 from .smoothness import period_buckets, smoothness_summary
 from .xml_io import load_instance, load_solution, save_solution
@@ -900,6 +902,51 @@ def cmd_rule_check(args: argparse.Namespace) -> int:
     return 1 if error_count and args.fail_on_violation else 0
 
 
+def cmd_verify_official(args: argparse.Namespace) -> int:
+    """Run the authoritative checker and never call an unavailable result valid."""
+    archive = args.checker_archive or default_v2_archive(PROJECT_ROOT)
+    result = verify_v2_solution(
+        Path(args.instance_xml),
+        Path(args.solution_xml),
+        checker_archive=archive,
+        timeout_seconds=args.timeout,
+    )
+    print(f"official_status,{result.status}")
+    print(f"official_valid,{result.valid}")
+    print(f"message,{result.message}")
+    print(f"checker_archive,{result.checker_archive or ''}")
+    print(f"checker_sha256,{result.checker_sha256 or ''}")
+    print(f"checker_return_code,{'' if result.return_code is None else result.return_code}")
+    print(f"official_logistic_ratio,{'' if result.logistic_ratio is None else result.logistic_ratio}")
+    for code, count in result.rule_counts.items():
+        print(f"official_rule_{code},{count}")
+    if args.log:
+        Path(args.log).write_text(result.output, encoding="utf-8")
+    return 0 if result.valid else 1
+
+
+def cmd_audit_solution(args: argparse.Namespace) -> int:
+    """Create separate simulator, checker, analyzer, and oracle artifacts."""
+    instance_path = Path(args.instance_xml)
+    solution_path = Path(args.solution_xml)
+    instance = load_instance(instance_path)
+    solution = load_solution(solution_path)
+    result = audit_solution(
+        instance,
+        solution,
+        instance_xml=instance_path,
+        solution_xml=solution_path,
+        output_dir=Path(args.output_dir),
+        checker_archive=args.checker_archive or default_v2_archive(PROJECT_ROOT),
+        official_timeout=args.timeout,
+    )
+    print(f"audit_dir,{Path(args.output_dir)}")
+    print(f"official_status,{result.status}")
+    print(f"official_valid,{result.valid}")
+    print(f"published,{result.valid}")
+    return 0 if result.valid else 1
+
+
 def cmd_rules_index(args: argparse.Namespace) -> int:
     print(RULES_INDEX.read_text())
     return 0
@@ -1674,6 +1721,28 @@ def build_parser() -> argparse.ArgumentParser:
     rule_check.add_argument("--limit", type=int, default=20)
     rule_check.add_argument("--fail-on-violation", action="store_true")
     rule_check.set_defaults(func=cmd_rule_check)
+
+    verify_official = subparsers.add_parser(
+        "verify-official",
+        help="Fail-closed validation using the released ROADEF V2 checker.",
+    )
+    verify_official.add_argument("instance_xml")
+    verify_official.add_argument("solution_xml")
+    verify_official.add_argument("--checker-archive", type=Path)
+    verify_official.add_argument("--timeout", type=float, default=180.0)
+    verify_official.add_argument("--log", type=Path)
+    verify_official.set_defaults(func=cmd_verify_official)
+
+    audit = subparsers.add_parser(
+        "audit-solution",
+        help="Write separate simulator, native-checker, analyzer, and official-checker artifacts.",
+    )
+    audit.add_argument("instance_xml")
+    audit.add_argument("solution_xml")
+    audit.add_argument("output_dir", type=Path)
+    audit.add_argument("--checker-archive", type=Path)
+    audit.add_argument("--timeout", type=float, default=180.0)
+    audit.set_defaults(func=cmd_audit_solution)
 
     rules_index = subparsers.add_parser("rules-index")
     rules_index.set_defaults(func=cmd_rules_index)
