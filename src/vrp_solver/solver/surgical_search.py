@@ -42,6 +42,7 @@ class SurgicalSearchConfig:
     workers: int = 6
     first_operator: str | None = None
     output_xml: str | None = None
+    coverage_include_ejection: bool = True
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,12 @@ OPERATORS = (
 )
 
 logging.getLogger("vrp_solver.highs_time_opt").setLevel(logging.ERROR)
+
+
+class _CandidateGenerationDeadline(Exception):
+    def __init__(self, candidates: list[Solution]):
+        super().__init__("candidate generation deadline reached")
+        self.candidates = candidates
 
 
 def surgical_search(
@@ -140,10 +147,20 @@ def surgical_search(
             else:
                 operator_index = OPERATORS.index("delete_operation")
         else:
-            operator_index = _select_operator(
-                rewards, attempts, last_used, iteration, rng,
-                feasibility_bias=not best_score.feasible,
+            coverage_operator = _coverage_rebuild_operator(
+                instance,
+                current,
+                config,
+                iteration=iteration,
+                stagnation=stagnation,
             )
+            if coverage_operator is not None:
+                operator_index = OPERATORS.index(coverage_operator)
+            else:
+                operator_index = _select_operator(
+                    rewards, attempts, last_used, iteration, rng,
+                    feasibility_bias=not best_score.feasible,
+                )
         operator = OPERATORS[operator_index]
         if progress:
             progress(
@@ -154,7 +171,11 @@ def surgical_search(
                 f"structural,{structural_errors}"
             )
         perturbation = min(64, 8 * stagnation)
-        candidates = _candidates(instance, current, operator, config, rng)
+        candidates = _candidates(
+            instance, current, operator, config, rng, deadline=deadline,
+        )
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         # The EXE perturbs enumeration after stagnation. Sampling a seeded
         # permutation gives the capped native scorer expanding coverage. Keep
         # every compound delete endpoint inside the cap, though: these are the
@@ -388,6 +409,8 @@ def surgical_search(
                     if item not in repair_pool:
                         repair_pool.append(item)
             for raw_candidate, _ in repair_pool:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 repaired, report = repair_quantities_with_highs(
                     instance,
                     raw_candidate,
@@ -395,6 +418,7 @@ def surgical_search(
                     feasibility_days=config.end_day,
                     ignore_tail_call_ins=True,
                     quantity_objective="max-delivered",
+                    time_limit_seconds=_remaining_time(deadline),
                 )
                 if (
                     report.status != "Optimal"
@@ -409,6 +433,7 @@ def surgical_search(
                         feasibility_days=config.end_day,
                         ignore_tail_call_ins=True,
                         quantity_objective="min-delivered",
+                        time_limit_seconds=_remaining_time(deadline),
                     )
                     if report.status == "Optimal":
                         compacted = _compact_after_activation(
@@ -555,6 +580,7 @@ def surgical_search(
                     feasibility_days=config.end_day,
                     ignore_tail_call_ins=True,
                     quantity_objective="max-delivered",
+                    time_limit_seconds=_remaining_time(deadline),
                 )
                 repaired_score = _score(
                     instance, repaired, config.end_day,
@@ -670,12 +696,64 @@ def surgical_search(
     return best, tuple(steps)
 
 
+def _remaining_time(deadline: float | None) -> float:
+    if deadline is None:
+        return 300.0
+    return max(0.01, deadline - time.monotonic())
+
+
+def _coverage_rebuild_operator(
+    instance: Instance,
+    solution: Solution,
+    config: SurgicalSearchConfig,
+    *,
+    iteration: int,
+    stagnation: int,
+) -> str | None:
+    """Choose topology-building moves while required coverage is absent.
+
+    This is a feature gate, not an instance policy.  A VMI customer remains
+    uncovered while it has any full-horizon pressure interval; merely having
+    a token early visit is not sufficient coverage.  An errored call-in counts
+    as uncovered when the full checker reports an unsatisfied order.  Rotating
+    insertion surfaces prevents a saturated create-shift neighbourhood from
+    monopolising the search.
+    """
+    missing: set[int] = set()
+    for pressure in pressure_points(
+        instance, solution, end_day=config.end_day,
+    ):
+        missing.add(pressure.customer)
+    missing.update(
+        violation.point
+        for violation in validate_solution(instance, solution)
+        if (
+            violation.severity == "error"
+            and violation.code == "QS01"
+            and violation.point is not None
+        )
+    )
+    if not missing:
+        return None
+    surfaces = [
+        "create_shift",
+        "insert_operation",
+        "pressure_band_resource_block",
+    ]
+    if config.coverage_include_ejection:
+        surfaces.append("replace_operation_point")
+    surfaces.append("recombine_route_blocks")
+    diversification_offset = stagnation // len(surfaces)
+    return surfaces[(iteration + diversification_offset) % len(surfaces)]
+
+
 def _candidates(
     instance: Instance,
     solution: Solution,
     operator: str,
     config: SurgicalSearchConfig,
     rng: random.Random,
+    deadline: float | None = None,
 ) -> list[Solution]:
     if operator == "create_shift":
         return _create_shift_candidates(instance, solution, config)
@@ -690,11 +768,16 @@ def _candidates(
     if operator == "relocate_between_shifts":
         return _between_shift_candidates(instance, solution, config, rng)
     if operator == "recombine_route_blocks":
-        return _recombine_route_block_candidates(instance, solution, config, rng)
-    if operator == "pressure_band_resource_block":
-        return _pressure_band_resource_block_candidates(
-            instance, solution, config, rng,
+        return _recombine_route_block_candidates(
+            instance, solution, config, rng, deadline=deadline,
         )
+    if operator == "pressure_band_resource_block":
+        try:
+            return _pressure_band_resource_block_candidates(
+                instance, solution, config, rng, deadline=deadline,
+            )
+        except _CandidateGenerationDeadline as exc:
+            return exc.candidates
     if operator == "joint_retailer_reinsert":
         return _joint_retailer_reinsert_candidates(instance, solution, config)
     return _within_shift_candidates(instance, solution, config, rng)
@@ -2085,6 +2168,7 @@ def _pressure_band_resource_block_candidates(
     solution: Solution,
     config: SurgicalSearchConfig,
     rng: random.Random,
+    deadline: float | None = None,
 ) -> list[Solution]:
     """Rebuild routes around high-area inventory pressure intervals.
 
@@ -2103,7 +2187,12 @@ def _pressure_band_resource_block_candidates(
     results: list[Solution] = []
     seen: set[str] = set()
 
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _CandidateGenerationDeadline(results)
+
     def append_candidate(shifts: list[Shift]) -> None:
+        check_deadline()
         candidate = normalize_source_loads(
             instance, _reindex(Solution(tuple(shifts))),
         )
@@ -2113,6 +2202,8 @@ def _pressure_band_resource_block_candidates(
             results.append(candidate)
 
     for pressure in pressures:
+        if deadline is not None and time.monotonic() >= deadline:
+            return results
         target_customer = instance.customer_by_point[pressure.customer]
         target_positions = [
             (shift_position, operation_position)
@@ -2152,6 +2243,7 @@ def _pressure_band_resource_block_candidates(
             for shift_position, operation_position in replacement_slots[
                 : max(32, config.samples_per_customer * 8)
             ]:
+                check_deadline()
                 shift = solution.shifts[shift_position]
                 operations = list(shift.operations)
                 operations[operation_position] = Operation(
@@ -2179,6 +2271,8 @@ def _pressure_band_resource_block_candidates(
                     return results
             continue
         for target_shift_position, target_operation_position in target_positions[:4]:
+            if deadline is not None and time.monotonic() >= deadline:
+                return results
             target_shift = solution.shifts[target_shift_position]
             target_operation = target_shift.operations[target_operation_position]
 
@@ -2200,6 +2294,7 @@ def _pressure_band_resource_block_candidates(
                         window.end - target_customer.setup_time - target_offset,
                     ))
             for driver in instance.drivers:
+                check_deadline()
                 for trailer_id in driver.trailer_ids:
                     if not _route_allows_trailer(
                         instance, target_shift, trailer_id,
@@ -2269,6 +2364,7 @@ def _pressure_band_resource_block_candidates(
                 reverse=True,
             )[:2]
             for predecessor_position in predecessor_positions:
+                check_deadline()
                 predecessor = solution.shifts[predecessor_position]
                 for predecessor_driver in instance.drivers:
                     for predecessor_trailer in predecessor_driver.trailer_ids:
@@ -2365,6 +2461,7 @@ def _pressure_band_resource_block_candidates(
                 + target_shift.operations[target_operation_position + 1:]
             )
             for insertion in range(len(without_target) + 1):
+                check_deadline()
                 operations = (
                     without_target[:insertion]
                     + (target_operation,)
@@ -2423,6 +2520,7 @@ def _pressure_band_resource_block_candidates(
             # tiny positive amount at the late visit and assign useful volume
             # to the early duplicate.
             for other_shift_position, other_operation_position in head:
+                check_deadline()
                 other_shift = solution.shifts[other_shift_position]
                 displaced = other_shift.operations[other_operation_position]
                 displaced_customer = instance.customer_by_point[displaced.point]
@@ -2475,6 +2573,7 @@ def _pressure_band_resource_block_candidates(
                 )
                 if retimed_donor is not None:
                     for other_shift_position, other_operation_position in head:
+                        check_deadline()
                         other_shift = solution.shifts[other_shift_position]
                         displaced = other_shift.operations[other_operation_position]
                         displaced_customer = instance.customer_by_point[
@@ -2511,6 +2610,7 @@ def _pressure_band_resource_block_candidates(
                         if len(results) >= cap:
                             return results
             for other_shift_position, other_operation_position in head:
+                check_deadline()
                 other_shift = solution.shifts[other_shift_position]
                 other_operation = other_shift.operations[other_operation_position]
                 target_operations = list(target_shift.operations)
@@ -2557,6 +2657,7 @@ def _pressure_band_resource_block_candidates(
             # This frees the early slot without forcing B's displaced visit
             # into A when its window is incompatible there.
             for b_shift_position, b_operation_position in head[:32]:
+                check_deadline()
                 b_shift = solution.shifts[b_shift_position]
                 b_operation = b_shift.operations[b_operation_position]
                 b_customer = instance.customer_by_point[b_operation.point]
@@ -2587,6 +2688,7 @@ def _pressure_band_resource_block_candidates(
                     - target_operation.arrival
                 ))
                 for c_shift_position, c_operation_position in c_slots[:24]:
+                    check_deadline()
                     c_shift = solution.shifts[c_shift_position]
                     c_operation = c_shift.operations[c_operation_position]
                     a_operations = list(target_shift.operations)
@@ -2656,6 +2758,7 @@ def _pressure_band_resource_block_candidates(
                 tuple[int, int, int, int, int]
             ] = []
             for length in (2, 3):
+                check_deadline()
                 for target_start in range(
                     max(0, target_operation_position - length + 1),
                     min(
@@ -2674,6 +2777,7 @@ def _pressure_band_resource_block_candidates(
                     for other_shift_position, other_shift in enumerate(
                         solution.shifts
                     ):
+                        check_deadline()
                         if other_shift_position == target_shift_position:
                             continue
                         for other_start in range(
@@ -2732,6 +2836,7 @@ def _pressure_band_resource_block_candidates(
                 other_shift_position,
                 other_start,
             ) in fragment_moves[: max(32, config.samples_per_customer * 8)]:
+                check_deadline()
                 other_shift = solution.shifts[other_shift_position]
                 target_fragment = target_shift.operations[
                     target_start:target_start + length
@@ -2791,6 +2896,7 @@ def _recombine_route_block_candidates(
     solution: Solution,
     config: SurgicalSearchConfig,
     rng: random.Random,
+    deadline: float | None = None,
 ) -> list[Solution]:
     """Exchange complete customer blocks between two existing routes.
 
@@ -2828,6 +2934,8 @@ def _recombine_route_block_candidates(
     # obviously fragile pairs.
     merge_moves.sort()
     for _rank, recipient_position, donor_position in merge_moves[:cap]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return result
         recipient = solution.shifts[recipient_position]
         donor = solution.shifts[donor_position]
         merged_operations = recipient.operations + donor.operations
@@ -2867,6 +2975,8 @@ def _recombine_route_block_candidates(
     ]
     rng.shuffle(moves)
     for left_position, left_block, right_position, right_block in moves:
+        if deadline is not None and time.monotonic() >= deadline:
+            return result
         shifts = list(solution.shifts)
         left, right = shifts[left_position], shifts[right_position]
         left_insert = right.operations[right_block[0]:right_block[1]]

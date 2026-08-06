@@ -6,13 +6,18 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .analysis import customer_inventory_summary, summarize_solution
 from .audit import audit_solution
 from .contest import score_prefix_with_feasibility_tail
 from .solver.greedy import construct_solution
-from .solver.cluster_greedy import construct_cluster_solution, construct_paper_solution
+from .solver.cluster_greedy import (
+    construct_cluster_solution,
+    construct_paper_solution,
+    derive_cluster_construction_policy,
+)
 from .evaluate import evaluate_solution
 from .improve import (
     prune_redundant_shifts,
@@ -1018,6 +1023,88 @@ def cmd_cluster_construct_solution(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_native_solve(args: argparse.Namespace) -> int:
+    """Run the production native cold-start constructor and topology search."""
+    from .solver.surgical_search import SurgicalSearchConfig, surgical_search
+
+    started = time.monotonic()
+    deadline = started + args.time_limit
+    instance = load_instance(args.instance_xml)
+    policy = derive_cluster_construction_policy(instance)
+    end_day = max(1, (instance.horizon * instance.unit + 1439) // 1440)
+    seed_solution, report = construct_cluster_solution(
+        instance,
+        safety_buffer=args.safety_buffer,
+        neighborhood_size=policy.neighborhood_size,
+        score_cutoff_minute=end_day * 1440,
+        global_pressure_fill=policy.global_pressure_fill,
+        tie_break_seed=args.seed,
+    )
+    solution = seed_solution
+    steps = []
+    completed_rounds = 0
+    restart_first_operators = (
+        None,
+        "replace_operation_point",
+        "pressure_band_resource_block",
+        "recombine_route_blocks",
+    )
+    for round_index in range(args.restart_rounds):
+        errors = sum(
+            violation.severity == "error"
+            for violation in validate_solution(instance, solution)
+        )
+        if errors == 0:
+            break
+        remaining = deadline - time.monotonic()
+        rounds_left = args.restart_rounds - round_index
+        if remaining <= 0:
+            break
+        round_budget = max(0.01, remaining / rounds_left)
+        print(
+            f"native_round,{round_index},errors,{errors},"
+            f"budget,{round_budget:.3f}"
+        )
+        solution, round_steps = surgical_search(
+            instance,
+            solution,
+            config=SurgicalSearchConfig(
+                end_day=end_day,
+                iterations=args.iterations,
+                candidates_per_move=args.candidates_per_move,
+                pressure_customers=args.pressure_customers,
+                samples_per_customer=args.samples_per_customer,
+                seed=args.seed + round_index,
+                time_limit_seconds=round_budget,
+                no_improvement_limit=args.no_improvement_limit,
+                workers=args.workers,
+                first_operator=restart_first_operators[
+                    round_index % len(restart_first_operators)
+                ],
+                output_xml=str(args.output_xml),
+                coverage_include_ejection=round_index > 0,
+            ),
+            progress=print,
+        )
+        steps.extend(round_steps)
+        completed_rounds += 1
+        save_solution(solution, args.output_xml)
+    save_solution(solution, args.output_xml)
+    errors = sum(
+        violation.severity == "error"
+        for violation in validate_solution(instance, solution)
+    )
+    print(f"wrote,{args.output_xml}")
+    print(f"constructor_neighborhood_size,{policy.neighborhood_size}")
+    print(f"constructor_global_pressure_fill,{policy.global_pressure_fill}")
+    print(f"constructor_unscheduled_customers,{len(report.unscheduled_customers)}")
+    print(f"restart_rounds,{completed_rounds}")
+    print(f"search_steps,{len(steps)}")
+    print(f"wall_time_seconds,{time.monotonic() - started:.3f}")
+    print(f"local_errors,{errors}")
+    return 0 if errors == 0 else 1
+
+
 def cmd_paper_construct_solution(args: argparse.Namespace) -> int:
     """Run the published HUST/S24 construction without Solver.exe output."""
     instance = load_instance(args.instance_xml)
@@ -1766,12 +1853,12 @@ def build_parser() -> argparse.ArgumentParser:
     cluster_construct.add_argument("instance_xml")
     cluster_construct.add_argument("output_xml")
     cluster_construct.add_argument("--safety-buffer", type=float, default=0.20)
-    cluster_construct.add_argument("--neighborhood-size", type=int, default=5)
+    cluster_construct.add_argument("--neighborhood-size", type=int)
     cluster_construct.add_argument("--max-shifts", type=int)
     cluster_construct.add_argument("--score-days", type=int)
     cluster_construct.add_argument("--terminal-buffer-days", type=float, default=0.0)
     cluster_construct.add_argument("--max-smoothing", type=int, default=0)
-    cluster_construct.add_argument("--global-pressure-fill", type=int, default=0)
+    cluster_construct.add_argument("--global-pressure-fill", type=int)
     cluster_construct.add_argument("--global-pressure-offset", type=int, default=0)
     cluster_construct.add_argument("--tie-break-seed", type=int, default=0)
     cluster_construct.add_argument(
@@ -1796,6 +1883,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cluster_construct.add_argument("--limit", type=int, default=25)
     cluster_construct.set_defaults(func=cmd_cluster_construct_solution)
+
+    native_solve = subparsers.add_parser(
+        "native-solve",
+        help="solve from instance data only using feature-scaled construction and topology search",
+    )
+    native_solve.add_argument("instance_xml", type=Path)
+    native_solve.add_argument("output_xml", type=Path)
+    native_solve.add_argument("--seed", type=int, default=0)
+    native_solve.add_argument("--safety-buffer", type=float, default=0.20)
+    native_solve.add_argument("--iterations", type=int, default=64)
+    native_solve.add_argument("--candidates-per-move", type=int, default=120)
+    native_solve.add_argument("--pressure-customers", type=int, default=24)
+    native_solve.add_argument("--samples-per-customer", type=int, default=10)
+    native_solve.add_argument("--time-limit", type=float, default=300.0)
+    native_solve.add_argument("--no-improvement-limit", type=int, default=24)
+    native_solve.add_argument("--workers", type=int, default=2)
+    native_solve.add_argument("--restart-rounds", type=int, default=2)
+    native_solve.set_defaults(func=cmd_native_solve)
 
     paper_construct = subparsers.add_parser(
         "paper-construct-solution",

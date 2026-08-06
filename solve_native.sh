@@ -19,23 +19,23 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-$SCRIPT_DIR/.uv-cache}"
 mkdir -p "$UV_CACHE_DIR"
 
 cd "$SCRIPT_DIR"
+OUT_DIR="$(dirname "$OUT_PATH")"
+mkdir -p "$OUT_DIR"
 PENDING_PATH="$(mktemp "${OUT_PATH}.pending.XXXXXX")"
+trap 'rm -f "$PENDING_PATH"' EXIT
 
-# This deliberately avoids the old Gurobi/WLS path: cold starts must work
-# without network access or a commercial-token service.  The constructor is
-# stateful (source/customer/reload chains), unlike the obsolete one-load MIP.
-# TIME_LIMIT is retained in the public interface for compatibility; retry
-# count is bounded explicitly until a deadline-aware portfolio is added.
-NATIVE_RETRIES="${NATIVE_RETRIES:-1}"
-echo "Native stateful cold-start solver: $INST_PATH; target limit ${TIME_LIMIT}s; retries $NATIVE_RETRIES"
-uv run vrp-solver paper-construct-solution "$INST_PATH" "$PENDING_PATH" \
-    --seed "${NATIVE_SEED:-1}" \
-    --retries "$NATIVE_RETRIES" \
-    --selection-range "${NATIVE_SELECTION_RANGE:-1.5}" \
-    --refill-coefficient "${NATIVE_REFILL_COEFFICIENT:-2.0}" \
-    --candidate-pool-size "${NATIVE_CANDIDATE_POOL_SIZE:-64}" \
-    --economic-urgency-minutes "${NATIVE_ECONOMIC_URGENCY_MINUTES:-0}"
+# Cold starts use only the instance plus feature-derived policy.  Checkpoint
+# restarts and their time slices are owned by native-solve, so no interactive
+# or LLM-assisted continuation is needed.
+echo "Native chain-first cold-start solver: $INST_PATH; target limit ${TIME_LIMIT}s"
+uv run vrp-solver native-solve "$INST_PATH" "$PENDING_PATH" \
+    --seed "${NATIVE_SEED:-0}" \
+    --time-limit "$TIME_LIMIT" \
+    --restart-rounds "${NATIVE_RESTART_ROUNDS:-2}" \
+    --iterations "${NATIVE_ITERATIONS:-64}" \
+    --candidates-per-move "${NATIVE_CANDIDATES_PER_MOVE:-120}" \
+    --workers "${NATIVE_WORKERS:-2}"
 
-uv run --extra gurobi vrp-solver verify-official "$INST_PATH" "$PENDING_PATH"
+uv run vrp-solver verify-official "$INST_PATH" "$PENDING_PATH"
 mv "$PENDING_PATH" "$OUT_PATH"
 echo "Accepted native solution: $OUT_PATH"

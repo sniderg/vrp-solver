@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import math
 from dataclasses import dataclass, replace
 from typing import Dict, List, Set, Tuple
 
@@ -33,6 +34,10 @@ WEEKEND_DELIVERY_WEIGHT = 0.65
 # top up once the trailer is materially depleted so the current cluster can
 # be completed in the same driver window.
 PROACTIVE_RELOAD_RATIO = 0.40
+# Call-in orders are official feasibility requirements.  Reserve the next few
+# days of compatible resource time for them before spending their only driver
+# / trailer pair on optional VMI route fillers.
+CALL_IN_RESERVATION_MINUTES = 3 * 1440
 
 @dataclass(frozen=True)
 class ConstructionReport:
@@ -42,6 +47,37 @@ class ConstructionReport:
     unscheduled_customers: tuple[int, ...]
     exhausted_resources: bool
     attempts: int = 1
+
+
+@dataclass(frozen=True)
+class ClusterConstructionPolicy:
+    """Feature-derived breadth controls for native cold-start construction."""
+
+    neighborhood_size: int
+    global_pressure_fill: int
+
+
+def derive_cluster_construction_policy(instance: Instance) -> ClusterConstructionPolicy:
+    """Scale route-chain breadth from size and trailer compatibility.
+
+    The policy deliberately depends only on continuous instance features.  A
+    sparse compatibility graph needs a broader related-customer pool because
+    each resource window has fewer interchangeable opportunities.
+    """
+    customers = max(1, len(instance.customers))
+    trailers = max(1, len(instance.trailers))
+    compatibility = sum(
+        len(customer.allowed_trailers) / trailers
+        for customer in instance.customers
+    ) / customers
+    scarcity = min(1.0, max(0.0, 1.0 - compatibility))
+    scale = math.sqrt(customers)
+    neighborhood_size = min(16, max(5, round(scale * (1.0 + 0.5 * scarcity))))
+    global_pressure_fill = min(16, max(4, round(scale * (1.0 + scarcity))))
+    return ClusterConstructionPolicy(
+        neighborhood_size=neighborhood_size,
+        global_pressure_fill=global_pressure_fill,
+    )
 
 @dataclass
 class _DriverState:
@@ -81,12 +117,12 @@ def construct_cluster_solution(
     instance: Instance,
     *,
     safety_buffer: float = 0.20,
-    neighborhood_size: int = 5,
+    neighborhood_size: int | None = None,
     max_shifts: int | None = None,
     score_cutoff_minute: int | None = None,
     terminal_buffer_days: float = 0.0,
     max_smoothing: int = 0,
-    global_pressure_fill: int = 0,
+    global_pressure_fill: int | None = None,
     global_pressure_offset: int = 0,
     tie_break_seed: int = 0,
     limit_reload_after_empty_start: bool = False,
@@ -94,6 +130,11 @@ def construct_cluster_solution(
     first_stop_targeted: bool = True,
     prioritize_early_callins: bool = True,
 ) -> tuple[Solution, ConstructionReport]:
+    policy = derive_cluster_construction_policy(instance)
+    if neighborhood_size is None:
+        neighborhood_size = policy.neighborhood_size
+    if global_pressure_fill is None:
+        global_pressure_fill = policy.global_pressure_fill
     drivers, trailers = _initial_resources(instance)
     scheduled: dict[int, dict[int, float]] = {customer.index: {} for customer in instance.customers}
     ignore_before_step: dict[int, int] = {customer.index: 0 for customer in instance.customers}
@@ -1195,15 +1236,10 @@ def _candidate_for_customer(
     else:
         driving_after = driving + total_travel
         if not is_driving_duration_valid(instance.drivers[resource.driver], driving_after + ret_travel):
-            if (
-                not layover_used
-                and (has_layover_customer or customer.layover_customer)
-                and is_driving_duration_valid(instance.drivers[resource.driver], driving_after)
-                and departure + ret_travel + instance.drivers[resource.driver].layover_duration <= window.end
-            ):
-                return_layover = True
-            else:
-                return None
+            # A final return has no XML operation at which a rest can be
+            # represented.  Treating a layover-capable customer as an
+            # implicit return rest produces DRI03 under the released checker.
+            return None
     arrival_step = min(max(arrival // instance.unit, 0), instance.horizon - 1)
     inv_at_arr = events[arrival_step].after_consumption
 
@@ -1332,15 +1368,7 @@ def _candidate_for_call_in(
     else:
         driving_after = driving + total_travel
         if not is_driving_duration_valid(instance.drivers[resource.driver], driving_after + ret_travel):
-            if (
-                not layover_used
-                and (has_layover_customer or customer.layover_customer)
-                and is_driving_duration_valid(instance.drivers[resource.driver], driving_after)
-                and departure + ret_travel + instance.drivers[resource.driver].layover_duration <= window.end
-            ):
-                return_layover = True
-            else:
-                return None
+            return None
 
     qty = min(trailer_qty, remaining)
     if qty <= EPSILON:
@@ -1655,6 +1683,7 @@ def _build_paper_shift(
     operations: list[Operation] = []
     visited: set[int] = set()
     has_layover_customer = False
+    layover_used = False
 
     while True:
         candidates = []
@@ -1687,6 +1716,7 @@ def _build_paper_shift(
                 customer=customer,
                 deliveries=scheduled[customer.index],
                 has_layover_customer=has_layover_customer,
+                layover_used=layover_used,
                 force_reload=False,
                 at_route_start=not operations,
                 inventory_cache=inventory_cache,
@@ -1702,6 +1732,7 @@ def _build_paper_shift(
                     customer=customer,
                     deliveries=scheduled[customer.index],
                     has_layover_customer=has_layover_customer,
+                    layover_used=layover_used,
                     force_reload=True,
                     at_route_start=not operations,
                     inventory_cache=inventory_cache,
@@ -1731,6 +1762,26 @@ def _build_paper_shift(
         ]
         if economical:
             candidates = economical
+
+        # A small random top-k range is useful for geographic route packing,
+        # but it must not let a near-term call-in order disappear behind many
+        # VMI tanks.  This is a reservation, not a fixed-route assignment: it
+        # only applies when the current resource can legally serve the order.
+        imminent_call_ins = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate.customer.call_in
+                and (order := _next_unsatisfied_order(
+                    candidate.customer,
+                    scheduled[candidate.customer.index],
+                )) is not None
+                and order[1].latest_time
+                <= current_time + CALL_IN_RESERVATION_MINUTES
+            )
+        ]
+        if imminent_call_ins:
+            candidates = imminent_call_ins
 
         candidates.sort(
             key=lambda candidate: _paper_rank_key(instance, candidate, scheduled[candidate.customer.index], inventory_cache))
@@ -1763,6 +1814,7 @@ def _build_paper_shift(
                 customer=selected.customer,
                 deliveries=scheduled[selected.customer.index],
                 has_layover_customer=has_layover_customer,
+                layover_used=layover_used,
                 force_reload=True,
                 at_route_start=not operations,
                 inventory_cache=inventory_cache,
@@ -1810,6 +1862,7 @@ def _build_paper_shift(
         driving = selected.driving_after
         visited.add(selected.customer.index)
         has_layover_customer = has_layover_customer or selected.customer.layover_customer
+        layover_used = layover_used or selected.layover_before
         # A rest before the return leg ends this shift.  Continuing would make
         # that implicit layover disappear from the actual operation sequence.
         if selected.return_layover:
@@ -1819,9 +1872,9 @@ def _build_paper_shift(
         return None
     end = current_time + instance.time_matrix[current_point][instance.base_index]
     if driving + instance.time_matrix[current_point][instance.base_index] > driver.max_driving_duration:
-        if not has_layover_customer or end + driver.layover_duration > window.end:
-            return None
-        end += driver.layover_duration
+        # There is no operation at which a terminal rest can be represented;
+        # accepting it here creates an officially invalid implicit layover.
+        return None
     resource.available_time = end + driver.min_inter_shift_duration
     resource.trailer_available_time = end
     return Shift(index=shift_index, driver=resource.driver, trailer=resource.trailer, start=start, operations=tuple(operations))
@@ -1872,6 +1925,7 @@ def _paper_customer_candidate(
     customer: Customer,
     deliveries: dict[int, float],
     has_layover_customer: bool,
+    layover_used: bool,
     force_reload: bool,
     at_route_start: bool,
     inventory_cache: dict[tuple[int, tuple[tuple[int, float], ...]], tuple],
@@ -1942,7 +1996,9 @@ def _paper_customer_candidate(
         not at_route_start
         and arrival - raw_arrival >= instance.drivers[resource.driver].layover_duration
     )
-    if layover_before and not (has_layover_customer or customer.layover_customer):
+    if layover_before and (
+        layover_used or not (has_layover_customer or customer.layover_customer)
+    ):
         return None
     # A source reload is itself part of the same continuous driving spell;
     # neither a later customer window nor a possible return layover can make

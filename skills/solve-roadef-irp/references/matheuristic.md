@@ -21,6 +21,10 @@ Replay references, finite values, travel/setup precedence, return travel, window
 
 End only with a locally feasible solution or explicit exhaustion.
 
+Qualification must invoke the production chain-aware constructor. Keep any
+legacy sparse/direct constructor labelled as a diagnostic baseline so an
+entry-point mismatch cannot be mistaken for poor generalisation.
+
 ## Chain-first neighbourhood search
 
 Use `select block -> destroy -> rebuild -> exact repair -> replay -> accept`.
@@ -39,6 +43,19 @@ Treat tails and internal waiting gaps as separate density surfaces. Extend tails
 6. Jointly retime after activation; deleted visits with stale arrivals can create false layovers.
 7. Run full-horizon quantity repair and global replay before acceptance.
 
+Treat coverage as complete only when no full-horizon pressure interval or
+unsatisfied call-in remains. A token visit before first breach is not adequate
+coverage. While pressure remains, rotate new-shift creation, internal
+insertion, pressure-block rebuilding, one-for-one route ejection/replacement,
+and broad recombination. The ejection surface is essential when driver/trailer
+gaps are saturated and the first three surfaces generate no candidates.
+
+Stage autonomous cold-start restarts when early ejection changes the basin:
+first develop dense chains with pressure blocks and recombination, then restart
+from the best native checkpoint with ejection enabled and selected first. This
+phase transition belongs inside the command-line solver; requiring a human or
+LLM to choose/reload the checkpoint is not a cold-start solution.
+
 Activation can remove every visit to a pressured customer. Price missing topology into a compatible optional slot using breach/window features. If a late visit structurally enables a layover, retain it at a positive quantity and add an earlier duplicate. Expand the radius to include the preceding legal service window; periodic windows may be more than 1,440 minutes apart.
 
 Customer-ID probes are only for discovering mechanics or regression fixtures. Promote reusable patterns and return to native cold-start execution.
@@ -50,6 +67,10 @@ Block timing must choose starts, arrivals, windows, legal layovers, and enforce 
 Quantity repair must choose deliveries, source loads, and optional activation while enforcing call-ins, cumulative VMI bounds, trailer paths, and protected prefixes. Hard mode has no inventory/order/trailer slack; elastic output is diagnostic only.
 
 Keep feasible candidates ordered by LR and diagnostics ordered by malformed/reference errors, physical violations, missed-order deficit, negative/overfill amount-duration, safety-deficit amount-duration, resource errors, then cost. Log candidate funnels, solver statuses/times, violation vectors, topology metrics, acceptance reason, and official verdict/hash.
+
+Propagate the run deadline into topology-generation loops and every nested
+timing/quantity solve. Checking time only between outer iterations does not
+provide a real wall-time budget.
 
 ## Set B generalisation
 

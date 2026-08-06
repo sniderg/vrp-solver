@@ -63,6 +63,7 @@ def repair_with_highs_selection(
     fixed_prefix_minutes: int = 0,
     fixed_shift_indices: set[int] | None = None,
     strict_inventory: bool = False,
+    time_limit_seconds: float = 300.0,
 ) -> tuple[Solution, HighsRepairReport]:
     try:
         import highspy
@@ -276,10 +277,13 @@ def repair_with_highs_selection(
             score_days,
         )
 
-    highs.setOptionValue("time_limit", 300.0)
+    time_limit_seconds = max(0.01, float(time_limit_seconds))
+    highs.setOptionValue("time_limit", time_limit_seconds)
     
     from .solver.gurobi_bridge import solve_with_gurobi_if_requested
-    status, values, solved_by_gurobi = solve_with_gurobi_if_requested(highs, time_limit=300.0)
+    status, values, solved_by_gurobi = solve_with_gurobi_if_requested(
+        highs, time_limit=time_limit_seconds,
+    )
     
     if solved_by_gurobi:
         print(f"Gurobi Status: {status}")
@@ -331,6 +335,7 @@ def repair_quantities_with_highs(
     fixed_prefix_minutes: int = 0,
     fixed_shift_indices: set[int] | None = None,
     strict_inventory: bool = False,
+    time_limit_seconds: float = 300.0,
 ) -> tuple[Solution, HighsRepairReport]:
     return repair_with_highs_selection(
         instance,
@@ -343,6 +348,7 @@ def repair_quantities_with_highs(
         fixed_prefix_minutes=fixed_prefix_minutes,
         fixed_shift_indices=fixed_shift_indices,
         strict_inventory=strict_inventory,
+        time_limit_seconds=time_limit_seconds,
     )
 
 
