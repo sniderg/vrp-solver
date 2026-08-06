@@ -62,6 +62,7 @@ def repair_with_highs_selection(
     baseline: Solution | None = None,
     fixed_prefix_minutes: int = 0,
     fixed_shift_indices: set[int] | None = None,
+    strict_inventory: bool = False,
 ) -> tuple[Solution, HighsRepairReport]:
     try:
         import highspy
@@ -157,7 +158,15 @@ def repair_with_highs_selection(
 
         if quantity_objective == "min-delivered":
             z_idx = col_count
-            z_lower = 1.0 if (instance.customer_by_point[var.point].layover_customer or var.is_fixed) else 0.0
+            customer = instance.customer_by_point[var.point]
+            # Call-in visits cover explicit orders and are not optional
+            # topology.  Allowing z=0 here made the activation formulation
+            # report an optimum by silently deleting mandatory deliveries.
+            z_lower = 1.0 if (
+                customer.call_in
+                or customer.layover_customer
+                or var.is_fixed
+            ) else 0.0
             highs.addCol(-1000.0, z_lower, 1.0, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
             highs.changeColIntegrality(z_idx, highspy.HighsVarType.kInteger)
             z_indices.append(z_idx)
@@ -165,8 +174,17 @@ def repair_with_highs_selection(
 
             # q_i <= max_q * z_i
             highs.addRow(-inf, 0.0, 2, np.array([q_idx, z_idx], dtype=np.int32), np.array([1.0, -var.max_quantity], dtype=np.float64))
-            # q_i >= min_q * z_i
-            highs.addRow(0.0, inf, 2, np.array([q_idx, z_idx], dtype=np.int32), np.array([1.0, -var.min_quantity], dtype=np.float64))
+            # q_i >= activation_q * z_i.  A zero-minimum layover visit still
+            # has to survive XML materialisation; otherwise removing q=0
+            # deletes the customer that makes the represented rest legal.
+            activation_quantity = max(var.min_quantity, 10.0 * EPSILON)
+            highs.addRow(
+                0.0,
+                inf,
+                2,
+                np.array([q_idx, z_idx], dtype=np.int32),
+                np.array([1.0, -activation_quantity], dtype=np.float64),
+            )
 
     for var in load_variables:
         load_idx = col_count
@@ -194,31 +212,41 @@ def repair_with_highs_selection(
                 cumulative_demand += customer.forecast[step]
             indices = [q_indices[idx] for idx, v in cust_vars if v.arrival_step <= step]
             if not indices:
-                # Check if initial inventory is enough
-                if customer.initial_tank_quantity - cumulative_demand < customer.safety_level - EPSILON:
-                    # Infeasible without more deliveries! 
-                    pass
+                # In strict mode, make an unreachable required inventory level
+                # explicitly infeasible. The former soft repair silently omitted
+                # this row and could report an apparently successful solve while
+                # the official checker still found a runout.
+                if strict_inventory and (
+                    customer.initial_tank_quantity - cumulative_demand
+                    < customer.safety_level - EPSILON
+                ):
+                    highs.addRow(1.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
                 continue
             
             lower_safety = customer.safety_level - customer.initial_tank_quantity + cumulative_demand
             lower_zero = 0.0 - customer.initial_tank_quantity + cumulative_demand
             upper = customer.capacity - customer.initial_tank_quantity + cumulative_demand
 
-            # 1. Safety breach slack (penalty: 100 Billion to eliminate safety level violations)
-            highs.addCol(100_000_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
-            slack_breach_idx = highs.getNumCol() - 1
-            
-            indices_l = indices + [slack_breach_idx]
-            qtys_l = [1.0] * len(indices) + [1.0]
-            highs.addRow(lower_safety, inf, len(indices_l), np.array(indices_l, dtype=np.int32), np.array(qtys_l, dtype=np.float64))
+            # A feasibility pass must use the actual hard inventory bound, not
+            # an enormous penalty slack. Keep the soft form for diversification
+            # in the ordinary improvement loop.
+            if strict_inventory:
+                highs.addRow(lower_safety, inf, len(indices), np.array(indices, dtype=np.int32), np.ones(len(indices), dtype=np.float64))
+            else:
+                highs.addCol(100_000_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
+                slack_breach_idx = highs.getNumCol() - 1
+                indices_l = indices + [slack_breach_idx]
+                qtys_l = [1.0] * len(indices) + [1.0]
+                highs.addRow(lower_safety, inf, len(indices_l), np.array(indices_l, dtype=np.int32), np.array(qtys_l, dtype=np.float64))
 
-            # 2. Negative inventory slack (penalty: 10 Billion to avoid going below 0.0 at all costs)
-            highs.addCol(10_000_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
-            slack_zero_idx = highs.getNumCol() - 1
-            
-            indices_z = indices + [slack_zero_idx]
-            qtys_z = [1.0] * len(indices) + [1.0]
-            highs.addRow(lower_zero, inf, len(indices_z), np.array(indices_z, dtype=np.int32), np.array(qtys_z, dtype=np.float64))
+            if strict_inventory:
+                highs.addRow(lower_zero, inf, len(indices), np.array(indices, dtype=np.int32), np.ones(len(indices), dtype=np.float64))
+            else:
+                highs.addCol(10_000_000_000.0, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
+                slack_zero_idx = highs.getNumCol() - 1
+                indices_z = indices + [slack_zero_idx]
+                qtys_z = [1.0] * len(indices) + [1.0]
+                highs.addRow(lower_zero, inf, len(indices_z), np.array(indices_z, dtype=np.int32), np.array(qtys_z, dtype=np.float64))
 
             # 3. Overfill constraint (HARD)
             indices_u = indices
@@ -302,6 +330,7 @@ def repair_quantities_with_highs(
     baseline: Solution | None = None,
     fixed_prefix_minutes: int = 0,
     fixed_shift_indices: set[int] | None = None,
+    strict_inventory: bool = False,
 ) -> tuple[Solution, HighsRepairReport]:
     return repair_with_highs_selection(
         instance,
@@ -313,6 +342,7 @@ def repair_quantities_with_highs(
         baseline=baseline,
         fixed_prefix_minutes=fixed_prefix_minutes,
         fixed_shift_indices=fixed_shift_indices,
+        strict_inventory=strict_inventory,
     )
 
 

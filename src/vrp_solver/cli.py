@@ -227,6 +227,9 @@ def cmd_targeted_rescue(args: argparse.Namespace) -> int:
         normalize_source_loads=not args.no_normalize_source_loads,
         quantity_objective=args.quantity_objective,
         prioritize_severity=args.prioritize_severity,
+        greedy_append=args.greedy_append,
+        greedy_rounds=args.greedy_rounds,
+        greedy_candidate_limit=args.greedy_candidate_limit,
     )
     rescued, report = targeted_rescue(instance, baseline, config=config)
     save_solution(rescued, args.output_xml)
@@ -270,6 +273,9 @@ def cmd_column_generation_rescue(args: argparse.Namespace) -> int:
         max_multi_reload_per_batch=args.max_multi_reload_per_batch,
         normalize_source_loads=not args.no_normalize_source_loads,
         quantity_objective=args.quantity_objective,
+        selector_time_limit=args.selector_time_limit,
+        selector_threads=args.selector_threads,
+        strict_missing_callin_orders=args.strict_missing_callin_orders,
     )
     solution, steps = column_generation_rescue(instance, baseline, config=config, ml_priors=ml_priors)
     save_solution(solution, args.output_xml)
@@ -1554,6 +1560,7 @@ def cmd_contest_highs_repair(args: argparse.Namespace) -> int:
         feasibility_days=args.feasibility_days,
         ignore_tail_call_ins=args.ignore_tail_call_ins,
         quantity_objective=args.quantity_objective,
+        strict_inventory=args.strict_inventory,
     )
     save_solution(repaired, args.output_xml)
     print(f"wrote,{args.output_xml}")
@@ -1976,6 +1983,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="max-delivered",
     )
     highs_repair.add_argument("--fail-on-infeasible", action="store_true")
+    highs_repair.add_argument(
+        "--strict-inventory",
+        action="store_true",
+        help="require every inventory bound; do not hide runouts behind LP slack",
+    )
     highs_repair.set_defaults(func=cmd_contest_highs_repair)
 
     highs_select = subparsers.add_parser("highs-select")
@@ -2021,6 +2033,19 @@ def build_parser() -> argparse.ArgumentParser:
     targeted_rescue_cmd.add_argument("--sample-lookback-days", type=int, default=5)
     targeted_rescue_cmd.add_argument("--max-chain-length", type=int, default=3)
     targeted_rescue_cmd.add_argument("--nearest-chain-neighbors", type=int, default=4)
+    targeted_rescue_cmd.add_argument(
+        "--greedy-append",
+        action="store_true",
+        help="append only full-validation, error-reducing rescue shifts",
+    )
+    targeted_rescue_cmd.add_argument(
+        "--greedy-rounds", type=int, default=16,
+        help="maximum direct-rescue shifts to append",
+    )
+    targeted_rescue_cmd.add_argument(
+        "--greedy-candidate-limit", type=int, default=240,
+        help="maximum dense rescue columns evaluated per greedy round",
+    )
     targeted_rescue_cmd.add_argument("--variable-quantity-columns", action="store_true")
     targeted_rescue_cmd.add_argument("--no-pressure-pricing", action="store_true")
     targeted_rescue_cmd.add_argument("--no-normalize-source-loads", action="store_true")
@@ -2056,6 +2081,23 @@ def build_parser() -> argparse.ArgumentParser:
     column_loop.add_argument("--max-pre-service-fill-ratio", type=float, default=0.95)
     column_loop.add_argument("--multi-reload-columns", action="store_true")
     column_loop.add_argument("--max-multi-reload-per-batch", type=int, default=20)
+    column_loop.add_argument(
+        "--selector-time-limit",
+        type=float,
+        default=300.0,
+        help="maximum seconds for each native MILP selection pass",
+    )
+    column_loop.add_argument(
+        "--selector-threads",
+        type=int,
+        default=None,
+        help="native MILP selector thread count",
+    )
+    column_loop.add_argument(
+        "--strict-missing-callin-orders",
+        action="store_true",
+        help="require currently missed call-in orders in the native selector",
+    )
     column_loop.add_argument("--no-normalize-source-loads", action="store_true")
     column_loop.add_argument(
         "--quantity-objective",
@@ -2142,7 +2184,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     surgical = subparsers.add_parser(
         "surgical-search",
-        help="run the seven transactional neighborhoods recovered from Solver.exe",
+        help="run recovered transactional neighborhoods plus native route recombination",
     )
     surgical.add_argument("instance_xml", type=Path)
     surgical.add_argument("solution_xml", type=Path)
@@ -2160,6 +2202,8 @@ def build_parser() -> argparse.ArgumentParser:
         "create_shift", "insert_operation", "delete_operation",
         "replace_operation_point", "swap_operations",
         "relocate_between_shifts", "relocate_within_shift",
+        "pressure_band_resource_block",
+        "recombine_route_blocks", "joint_retailer_reinsert",
     ))
     surgical.set_defaults(func=cmd_surgical_search)
 
