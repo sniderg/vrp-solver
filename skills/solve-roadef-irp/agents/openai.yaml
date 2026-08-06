@@ -1,0 +1,4 @@
+interface:
+  display_name: "Solve ROADEF IRP"
+  short_description: "Build and validate native ROADEF IRP solvers"
+  default_prompt: "Use $solve-roadef-irp to design, implement, and independently validate a native cold-start Set B solution."
