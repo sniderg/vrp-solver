@@ -23,6 +23,7 @@ from ..joint_block_timing import (
     generate_pressure_block_substitutions,
     generate_pressure_substitution_ejections,
     retime_connected_resource_block,
+    retime_resource_blocks,
 )
 from ..inventory import tank_events
 from ..model import Instance, Operation, Shift, Solution
@@ -932,10 +933,11 @@ def _resource_safe_created_candidates(
     candidates: list[Solution],
     config: SurgicalSearchConfig,
 ) -> list[Solution]:
-    """Place each newly created route on a compatible idle resource pair."""
+    """Place each new route, compacting a local resource block only if needed."""
     current_derived = derive_solution(instance, solution)
     result: list[Solution] = []
     cap = max(64, config.candidates_per_move * 8)
+    compaction_attempts = max(8, min(32, config.candidates_per_move))
     resource_pairs = tuple(
         (driver.index, trailer_id)
         for driver in instance.drivers
@@ -973,9 +975,81 @@ def _resource_safe_created_candidates(
                 _reindex(Solution((*solution.shifts, placed))),
             ))
             break
+        else:
+            # The ordinary placement gate sees only fixed incumbent intervals.
+            # Give a bounded number of high-pressure columns a chance to
+            # shorten their jointly blocking driver/trailer chains first.
+            # This is an atomic endpoint: a compacted incumbent alone does not
+            # improve inventory and therefore would never survive acceptance.
+            if compaction_attempts <= 0:
+                continue
+            compaction_attempts -= 1
+            for driver_id, trailer_id in (*preferred, *alternatives):
+                if not _route_allows_trailer(instance, created, trailer_id):
+                    continue
+                assigned = replace(
+                    created,
+                    driver=driver_id,
+                    trailer=trailer_id,
+                )
+                # The timing MIP preserves resource order.  A newly generated
+                # route's provisional start gives just one such order; also
+                # place it immediately before and after the nearest occupied
+                # pair slots.  Its times remain decision variables, so these
+                # are sequence choices, not timestamp guesses.
+                for order_start in _compaction_order_starts(
+                    solution, assigned,
+                ):
+                    compacted = retime_resource_blocks(
+                        instance,
+                        Solution((
+                            *solution.shifts,
+                            replace(assigned, start=order_start),
+                        )),
+                        (assigned.index,),
+                        max_shifts=8,
+                        compact=True,
+                    )
+                    if compacted is None:
+                        continue
+                    if any(
+                        violation.severity == "error"
+                        and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
+                        for violation in validate_structural(instance, compacted)
+                    ):
+                        continue
+                    result.append(normalize_source_loads(
+                        instance, _reindex(compacted),
+                    ))
+                    break
+                else:
+                    continue
+                break
         if len(result) >= cap:
             break
     return result
+
+
+def _compaction_order_starts(solution: Solution, created: Shift) -> tuple[int, ...]:
+    """Return a bounded set of resource-chain positions for ``created``.
+
+    ``retime_resource_blocks`` keeps the incumbent order.  The created route is
+    therefore provisionally placed immediately before or after nearby shifts
+    sharing either resource; compaction then optimizes all actual timestamps.
+    """
+    neighbours = sorted(
+        (
+            shift for shift in solution.shifts
+            if shift.driver == created.driver or shift.trailer == created.trailer
+        ),
+        key=lambda shift: (
+            abs(shift.start - created.start), shift.start, shift.index,
+        ),
+    )
+    starts = [created.start]
+    for shift in neighbours[:4]:
+        starts.extend((shift.start - 1, shift.start))
+    return tuple(dict.fromkeys(start for start in starts if start >= 0))
 
 
 def _place_created_shift_in_resource_gap(

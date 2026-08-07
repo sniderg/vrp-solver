@@ -97,7 +97,7 @@ is after one `--resume-from` continuation round (~25 min each):
 | Instance | Seed errors (uncapped) | Seed errors (cap 180) | After one search round | After resume round |
 | --- | ---: | ---: | ---: | ---: |
 | V2.12 | 2,135 | 1,402 | 1,331 | — |
-| V2.15 | 622 | 732 | 189 | **71** |
+| V2.15 | 622 | 732 | 189 | **36** (native resume with repair-time compaction; local only) |
 | V2.17 | 11,520 | 6,082 | 5,889 | — |
 | V2.18 | 13,017 | 2,115 | 1,769 | — |
 | V2.22 | 14,402 | 6,245 | 6,176 | — |
@@ -117,15 +117,26 @@ finished worse than uncapped).  The idle cap that closed V2.14 does not
 generalise; construction policy cannot compact routes an incumbent already
 committed.
 
-**Identified next levers (not yet implemented):**
+**Implemented mechanism and remaining blocker:**
 
-1. **Repair-time shift-compaction move.** V2.15 has 5,671 trapped in-shift idle
-   minutes against a 2,557-minute need.  Reclaiming it requires a repair operator
-   that shortens or re-times committed shifts, not a construction knob sweep.
-2. **`strict_inventory=True` in repair MIP.** No call site currently sets this
-   flag, so the search's repair MIP never enforces safety levels.  Worth enabling
-   to see whether it closes the remaining gap on V2.15 or V2.26 before investing
-   in the compaction move.
+1. **Repair-time compact-and-place.** The create-shift gate now falls back to a
+   bounded joint timing MIP that compacts a connected driver/trailer block and
+   places the new route atomically. On V2.15 this turned an empty gate into one
+   candidate; normal quantity repair accepted it and lowered the native resume
+   from 70 to **36** local errors (23 shifts). This is not a valid result: the
+   released checker has not been run because local errors remain nonzero.
+2. **Sequence redesign remains required.** A 600-second continuation from the
+   36-error checkpoint returned to zero create-shift candidates. All 612 raw
+   routes were trailer-compatible, but none fit a compacted eight-shift block in
+   the incumbent resource order. The supplied V2.15 comparison XML has 31 shifts
+   and just 89 in-route idle minutes, versus 22 shifts / 5,671 idle minutes in
+   the pre-compaction native checkpoint. The next production operator must
+   choose a larger resource-chain sequence (not merely retime a fixed order).
+3. **Strict inventory is a proof gate, not a substitute for topology.** Applying
+   `strict_inventory=True` to the newly reachable V2.15 route is infeasible:
+   the route reduces safety errors but cannot cover every remaining tank. Keep
+   strict repair for feasibility proof once a candidate topology has sufficient
+   coverage; use soft repair while constructing that topology.
 
 The V2.12 row is a native repair of a pre-existing candidate
 (`scratch/v212_skill_orders_final_local.xml`, SHA-256

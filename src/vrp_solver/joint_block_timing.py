@@ -23,6 +23,7 @@ def retime_connected_resource_block(
     anchor_shift_index: int,
     *,
     max_shifts: int = 5,
+    compact: bool = False,
 ) -> Solution | None:
     """Jointly retime a small resource-connected block around ``anchor``.
 
@@ -32,7 +33,11 @@ def retime_connected_resource_block(
     reached.  Unchanged neighbouring shifts become hard boundary constraints.
     """
     return retime_resource_blocks(
-        instance, solution, (anchor_shift_index,), max_shifts=max_shifts,
+        instance,
+        solution,
+        (anchor_shift_index,),
+        max_shifts=max_shifts,
+        compact=compact,
     )
 
 
@@ -42,8 +47,15 @@ def retime_resource_blocks(
     anchor_shift_indices: tuple[int, ...],
     *,
     max_shifts: int = 8,
+    compact: bool = False,
 ) -> Solution | None:
-    """Jointly retime the union of several connected resource components."""
+    """Jointly retime the union of several connected resource components.
+
+    ``compact`` finds the earliest legal schedule rather than preserving the
+    incumbent timestamps.  It is used only for an atomic create-and-place move:
+    shortening committed shifts can expose a jointly available driver/trailer
+    interval that aggregate resource utilisation hides.
+    """
     by_index = {shift.index: shift for shift in solution.shifts}
     anchors = [index for index in anchor_shift_indices if index in by_index]
     if len(anchors) != len(anchor_shift_indices):
@@ -72,7 +84,9 @@ def retime_resource_blocks(
     selected_shifts = sorted(
         (by_index[index] for index in selected), key=lambda shift: shift.index,
     )
-    return _solve_joint_timing(instance, solution, selected_shifts, derived)
+    return _solve_joint_timing(
+        instance, solution, selected_shifts, derived, compact=compact,
+    )
 
 
 def generate_pressure_block_insertions(
@@ -317,7 +331,14 @@ def generate_pressure_substitution_ejections(
     return result
 
 
-def _solve_joint_timing(instance, solution, block, derived) -> Solution | None:
+def _solve_joint_timing(
+    instance,
+    solution,
+    block,
+    derived,
+    *,
+    compact: bool,
+) -> Solution | None:
     try:
         import highspy
     except ModuleNotFoundError as exc:
@@ -349,11 +370,13 @@ def _solve_joint_timing(instance, solution, block, derived) -> Solution | None:
         return column
 
     for shift in block:
-        starts[shift.index] = add_column(0.02)
-        start_deviations[shift.index] = add_column(0.02)
+        starts[shift.index] = add_column(0.0001 if compact else 0.02)
+        start_deviations[shift.index] = add_column(0.0 if compact else 0.02)
         for position, operation in enumerate(shift.operations):
-            arrivals[(shift.index, position)] = add_column(0.0)
-            add_column(1.0)
+            arrivals[(shift.index, position)] = add_column(
+                0.001 if compact else 0.0,
+            )
+            add_column(0.0 if compact else 1.0)
             for choice in range(len(windows[shift.index][position])):
                 column = add_column(0.0, 0.0, 1.0)
                 highs.changeColIntegrality(column, highspy.HighsVarType.kInteger)

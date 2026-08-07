@@ -85,6 +85,8 @@ Distinguish *aggregate* slack from *jointly available* slack. A driver 50% idle 
 
 Trapped in-shift idle time is not necessarily reachable from construction policy. Tightening a construction idle cap only changes which routes get built; it cannot compact routes an incumbent already committed. Measuring trapped idle therefore identifies the *quantity* of recoverable capacity, not the mechanism — sweeping construction knobs to chase it produced strictly worse incumbents on an instance whose search had already gone much further. Reclaiming it requires a repair-time move that shortens or re-times committed shifts. Distinguish "capacity exists" from "this knob can reach it" before spending a sweep.
 
+Implement the first repair-time move as an atomic compact-and-place transaction: retime a connected driver/trailer block to its earliest legal schedule and place the route in that same endpoint. Do not accept compaction alone; it has no inventory benefit and local-search acceptance will discard it. If no raw route fits a compacted bounded block, the blocker is **sequence choice**: enumerate bounded insertion positions in the resource chain, then implement a larger sequence-repair neighborhood rather than raising candidate samples or rerunning construction caps.
+
 ## Treat construction policy knobs as a seed portfolio
 
 A construction parameter that helps most instances usually breaks a few that already close. Measure the seed's error count and safety-deficit quantity-minutes for each setting across the whole corpus, then construct several seeds per run and keep the best rather than shipping one global default. Report which instances each setting helps and hurts; a mean improvement hides regressions on already-solved instances.
