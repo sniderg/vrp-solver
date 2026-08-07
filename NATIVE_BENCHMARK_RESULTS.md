@@ -42,16 +42,29 @@ The old costs, delivered volumes, logistic ratios, “wins”, and aggregate sco
 were calculated for invalid outputs and are withdrawn. Logistic ratio is only
 meaningful among officially valid solutions.
 
-## Current demonstrated milestone
+## Current demonstrated milestones
 
-| Instance | Provenance | Released checker | Delivered volume | Shift cost | LR |
+| Instance | Provenance | Released checker | Wall time | Shift cost | LR |
 | --- | --- | ---: | ---: | ---: | ---: |
-| V2.12 | **native-repair** | **VALID** | 1,809,906.418 L | 49,246.08 | 0.027209 |
+| V2.13 | **native-cold-start** | **VALID** | 345 s | 15,895.40 | — |
+| V2.24 | **native-cold-start** | **VALID** | 789 s | 14,384.82 | — |
+| V2.25 | **native-cold-start** | **VALID** | ~80 min total | 36,994.19 | 0.035982 |
+| V2.12 | native-repair | VALID | — | 49,246.08 | 0.027209 |
 
-This V2.12 result is a native repair of a pre-existing candidate. It is not a
-native cold-start solve and is not evidence that the solver generalizes across
-Set B. Its exact XML is `scratch/v212_skill_orders_final_local.xml`, SHA-256
-`32d5905ffd7495fbc37d4ad5b26d2d6dd4a589246a1f93b2f89f925c2a83b2f3`.
+All three cold starts were produced on 2026-08-07 by `vrp-solver native-solve`
+(instance XML + seed only; V2.25 additionally continued through
+`surgical_search` restart rounds from its own native checkpoint) and verified
+with the released checker on Windows. Exact XMLs:
+
+- V2.13: `scratch/replicate_V2.13_native.xml`
+- V2.24: `scratch/replicate_V2.24_native.xml`
+- V2.25: `scratch/opt3_V2.25_native.xml`, SHA-256
+  `a407cde5d2f0ddc1ba34a0471328ac7cd374067c48b046aee07b9b2f1c4bedc7`
+
+The V2.12 row is a native repair of a pre-existing candidate
+(`scratch/v212_skill_orders_final_local.xml`, SHA-256
+`32d5905ffd7495fbc37d4ad5b26d2d6dd4a589246a1f93b2f89f925c2a83b2f3`); a V2.12
+cold start has not yet reached zero errors.
 
 For comparison, the supplied V2.12 reference is also officially valid with
 2,431,172.363 L delivered, shift cost 44,966.73, and LR 0.018496.
