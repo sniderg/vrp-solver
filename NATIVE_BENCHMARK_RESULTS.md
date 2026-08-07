@@ -91,17 +91,41 @@ resource cadence — 46,624 idle minutes against 34,273 travel minutes, with 40
 of 63 late first visits occurring while no shift was even under way.
 
 Best cold-start error counts after a 25-minute search round with the idle-cap
-seed portfolio (seed 1), for tracking the remaining gap:
+seed portfolio (seed 1), for tracking the remaining gap.  The "resume" column
+is after one `--resume-from` continuation round (~25 min each):
 
-| Instance | Seed errors (uncapped) | Seed errors (cap 180) | After one search round |
-| --- | ---: | ---: | ---: |
-| V2.12 | 2,135 | 1,402 | 1,331 |
-| V2.15 | 622 | 732 | 189 |
-| V2.17 | 11,520 | 6,082 | 5,889 |
-| V2.18 | 13,017 | 2,115 | 1,769 |
-| V2.22 | 14,402 | 6,245 | 6,176 |
-| V2.23 | 3,482 | 2,642 | 2,598 |
-| V2.26 | 614 | 544 | 222 |
+| Instance | Seed errors (uncapped) | Seed errors (cap 180) | After one search round | After resume round |
+| --- | ---: | ---: | ---: | ---: |
+| V2.12 | 2,135 | 1,402 | 1,331 | — |
+| V2.15 | 622 | 732 | 189 | **71** |
+| V2.17 | 11,520 | 6,082 | 5,889 | — |
+| V2.18 | 13,017 | 2,115 | 1,769 | — |
+| V2.22 | 14,402 | 6,245 | 6,176 | — |
+| V2.23 | 3,482 | 2,642 | 2,598 | — |
+| V2.26 | 614 | 544 | 222 | **74** (negative inventory eliminated) |
+
+Resume rounds improved every tested open instance but all flattened after round
+1.  The cause is measured: on V2.15, 13 of 25 search steps produced zero
+candidates; `create_shift` builds 833 routes and all 833 die at the
+resource-placement gate (1,052 attempts found a driver gap; zero found the
+trailer free simultaneously — only 3 joint driver+trailer idle windows ≥300 min
+exist across the full horizon, even though each resource alone is 44–76% idle).
+
+Three theories were refuted with data: layovers blocking retiming, sparse
+candidate start times, and tighter construction idle caps (60/90/120 all
+finished worse than uncapped).  The idle cap that closed V2.14 does not
+generalise; construction policy cannot compact routes an incumbent already
+committed.
+
+**Identified next levers (not yet implemented):**
+
+1. **Repair-time shift-compaction move.** V2.15 has 5,671 trapped in-shift idle
+   minutes against a 2,557-minute need.  Reclaiming it requires a repair operator
+   that shortens or re-times committed shifts, not a construction knob sweep.
+2. **`strict_inventory=True` in repair MIP.** No call site currently sets this
+   flag, so the search's repair MIP never enforces safety levels.  Worth enabling
+   to see whether it closes the remaining gap on V2.15 or V2.26 before investing
+   in the compaction move.
 
 The V2.12 row is a native repair of a pre-existing candidate
 (`scratch/v212_skill_orders_final_local.xml`, SHA-256
