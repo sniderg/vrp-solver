@@ -39,12 +39,29 @@ class SelectorConfig:
     mip_start_shift_indices: tuple[int, ...] = ()
     priority_shift_indices: tuple[int, ...] = ()
     priority_shift_bonus: float = 1_000_000.0
+    # Diagnostic/repair aid: pin known-valid route columns to one.  This is
+    # also useful for preserving an essential carried-load route while the
+    # selector rebuilds the surrounding schedule.
+    force_shift_indices: tuple[int, ...] = ()
     # Strict mode turns the route selector into a feasibility MIP: inventory
     # and order requirements are constraints, rather than penalised slacks.
     # This is deliberately opt-in because column generation normally benefits
     # from returning the least-infeasible incumbent while its pool is sparse.
     strict_feasibility: bool = False
     strict_inventory: bool = False
+    # Restrict hard safety constraints to a retailer-focused neighbourhood.
+    # This supports an IRP destroy/reinsert probe without pretending that a
+    # sparse global column pool can repair every unrelated retailer at once.
+    strict_inventory_points: tuple[int, ...] = ()
+    # Alternative columns for a single incumbent route can be required to
+    # choose exactly one. This is needed by retailer destroy/reinsert: every
+    # unchanged route remains present unless one of its insertion variants is
+    # selected in its place.
+    exactly_one_shift_groups: tuple[tuple[int, ...], ...] = ()
+    # Require inventory to remain nonnegative while allowing a separate
+    # safety-level improvement phase.  This is the useful bridge between a
+    # zero-runout incumbent and strict call-in repair.
+    strict_nonnegative_inventory: bool = False
     strict_orders: bool = False
     # If supplied, only these (customer, order) pairs are hard.  This lets a
     # local repair model prove a specific call-in window feasible before its
@@ -87,6 +104,8 @@ def select_shifts_with_highs(
 
         highs = highspy.Highs()
         highs.setOptionValue("output_flag", selector_config.output)
+        if selector_config.threads is not None:
+            highs.setOptionValue("threads", selector_config.threads)
         inf = highspy.kHighsInf
         integer_type = highspy.HighsVarType.kInteger
 
@@ -177,9 +196,22 @@ def select_shifts_with_highs(
         highs.addCol(obj_coeff, 0.0, 1.0, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
         idx = highs.getNumCol() - 1
         highs.changeColIntegrality(idx, integer_type)
+        if i in selector_config.force_shift_indices:
+            highs.changeColBounds(idx, 1.0, 1.0)
         if solved_by_gurobi and i in selector_config.mip_start_shift_indices:
             highs.set_start(idx, 1.0)
         x_indices.append(idx)
+
+    for group in selector_config.exactly_one_shift_groups:
+        if not group:
+            continue
+        highs.addRow(
+            1.0,
+            1.0,
+            len(group),
+            np.array([x_indices[index] for index in group], dtype=np.int32),
+            np.ones(len(group), dtype=np.float64),
+        )
 
     q_variables: list[_QuantityVariable] = []
     q_indices: list[int] = []
@@ -229,7 +261,9 @@ def select_shifts_with_highs(
             q_indices,
             start_day,
             end_day,
-            strict=(selector_config.strict_feasibility or selector_config.strict_inventory),
+            strict=(selector_config.strict_feasibility or selector_config.strict_inventory or selector_config.strict_nonnegative_inventory),
+            strict_nonnegative=selector_config.strict_nonnegative_inventory,
+            strict_points=set(selector_config.strict_inventory_points),
         )
     else:
         _add_fixed_inventory_constraints_with_slacks(
@@ -240,7 +274,9 @@ def select_shifts_with_highs(
             x_indices,
             start_day,
             end_day,
-            strict=(selector_config.strict_feasibility or selector_config.strict_inventory),
+            strict=(selector_config.strict_feasibility or selector_config.strict_inventory or selector_config.strict_nonnegative_inventory),
+            strict_nonnegative=selector_config.strict_nonnegative_inventory,
+            strict_points=set(selector_config.strict_inventory_points),
         )
     _add_order_coverage_constraints(
         highs,
@@ -248,6 +284,8 @@ def select_shifts_with_highs(
         prefix,
         candidates,
         x_indices,
+        q_variables=q_variables if variable_quantities else None,
+        q_indices=q_indices if variable_quantities else None,
         strict=(selector_config.strict_feasibility or selector_config.strict_orders),
         strict_keys=selector_config.strict_order_keys,
     )
@@ -647,6 +685,8 @@ def _add_inventory_constraints_with_slacks(
     end_day,
     *,
     strict: bool = False,
+    strict_nonnegative: bool = False,
+    strict_points: set[int] | None = None,
 ):
     deliveries_by_customer: dict[int, list[tuple[int, _QuantityVariable]]] = {}
     candidate_delivery_steps = {}
@@ -668,6 +708,7 @@ def _add_inventory_constraints_with_slacks(
     
     for customer in instance.customers:
         if customer.call_in: continue
+        customer_strict = strict or customer.index in (strict_points or set())
         
         for step in checkpoint_steps.get(customer.index, ()):
             step_time = (step + 1) * instance.unit
@@ -678,11 +719,15 @@ def _add_inventory_constraints_with_slacks(
             end_step = min(instance.horizon - 1, end_day * 1440 // instance.unit)
             target_level = customer.safety_level
             slack_penalty = 10_000_000.0
-            if step == end_step and not strict:
+            if step == end_step and not customer_strict:
                 target_level = customer.safety_level + 0.35 * (customer.capacity - customer.safety_level)
                 slack_penalty = 100_000.0
             
-            rhs_lower = target_level - baseline_event.ending_inventory
+            rhs_lower = (
+                -baseline_event.ending_inventory
+                if strict_nonnegative
+                else target_level - baseline_event.ending_inventory
+            )
             rhs_upper = customer.capacity - baseline_event.ending_inventory
             
             relevant = [
@@ -695,7 +740,7 @@ def _add_inventory_constraints_with_slacks(
 
             indices = [q_indices[variable_index] for variable_index in relevant]
             qtys = [1.0] * len(relevant)
-            if strict:
+            if customer_strict:
                 highs.addRow(rhs_lower, inf, len(indices), np.array(indices, dtype=np.int32), np.array(qtys, dtype=np.float64))
             else:
                 highs.addCol(slack_penalty, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
@@ -718,6 +763,8 @@ def _add_fixed_inventory_constraints_with_slacks(
     end_day,
     *,
     strict: bool = False,
+    strict_nonnegative: bool = False,
+    strict_points: set[int] | None = None,
 ):
     shift_cust_deliveries = {}
     candidate_delivery_steps = {}
@@ -745,6 +792,7 @@ def _add_fixed_inventory_constraints_with_slacks(
     for customer in instance.customers:
         if customer.call_in:
             continue
+        customer_strict = strict or customer.index in (strict_points or set())
 
         for step in checkpoint_steps.get(customer.index, ()):
             step_time = (step + 1) * instance.unit
@@ -755,11 +803,15 @@ def _add_fixed_inventory_constraints_with_slacks(
             end_step = min(instance.horizon - 1, end_day * 1440 // instance.unit)
             target_level = customer.safety_level
             slack_penalty = 10_000_000.0
-            if step == end_step and not strict:
+            if step == end_step and not customer_strict:
                 target_level = customer.safety_level + 0.35 * (customer.capacity - customer.safety_level)
                 slack_penalty = 100_000.0
 
-            rhs_lower = target_level - baseline_event.ending_inventory
+            rhs_lower = (
+                -baseline_event.ending_inventory
+                if strict_nonnegative
+                else target_level - baseline_event.ending_inventory
+            )
             rhs_upper = customer.capacity - baseline_event.ending_inventory
 
             relevant_shifts = {}
@@ -772,7 +824,7 @@ def _add_fixed_inventory_constraints_with_slacks(
 
             qtys = [relevant_shifts[shift_index] for shift_index in relevant_shifts]
             indices = [x_indices[shift_index] for shift_index in relevant_shifts]
-            if strict:
+            if customer_strict:
                 highs.addRow(rhs_lower, inf, len(indices), np.array(indices, dtype=np.int32), np.array(qtys, dtype=np.float64))
             else:
                 highs.addCol(slack_penalty, 0.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
@@ -792,6 +844,8 @@ def _add_order_coverage_constraints(
     candidates,
     x_indices,
     *,
+    q_variables: list[_QuantityVariable] | None = None,
+    q_indices: list[int] | None = None,
     strict: bool = False,
     strict_keys: tuple[tuple[int, int], ...] = (),
 ):
@@ -810,9 +864,20 @@ def _add_order_coverage_constraints(
                         + operation.quantity
                     )
 
+    # With fixed quantities an order is covered by a binary shift selection.
+    # With variable quantities it must be covered by the *actual* quantity
+    # variable.  Using the original XML quantity in the latter case lets a
+    # selected call-in route be reduced below its order minimum while the MIP
+    # still believes the order is satisfied.
+    quantity_by_operation: dict[tuple[int, int], int] = {}
+    if q_variables is not None and q_indices is not None:
+        quantity_by_operation = {
+            (variable.shift_index, variable.operation_index): q_indices[variable_index]
+            for variable_index, variable in enumerate(q_variables)
+        }
     candidate_deliveries: dict[tuple[int, int], dict[int, float]] = {}
     for candidate_index, shift in enumerate(candidates):
-        for operation in shift.operations:
+        for operation_index, operation in enumerate(shift.operations):
             if operation.quantity <= EPSILON or operation.point not in instance.customer_by_point:
                 continue
             customer = instance.customer_by_point[operation.point]
@@ -820,7 +885,14 @@ def _add_order_coverage_constraints(
                 if order.earliest_time <= operation.arrival <= order.latest_time:
                     key = (customer.index, order_index)
                     by_shift = candidate_deliveries.setdefault(key, {})
-                    by_shift[candidate_index] = by_shift.get(candidate_index, 0.0) + operation.quantity
+                    variable_index = quantity_by_operation.get((candidate_index, operation_index))
+                    if variable_index is None:
+                        index = x_indices[candidate_index]
+                        coefficient = operation.quantity
+                    else:
+                        index = variable_index
+                        coefficient = 1.0
+                    by_shift[index] = by_shift.get(index, 0.0) + coefficient
 
     inf = 1e20
     for customer in instance.customers:
@@ -829,8 +901,8 @@ def _add_order_coverage_constraints(
             if required <= EPSILON:
                 continue
             relevant = candidate_deliveries.get((customer.index, order_index), {})
-            indices = [x_indices[candidate_index] for candidate_index in relevant]
-            quantities = [relevant[candidate_index] for candidate_index in relevant]
+            indices = list(relevant)
+            quantities = [relevant[index] for index in indices]
             is_strict = strict and (not strict_keys or (customer.index, order_index) in strict_keys)
             if is_strict:
                 highs.addRow(required, inf, len(indices), np.array(indices, dtype=np.int32), np.array(quantities, dtype=np.float64))

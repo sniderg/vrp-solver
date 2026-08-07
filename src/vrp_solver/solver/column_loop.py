@@ -12,7 +12,7 @@ from ..model import Instance, Shift, Solution
 from ..highs_repair import repair_quantities_with_highs
 from ..highs_time_opt import optimize_solution_times
 from ..route_cache import RouteCache
-from ..rules import derive_solution
+from ..rules import derive_solution, validate_solution
 from .ml_priors import MLRoutePriors
 from .highs_selector import (
     SelectorConfig,
@@ -32,6 +32,7 @@ from .targeted_rescue import (
     _dedupe_reindex,
     _failing_customers,
     _keep_shifts_started_before,
+    _is_shift_route_valid,
     generate_chain_rescue_candidates,
     generate_carryover_rescue_candidates,
     generate_multi_reload_candidates,
@@ -166,9 +167,11 @@ def column_generation_rescue(
         baseline,
         config.replace_from_day * MINUTES_PER_DAY,
     )
-    baseline_window = list(_baseline_window_shifts(baseline, _rescue_config(config)))
+    baseline_window = list(_baseline_window_shifts(instance, baseline, _rescue_config(config)))
     raw_pool = [*baseline_window, *config.route_prior_candidates]
-    pool = _dedupe_reindex(raw_pool)
+    pool = _dedupe_reindex(
+        [candidate for candidate in raw_pool if _is_shift_route_valid(instance, candidate)]
+    )
     prior_diagnostics = _prior_diagnostics(instance, config, pool, ())
     steps: list[ColumnLoopStep] = []
     baseline_score = score_prefix_with_feasibility_tail(
@@ -233,8 +236,14 @@ def column_generation_rescue(
         # Cap delivery quantities for new candidates to avoid causing downstream
         # overfill when combined with existing baseline window deliveries.
         if config.cap_new_candidate_quantities:
+            # Baseline-window shifts are alternatives in ``pool``, not
+            # committed deliveries.  Reserving their quantities here leaves
+            # zero budget for exactly the replacement columns intended to fix
+            # their safety breaches.  Only the immutable prefix consumes the
+            # pre-selection delivery budget; the selector/quantity repair
+            # jointly enforce capacity for the chosen window columns.
             budgets = _safe_delivery_budgets(
-                instance, fixed_prefix, baseline_window,
+                instance, fixed_prefix, [],
                 config.replace_from_day, config.end_day,
             )
             generated = _apply_delivery_budgets(instance, generated, budgets)
@@ -259,6 +268,7 @@ def column_generation_rescue(
             pool,
             start_day=config.replace_from_day,
             end_day=config.end_day,
+            variable_quantities=True,
             pressure_pricing=True,
             selector_config=SelectorConfig(
                 time_limit=config.selector_time_limit,
@@ -267,9 +277,15 @@ def column_generation_rescue(
                 mip_focus=config.selector_mip_focus,
                 node_limit=config.selector_node_limit,
                 selector_phase=_selector_phase_for_iteration(config, best_score),
-                strict_orders=bool(strict_order_keys),
+                # Sparse pools must report infeasible rather than trade away
+                # tank safety or mandatory call-in quantities.
+                strict_inventory=True,
+                strict_orders=True,
                 strict_order_keys=strict_order_keys,
-                strict_trailer_inventory=config.strict_missing_callin_orders,
+                # Trailer stock is a hard physical state, independently of
+                # whether any currently missed call-in order is promoted to a
+                # strict selector constraint.
+                strict_trailer_inventory=True,
                 mip_start_shift_indices=_mip_start_indices(
                     instance,
                     pool,
@@ -285,7 +301,12 @@ def column_generation_rescue(
             ),
             ml_priors=ml_priors,
         )
-        selected = optimize_solution_times(instance, selected)
+        # Retiming is an optional improvement pass.  Its heuristics may move
+        # a shift across a driver window or driving-limit boundary, so never
+        # let it turn an otherwise valid column selection into the incumbent.
+        retimed = optimize_solution_times(instance, selected)
+        if not _has_structural_errors(instance, retimed):
+            selected = retimed
         if config.normalize_source_loads:
             selected = normalize_source_loads(instance, selected)
         selected_score = score_prefix_with_feasibility_tail(
@@ -308,6 +329,8 @@ def column_generation_rescue(
         )
         if config.normalize_source_loads:
             repaired = normalize_source_loads(instance, repaired)
+        if _has_structural_errors(instance, repaired):
+            repaired = selected
         repaired_score = score_prefix_with_feasibility_tail(
             instance,
             repaired,
@@ -448,6 +471,9 @@ def _rescue_config(config: ColumnLoopConfig) -> RescueConfig:
         repair_quantities=False,
         normalize_source_loads=config.normalize_source_loads,
         quantity_objective=config.quantity_objective,
+        # Baseline-window routes are optional columns in the full selector.
+        # It may jointly replace a later delivery after adding an early refill.
+        allow_future_rebalance=True,
     )
 
 
@@ -457,8 +483,19 @@ def _pressure_customers(
     config: ColumnLoopConfig,
 ) -> list[int]:
     ranked = pressure_points(instance, solution, end_day=config.end_day)
+    required_call_ins: list[int] = []
+    if config.strict_missing_callin_orders:
+        for customer_index, _ in _missing_callin_order_keys(
+            instance, solution, config.end_day
+        ):
+            if customer_index not in required_call_ins:
+                required_call_ins.append(customer_index)
     if ranked:
-        return [point.customer for point in ranked[: config.max_pressure_customers]]
+        ordered = [*required_call_ins]
+        ordered.extend(
+            point.customer for point in ranked if point.customer not in required_call_ins
+        )
+        return ordered[: config.max_pressure_customers]
     cutoff_step = min(instance.horizon, config.end_day * MINUTES_PER_DAY // instance.unit)
     breach_scores: dict[int, tuple[int, float]] = {}
     urgency_scores: dict[int, tuple[int, float]] = {}
@@ -490,7 +527,9 @@ def _pressure_customers(
     ordered.extend(point for point in urgency_order if point not in breach_scores)
     if not ordered:
         return _failing_customers(instance, solution, _rescue_config(config))
-    return ordered[: config.max_pressure_customers]
+    return [*required_call_ins, *(
+        point for point in ordered if point not in required_call_ins
+    )][: config.max_pressure_customers]
 
 
 def _augment_with_ml_priorities(
@@ -550,16 +589,32 @@ def _generate_priced_batches(
         for anchor in pressure_customers
     ]
     rescue_config = _rescue_config(config)
+    chain_limit = max(
+        32,
+        config.max_candidates_per_iteration // max(1, len(batches)),
+    )
 
     def generate(batch: list[int]) -> list[Shift]:
         candidates = generate_rescue_candidates(instance, prefix, batch, config=rescue_config)
         candidates.extend(generate_carryover_rescue_candidates(instance, prefix, batch, config=rescue_config))
-        candidates.extend(generate_chain_rescue_candidates(instance, prefix, batch, config=rescue_config))
+        candidates.extend(
+            generate_chain_rescue_candidates(
+                instance,
+                prefix,
+                batch,
+                config=rescue_config,
+                max_candidates=chain_limit,
+            )
+        )
         if config.multi_reload_columns:
             candidates.extend(
-                generate_multi_reload_candidates(instance, prefix, batch, config=rescue_config)[
-                    : config.max_multi_reload_per_batch
-                ]
+                generate_multi_reload_candidates(
+                    instance,
+                    prefix,
+                    batch,
+                    config=rescue_config,
+                    max_candidates=config.max_multi_reload_per_batch,
+                )
             )
         return candidates
 
@@ -741,6 +796,20 @@ def _score_key(score) -> tuple[int, int, int, float]:
         score.hard_violations,
         score.feasibility_errors,
         score.safety_kg_min,
+    )
+
+
+def _has_structural_errors(instance: Instance, solution: Solution) -> bool:
+    """Return whether a route mutation violates a non-inventory rule.
+
+    QS01/QS02/DYN01 are handled by the inventory/call-in selector and quantity
+    repair.  Any other error means the route mechanics themselves are invalid
+    and must not be introduced as a trade for fewer inventory breach steps.
+    """
+    return any(
+        violation.severity == "error"
+        and violation.code not in {"QS01", "QS02", "DYN01"}
+        for violation in validate_solution(instance, solution)
     )
 
 

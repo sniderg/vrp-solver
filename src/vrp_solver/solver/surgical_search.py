@@ -17,12 +17,20 @@ from ..diagnostics import (
 )
 from ..highs_repair import repair_quantities_with_highs
 from ..highs_time_opt import try_optimize_shift_times
+from ..joint_block_timing import (
+    generate_pressure_block_insertions,
+    generate_pressure_block_substitutions,
+    generate_pressure_substitution_ejections,
+    retime_connected_resource_block,
+)
 from ..inventory import tank_events
 from ..model import Instance, Operation, Shift, Solution
 from ..rules import derive_solution, validate_solution
 from .pressure import pressure_points
+from .multiroute_block import repair_pressure_multiroute_block
 from .targeted_rescue import (
     RescueConfig,
+    generate_carryover_rescue_candidates,
     generate_chain_rescue_candidates,
     generate_rescue_candidates,
     normalize_source_loads,
@@ -67,6 +75,7 @@ OPERATORS = (
     "relocate_between_shifts",
     "relocate_within_shift",
     "pressure_band_resource_block",
+    "multiroute_pressure_block",
     "recombine_route_blocks",
     "joint_retailer_reinsert",
 )
@@ -327,7 +336,11 @@ def surgical_search(
         move_score = None
         move_vector = None
         evaluated = 0
-        limited_candidates = candidates[: config.candidates_per_move]
+        limited_candidates = _candidate_frontier(
+            candidates,
+            budget=config.candidates_per_move,
+            stagnation=stagnation,
+        )
         scored = _score_candidates(
             instance, limited_candidates, config.end_day, config.workers,
         )
@@ -406,6 +419,22 @@ def surgical_search(
                     ):
                         continue
                     repaired_targets.add(target)
+                    if item not in repair_pool:
+                        repair_pool.append(item)
+            elif operator == "pressure_band_resource_block":
+                # A source-reload/internal insertion temporarily violates a
+                # trailer path with its seed quantities. Raw replay therefore
+                # ranks it poorly even when the topology admits a hard
+                # assignment. Guarantee one hard-repair attempt for every
+                # distinct pressure customer that gained an earlier visit.
+                rebuilt_targets: set[int] = set()
+                for item in ranked_repair_pool:
+                    target = _early_pressure_insertion_target(
+                        current, item[0], pressure_targets,
+                    )
+                    if target is None or target in rebuilt_targets:
+                        continue
+                    rebuilt_targets.add(target)
                     if item not in repair_pool:
                         repair_pool.append(item)
             for raw_candidate, _ in repair_pool:
@@ -739,6 +768,7 @@ def _coverage_rebuild_operator(
         "create_shift",
         "insert_operation",
         "pressure_band_resource_block",
+        "multiroute_pressure_block",
     ]
     if config.coverage_include_ejection:
         surfaces.append("replace_operation_point")
@@ -778,13 +808,65 @@ def _candidates(
             )
         except _CandidateGenerationDeadline as exc:
             return exc.candidates
+    if operator == "multiroute_pressure_block":
+        pressures = _narrow_window_pressures(
+            instance,
+            pressure_points(instance, solution, end_day=config.end_day),
+        )[: config.pressure_customers]
+        results: list[Solution] = []
+        for pressure in pressures:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            repaired, _funnel = repair_pressure_multiroute_block(
+                instance,
+                solution,
+                pressure,
+                end_day=config.end_day,
+                max_topologies=max(8, config.samples_per_customer),
+                time_limit_per_model=min(10.0, _remaining_time(deadline)),
+            )
+            results.extend(repaired)
+            if len(results) >= config.candidates_per_move:
+                break
+        return results
     if operator == "joint_retailer_reinsert":
         return _joint_retailer_reinsert_candidates(instance, solution, config)
     return _within_shift_candidates(instance, solution, config, rng)
 
 
+def _narrow_window_pressures(instance, pressures):
+    """Prioritise the last reachable service window before a pressure event.
+
+    A small deficit with an expiring 540-minute window is usually less
+    repairable than a large deficit at an always-open customer.  This ranking
+    is feature-derived and only affects which bounded block is searched first.
+    """
+    def key(pressure):
+        customer = instance.customer_by_point.get(pressure.customer)
+        if customer is None:
+            return (float("inf"), float("inf"), -pressure.deficit_area, pressure.customer)
+        feasible = [
+            (
+                max(0, min(window.end - customer.setup_time, pressure.first_minute) - window.start),
+                pressure.first_minute - min(window.end - customer.setup_time, pressure.first_minute),
+            )
+            for window in customer.time_windows
+            if window.start <= min(window.end - customer.setup_time, pressure.first_minute)
+        ]
+        if not feasible:
+            return (float("inf"), float("inf"), -pressure.deficit_area, pressure.customer)
+        slack, gap = min(feasible)
+        return (slack, gap, -pressure.deficit_area, pressure.customer)
+    return tuple(sorted(pressures, key=key))
+
+
 def _create_shift_candidates(instance, solution, config) -> list[Solution]:
-    pressure = [p.customer for p in pressure_points(instance, solution, end_day=config.end_day)]
+    pressure = [
+        item.customer for item in _narrow_window_pressures(
+            instance,
+            pressure_points(instance, solution, end_day=config.end_day),
+        )
+    ]
     pressure = pressure[: config.pressure_customers]
     rescue = RescueConfig(
         start_day=0,
@@ -797,6 +879,9 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
         target_fill_ratio=0.98,
     )
     shifts = generate_rescue_candidates(instance, solution, pressure, config=rescue)
+    shifts += generate_carryover_rescue_candidates(
+        instance, solution, pressure, config=rescue,
+    )
     shifts += generate_chain_rescue_candidates(instance, solution, pressure, config=rescue)
     ordinary = [
         _reindex(Solution((*solution.shifts, replace(shift, index=len(solution.shifts)))))
@@ -2176,8 +2261,9 @@ def _pressure_band_resource_block_candidates(
     boundaries.  The quantity/activation transaction is deliberately handled
     by the caller after these route skeletons are generated.
     """
-    pressures = pressure_points(
-        instance, solution, end_day=config.end_day,
+    pressures = _narrow_window_pressures(
+        instance,
+        pressure_points(instance, solution, end_day=config.end_day),
     )[: config.pressure_customers]
     if not pressures:
         return []
@@ -2191,15 +2277,26 @@ def _pressure_band_resource_block_candidates(
         if deadline is not None and time.monotonic() >= deadline:
             raise _CandidateGenerationDeadline(results)
 
-    def append_candidate(shifts: list[Shift]) -> None:
+    def append_candidate(
+        shifts: list[Shift], *, anchor_shift_index: int | None = None,
+    ) -> None:
         check_deadline()
-        candidate = normalize_source_loads(
-            instance, _reindex(Solution(tuple(shifts))),
-        )
-        fingerprint = solution_fingerprint(candidate)
-        if fingerprint not in seen:
-            seen.add(fingerprint)
-            results.append(candidate)
+        # Preserve stable shift IDs until the joint timing model has selected
+        # its anchor.  Reindexing before that step can silently retime a
+        # different shift after an advancing move changes chronological order.
+        candidate = normalize_source_loads(instance, Solution(tuple(shifts)))
+        variants = [_reindex(candidate)]
+        if anchor_shift_index is not None:
+            joint = retime_connected_resource_block(
+                instance, candidate, anchor_shift_index,
+            )
+            if joint is not None:
+                variants.append(normalize_source_loads(instance, _reindex(joint)))
+        for variant in variants:
+            fingerprint = solution_fingerprint(variant)
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                results.append(variant)
 
     for pressure in pressures:
         if deadline is not None and time.monotonic() >= deadline:
@@ -2266,7 +2363,7 @@ def _pressure_band_resource_block_candidates(
                     continue
                 shifts = list(solution.shifts)
                 shifts[shift_position] = retimed
-                append_candidate(shifts)
+                append_candidate(shifts, anchor_shift_index=shift.index)
                 if len(results) >= cap:
                     return results
             continue
@@ -2275,6 +2372,45 @@ def _pressure_band_resource_block_candidates(
                 return results
             target_shift = solution.shifts[target_shift_position]
             target_operation = target_shift.operations[target_operation_position]
+
+            # Internal densification is a separate rebuild surface from the
+            # source-backed create-shift fallback below. It keeps a late
+            # layover-enabling visit intact and prices an additional earlier
+            # delivery into a compatible chain, then jointly retimes that
+            # chain's driver/trailer component.
+            inserted = generate_pressure_block_insertions(
+                instance,
+                solution,
+                customer_point=pressure.customer,
+                first_minute=pressure.first_minute,
+                radius=radius,
+                max_candidates=max(4, config.samples_per_customer),
+            )
+            for rebuilt in inserted:
+                append_candidate(list(rebuilt.shifts))
+                if len(results) >= cap:
+                    return results
+            substitutions = generate_pressure_block_substitutions(
+                instance,
+                solution,
+                customer_point=pressure.customer,
+                first_minute=pressure.first_minute,
+                radius=radius,
+                max_candidates=max(4, config.samples_per_customer),
+            )
+            for rebuilt in substitutions:
+                append_candidate(list(rebuilt.shifts))
+                if len(results) >= cap:
+                    return results
+            ejections = generate_pressure_substitution_ejections(
+                instance, solution, customer_point=pressure.customer,
+                first_minute=pressure.first_minute, radius=radius,
+                max_candidates=max(4, config.samples_per_customer),
+            )
+            for rebuilt in ejections:
+                append_candidate(list(rebuilt.shifts))
+                if len(results) >= cap:
+                    return results
 
             # Proactively reassign a pressure route to a compatible free
             # driver/trailer pair and advance it to the breach or a preceding
@@ -2340,7 +2476,7 @@ def _pressure_band_resource_block_candidates(
                             continue
                         shifts = list(solution.shifts)
                         shifts[target_shift_position] = reassigned
-                        append_candidate(shifts)
+                        append_candidate(shifts, anchor_shift_index=target_shift.index)
                         if len(results) >= cap:
                             return results
 
@@ -2449,7 +2585,9 @@ def _pressure_band_resource_block_candidates(
                                 continue
                             rebuilt = list(evacuated_shifts)
                             rebuilt[target_shift_position] = advanced
-                            append_candidate(rebuilt)
+                            append_candidate(
+                                rebuilt, anchor_shift_index=target_shift.index,
+                            )
                             if len(results) >= cap:
                                 return results
 
@@ -2485,7 +2623,7 @@ def _pressure_band_resource_block_candidates(
                     continue
                 shifts = list(solution.shifts)
                 shifts[target_shift_position] = retimed
-                append_candidate(shifts)
+                append_candidate(shifts, anchor_shift_index=target_shift.index)
                 if len(results) >= cap:
                     return results
 
@@ -4056,6 +4194,30 @@ def _score(instance, solution, end_day):
     )
 
 
+def _candidate_frontier(candidates, *, budget: int, stagnation: int):
+    """Spend a fixed evaluation budget across exploitation and exploration.
+
+    Generators place cheap/local edits before expensive reload and ejection
+    structures.  A simple prefix cap therefore turns a time budget into an
+    unintended topology ban.  Keep the leading candidates, but sample the
+    remainder evenly; exploration increases after unsuccessful iterations.
+    """
+    if budget <= 0 or len(candidates) <= budget:
+        return candidates
+    exploration_share = 1 / 3 if stagnation == 0 else 1 / 2
+    explore = max(1, int(budget * exploration_share))
+    exploit = max(1, budget - explore)
+    head = candidates[:exploit]
+    tail = candidates[exploit:]
+    if explore == 1:
+        return head + [tail[-1]]
+    indexes = [
+        round(index * (len(tail) - 1) / (explore - 1))
+        for index in range(explore)
+    ]
+    return head + [tail[index] for index in indexes]
+
+
 _WORKER_INSTANCE = None
 _WORKER_CANDIDATES = None
 _WORKER_END_DAY = None
@@ -4123,6 +4285,33 @@ def _hard_invariants_not_worse(
         getattr(after, field) <= getattr(before, field) + 1e-6
         for field in fields
     )
+
+
+def _early_pressure_insertion_target(
+    before: Solution,
+    candidate: Solution,
+    pressure_targets: set[int],
+) -> int | None:
+    """Identify a new visit to a currently pressured VMI customer.
+
+    Candidate timing may be retimed and shifts may be reindexed, so compare
+    point multiplicity instead of operation positions or shift IDs.
+    """
+    before_counts: dict[int, int] = {}
+    candidate_counts: dict[int, int] = {}
+    for shift in before.shifts:
+        for operation in shift.operations:
+            if operation.point in pressure_targets:
+                before_counts[operation.point] = before_counts.get(operation.point, 0) + 1
+    for shift in candidate.shifts:
+        for operation in shift.operations:
+            if operation.point in pressure_targets:
+                candidate_counts[operation.point] = candidate_counts.get(operation.point, 0) + 1
+    added = sorted(
+        point for point in pressure_targets
+        if candidate_counts.get(point, 0) > before_counts.get(point, 0)
+    )
+    return added[0] if len(added) == 1 else None
 
 
 def _key(score: ContestScore):

@@ -1028,6 +1028,7 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     from .solver.surgical_search import SurgicalSearchConfig, surgical_search
 
     started = time.monotonic()
+    Path(args.output_xml).parent.mkdir(parents=True, exist_ok=True)
     deadline = started + args.time_limit
     instance = load_instance(args.instance_xml)
     policy = derive_cluster_construction_policy(instance)
@@ -1047,6 +1048,7 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         None,
         "replace_operation_point",
         "pressure_band_resource_block",
+        "multiroute_pressure_block",
         "recombine_route_blocks",
     )
     for round_index in range(args.restart_rounds):
@@ -2307,7 +2309,7 @@ def build_parser() -> argparse.ArgumentParser:
         "create_shift", "insert_operation", "delete_operation",
         "replace_operation_point", "swap_operations",
         "relocate_between_shifts", "relocate_within_shift",
-        "pressure_band_resource_block",
+        "pressure_band_resource_block", "multiroute_pressure_block",
         "recombine_route_blocks", "joint_retailer_reinsert",
     ))
     surgical.set_defaults(func=cmd_surgical_search)

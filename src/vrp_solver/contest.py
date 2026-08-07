@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
+import os
 
 import numpy as np
 
@@ -12,6 +13,8 @@ from .penalties import penalty_breakdown
 from .rules import derive_solution, validate_solution
 
 try:
+    if os.environ.get("VRP_DISABLE_FAST", "").lower() in {"1", "true", "yes"}:
+        raise ImportError("accelerated scoring disabled by VRP_DISABLE_FAST")
     from .inventory_fast import score_all_customers as _cy_score_all_customers
     _HAS_FAST_SCORING = True
 except ImportError:
@@ -130,7 +133,12 @@ def score_prefix_with_feasibility_tail(
         feasible=errors == 0,
         feasibility_errors=errors,
         feasibility_warnings=warnings,
-        hard_violations=penalties.hard_violations,
+        # This score is used to decide whether a generated solution can
+        # replace an incumbent.  The official checker rejects *every* rule
+        # error, including VMI safety-level breaches (QS02) and missed
+        # call-in orders (QS01).  Do not let an internal "soft" classification
+        # make an officially-invalid candidate look preferable.
+        hard_violations=errors,
         safety_kg_min=penalties.safety_kg_min,
         tank_safety_breach_steps=tank_counts.get("TANK_SAFETY_BREACH", 0),
         tank_negative_steps=tank_counts.get("TANK_NEGATIVE", 0),
@@ -340,9 +348,9 @@ def _score_fast(
     total_errors = non_tank_errors + tank_errors
     total_warnings = non_tank_warnings
 
-    # Hard violations: DYN01 (negatives + overfills) + non-tank hard codes
-    hard_violations_tank = negative_count + overfill_count
-    total_hard = hard_violations_tank + non_tank_hard
+    # See the fallback path above: for native search acceptance, all official
+    # rule errors are hard.  QS02 safety breaches are therefore included.
+    total_hard = total_errors
 
     return ContestScore(
         score_days=score_days,
@@ -367,4 +375,3 @@ def _score_fast(
         vmi_customers_below_safety=breach_points_count,
         first_safety_breach_minute=None,  # Not tracked in fast path
     )
-

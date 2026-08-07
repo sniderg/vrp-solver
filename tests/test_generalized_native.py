@@ -16,6 +16,11 @@ from vrp_solver.solver.surgical_search import (
     SurgicalSearchConfig,
     _coverage_rebuild_operator,
 )
+from vrp_solver.solver.targeted_rescue import (
+    RescueConfig,
+    generate_rescue_candidates,
+)
+from vrp_solver.rules import derive_solution
 
 
 def _instance(*, allowed_trailers: tuple[int, ...] = (0,)) -> Instance:
@@ -82,11 +87,17 @@ def test_missing_coverage_rotates_across_topology_surfaces() -> None:
     ) == "pressure_band_resource_block"
     assert _coverage_rebuild_operator(
         instance, empty, config, iteration=3, stagnation=3,
+    ) == "multiroute_pressure_block"
+    assert _coverage_rebuild_operator(
+        instance, empty, config, iteration=4, stagnation=4,
     ) == "replace_operation_point"
 
     development = replace(config, coverage_include_ejection=False)
     assert _coverage_rebuild_operator(
         instance, empty, development, iteration=3, stagnation=3,
+    ) == "multiroute_pressure_block"
+    assert _coverage_rebuild_operator(
+        instance, empty, development, iteration=4, stagnation=4,
     ) == "recombine_route_blocks"
 
 
@@ -109,3 +120,58 @@ def test_timely_visit_disables_coverage_override() -> None:
         iteration=0,
         stagnation=0,
     ) is None
+
+
+def test_rescue_represents_return_layover_with_terminal_source() -> None:
+    matrix = (
+        (0, 10, 60),
+        (10, 0, 60),
+        (60, 60, 0),
+    )
+    customer = Customer(
+        index=2,
+        layover_customer=True,
+        call_in=False,
+        orders=(),
+        setup_time=5,
+        time_windows=(TimeWindow(70, 180),),
+        allowed_trailers=(0,),
+        forecast=(10.0,) * 5,
+        capacity=100.0,
+        initial_tank_quantity=10.0,
+        min_operation_quantity=1.0,
+        safety_level=5.0,
+    )
+    instance = Instance(
+        name="represented-return-layover",
+        unit=60,
+        horizon=5,
+        time_matrix=matrix,
+        distance_matrix=tuple(tuple(float(v) for v in row) for row in matrix),
+        base_index=0,
+        drivers=(Driver(
+            0, 0, 100, (0,), (TimeWindow(0, 300),), 30, 0.0, 0.0,
+        ),),
+        trailers=(Trailer(0, 100.0, 0.0, 0.0),),
+        sources=(Source(1, (0,), 5),),
+        customers=(customer,),
+    )
+
+    candidates = generate_rescue_candidates(
+        instance,
+        Solution(()),
+        [customer.index],
+        config=RescueConfig(
+            start_day=0,
+            end_day=1,
+            replace_from_day=0,
+            samples_per_customer=4,
+        ),
+    )
+
+    assert candidates
+    route = candidates[0]
+    assert tuple(operation.point for operation in route.operations) == (1, 2, 1)
+    derived = derive_solution(instance, Solution((route,)))[0]
+    assert derived.layovers == 1
+    assert derived.operations[-1].layover_before

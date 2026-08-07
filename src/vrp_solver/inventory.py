@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import os
 
 import numpy as np
 from .model import Customer, Instance, Solution
@@ -70,6 +71,8 @@ def tank_events(instance: Instance, solution: Solution) -> list[TankEvent]:
 
 
 try:
+    if os.environ.get("VRP_DISABLE_FAST", "").lower() in {"1", "true", "yes"}:
+        raise ImportError("accelerated inventory disabled by VRP_DISABLE_FAST")
     from .inventory_fast import project_inventory_core
     _HAS_FAST_CORE = True
 except ImportError:

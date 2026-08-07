@@ -6,11 +6,11 @@ from itertools import combinations, permutations
 
 from ..inventory import tank_events
 from ..model import Instance, Operation, Shift, Solution
-from ..rules import derive_solution, is_time_window_valid, is_trailer_allowed
+from ..rules import derive_solution, is_time_window_valid, is_trailer_allowed, validate_solution
 from ..highs_repair import repair_quantities_with_highs
-from ..highs_time_opt import optimize_solution_times
+from ..highs_time_opt import optimize_solution_times, try_optimize_shift_times
 from ..route_cache import RouteCache
-from .highs_selector import select_shifts_with_highs
+from .highs_selector import SelectorConfig, select_shifts_with_highs
 
 
 MINUTES_PER_DAY = 1440
@@ -66,6 +66,14 @@ class RescueConfig:
     normalize_source_loads: bool = True
     quantity_objective: str = "max-delivered"
     prioritize_severity: bool = False
+    # In a full route-selection window, incumbent future routes are optional
+    # columns and their quantities can be re-optimized jointly with a new
+    # early refill.  Standalone/greedy repair cannot make that assumption and
+    # must reserve all future capacity conservatively.
+    allow_future_rebalance: bool = False
+    greedy_append: bool = False
+    greedy_rounds: int = 16
+    greedy_candidate_limit: int = 240
 
 
 @dataclass(frozen=True)
@@ -84,16 +92,25 @@ def targeted_rescue(
     config: RescueConfig = RescueConfig(),
 ) -> tuple[Solution, RescueReport]:
     failing = _failing_customers(instance, baseline, config)
+    if config.greedy_append:
+        return greedy_append_rescue(instance, baseline, config=config, failing=failing)
     fixed_prefix = _keep_shifts_started_before(
         baseline,
         config.replace_from_day * MINUTES_PER_DAY,
     )
-    candidates = _baseline_window_shifts(baseline, config)
+    # A previous incumbent is only a route-column seed, not a presumption of
+    # feasibility.  In particular, old cold starts may contain an impossible
+    # final return that a column selector would otherwise retain unchanged.
+    candidates = _baseline_window_shifts(instance, baseline, config)
     candidates.extend(generate_rescue_candidates(instance, fixed_prefix, failing, config=config))
     candidates.extend(generate_carryover_rescue_candidates(instance, fixed_prefix, failing, config=config))
     candidates.extend(generate_chain_rescue_candidates(instance, fixed_prefix, failing, config=config))
     candidates.extend(generate_multi_reload_candidates(instance, fixed_prefix, failing, config=config))
-    candidates = _dedupe_reindex(candidates)
+    # Individual generators are deliberately diverse; keep the central gate
+    # here so no route can bypass complete derived driving validation.
+    candidates = _dedupe_reindex(
+        [candidate for candidate in candidates if _is_shift_route_valid(instance, candidate)]
+    )
     if not candidates:
         return baseline, RescueReport(tuple(failing), 0, 0)
 
@@ -106,6 +123,14 @@ def targeted_rescue(
         variable_quantities=config.variable_quantity_columns,
         pressure_pricing=config.pressure_pricing,
         baseline=baseline,
+        # A rescue is never allowed to exchange one physical tank violation
+        # for another.  Sparse-pool column generation may use soft safety
+        # stock penalties, but the hard 0..capacity tank bounds remain
+        # mandatory for every selected repair schedule.
+        selector_config=SelectorConfig(
+            strict_trailer_inventory=True,
+            strict_nonnegative_inventory=True,
+        ),
     )
     # Restore future shifts from the baseline that start after the end day of the rescue window
     future_shifts = [
@@ -146,6 +171,147 @@ def targeted_rescue(
         repair_status,
         repair_constraints,
     )
+
+
+def greedy_append_rescue(
+    instance: Instance,
+    baseline: Solution,
+    *,
+    config: RescueConfig,
+    failing: list[int] | None = None,
+) -> tuple[Solution, RescueReport]:
+    """Fast, fail-closed final feasibility repair for a cold-start schedule.
+
+    Global selection is useful earlier in construction, but it becomes needlessly
+    expensive when a nearly feasible schedule has only a few isolated inventory
+    breaches.  Generate direct source-backed services, append one only when a
+    full validation proves it strictly reduces the number of official-style
+    errors and introduces no route/resource error, and repeat.
+    """
+    current = Solution(
+        shifts=tuple(replace(shift, index=index) for index, shift in enumerate(baseline.shifts))
+    )
+    generated_total = 0
+    selected = 0
+    for _round in range(config.greedy_rounds):
+        targets = failing if failing is not None else _failing_customers(instance, current, config)
+        candidates = generate_rescue_candidates(instance, current, targets, config=config)
+        # Dense substitutions are essential when every free driver/trailer
+        # interval is already occupied.  These columns replace a small group
+        # of incumbent one-stop shifts while covering several pressure tanks.
+        candidates.extend(
+            generate_chain_rescue_candidates(
+                instance,
+                current,
+                targets,
+                config=config,
+                max_candidates=max(32, config.greedy_candidate_limit // 2),
+            )
+        )
+        candidates.extend(
+            generate_multi_reload_candidates(
+                instance,
+                current,
+                targets,
+                config=config,
+                max_candidates=max(32, config.greedy_candidate_limit // 2),
+            )
+        )
+        target_set = set(targets)
+        candidates = _dedupe_reindex(candidates)
+        candidates.sort(
+            key=lambda shift: (
+                -sum(
+                    operation.quantity > EPSILON and operation.point in target_set
+                    for operation in shift.operations
+                ),
+                -sum(operation.quantity > EPSILON for operation in shift.operations),
+                shift.start,
+            )
+        )
+        candidates = candidates[: config.greedy_candidate_limit]
+        generated_total += len(candidates)
+        current_errors = _error_count(instance, current)
+        best: Solution | None = None
+        best_errors = current_errors
+        current_derived = derive_solution(instance, current)
+        for candidate in candidates:
+            conflicts = _rescue_conflicts(instance, current_derived, candidate)
+            if any(
+                shift.start < config.replace_from_day * MINUTES_PER_DAY
+                for shift in conflicts
+            ):
+                continue
+            proposal = Solution(
+                shifts=tuple(
+                    replace(shift, index=index)
+                    for index, shift in enumerate(
+                        (*(
+                            shift for shift in current.shifts
+                            if shift not in conflicts
+                        ), candidate)
+                    )
+                )
+            )
+            violations = validate_solution(instance, proposal)
+            # A repair may improve service quality or safety stock, but it may
+            # never buy that improvement with physically impossible tank
+            # state.  In particular, comparing only the total error count
+            # previously allowed a proposal to exchange negative inventory for
+            # a later tank overfill.  Treat *every* dynamic tank violation as
+            # a hard rejection; the released checker does too.
+            if any(
+                violation.severity == "error" and violation.code == "DYN01"
+                for violation in violations
+            ):
+                continue
+            if any(
+                violation.severity == "error"
+                and violation.code not in {"QS01", "QS02", "DYN01"}
+                for violation in violations
+            ):
+                continue
+            errors = sum(violation.severity == "error" for violation in violations)
+            if errors < best_errors:
+                best = proposal
+                best_errors = errors
+        if best is None:
+            break
+        current = best
+        selected += 1
+        failing = None
+
+    return current, RescueReport(
+        tuple(_failing_customers(instance, current, config)),
+        generated_total,
+        selected,
+    )
+
+
+def _error_count(instance: Instance, solution: Solution) -> int:
+    return sum(
+        violation.severity == "error"
+        for violation in validate_solution(instance, solution)
+    )
+
+
+def _rescue_conflicts(instance: Instance, current_derived, candidate: Shift) -> tuple[Shift, ...]:
+    """Shifts that cannot coexist with a direct rescue on its resources."""
+    candidate_end = derive_solution(instance, Solution(shifts=(candidate,)))[0].end
+    driver = instance.drivers[candidate.driver]
+    conflicts: list[Shift] = []
+    for derived in current_derived:
+        shift = derived.shift
+        if shift.driver == candidate.driver:
+            left = candidate_end + driver.min_inter_shift_duration
+            right = derived.end + driver.min_inter_shift_duration
+            if candidate.start < right and shift.start < left:
+                conflicts.append(shift)
+                continue
+        if shift.trailer == candidate.trailer:
+            if candidate.start < derived.end and shift.start < candidate_end:
+                conflicts.append(shift)
+    return tuple(conflicts)
 
 
 def normalize_source_loads(instance: Instance, solution: Solution) -> Solution:
@@ -196,10 +362,18 @@ def _keep_shifts_started_before(solution: Solution, cutoff_minute: int) -> Solut
     )
 
 
-def _baseline_window_shifts(solution: Solution, config: RescueConfig) -> list[Shift]:
+def _baseline_window_shifts(
+    instance: Instance,
+    solution: Solution,
+    config: RescueConfig,
+) -> list[Shift]:
     start = config.replace_from_day * MINUTES_PER_DAY
     end = config.end_day * MINUTES_PER_DAY
-    return [shift for shift in solution.shifts if start <= shift.start < end]
+    return [
+        shift
+        for shift in solution.shifts
+        if start <= shift.start < end and _is_shift_route_valid(instance, shift)
+    ]
 
 
 def _dedupe_reindex(shifts: list[Shift]) -> list[Shift]:
@@ -284,22 +458,64 @@ def generate_rescue_candidates(
                     + instance.time_matrix[source.index][customer.index]
                     + return_time
                 )
-                needs_return_layover = (
-                    customer.layover_customer
-                    and total_driving > driver.max_driving_duration
+                outbound_driving = (
+                    instance.time_matrix[instance.base_index][source.index]
+                    + instance.time_matrix[source.index][customer.index]
                 )
-                trail_time = customer.setup_time + return_time + (
-                    driver.layover_duration if needs_return_layover else 0
+                post_layover_driving = (
+                    instance.time_matrix[customer.index][source.index]
+                    + instance.time_matrix[source.index][instance.base_index]
+                )
+                # A layover-enabled target can legally split the outbound and
+                # return driving spell.  Do not reject that topology before
+                # ``_is_shift_route_valid`` derives the represented return
+                # layover and proves the complete driver window.
+                if (
+                    total_driving > driver.max_driving_duration
+                    and (
+                        not customer.layover_customer
+                        or outbound_driving > driver.max_driving_duration
+                        or post_layover_driving > driver.max_driving_duration
+                    )
+                ):
+                    continue
+                return_layover = (
+                    total_driving > driver.max_driving_duration
+                    and customer.layover_customer
+                )
+                trail_time = (
+                    customer.setup_time
+                    + (
+                        instance.time_matrix[customer.index][source.index]
+                        + driver.layover_duration
+                        + source.setup_time
+                        + instance.time_matrix[source.index][instance.base_index]
+                        if return_layover
+                        else return_time
+                    )
                 )
                 
                 target_arrivals = []
-                for window in driver.time_windows:
-                    min_arrival = max(start_minute + route_to_customer, window.start + route_to_customer)
-                    max_arrival = min(latest_customer_arrival, window.end - trail_time)
-                    if min_arrival <= max_arrival:
-                        target_arrivals.extend(
-                            _window_arrival_samples(min_arrival, max_arrival, config.samples_per_customer)
+                for driver_window in driver.time_windows:
+                    for customer_window in customer.time_windows:
+                        min_arrival = max(
+                            start_minute + route_to_customer,
+                            driver_window.start + route_to_customer,
+                            customer_window.start,
                         )
+                        max_arrival = min(
+                            latest_customer_arrival,
+                            driver_window.end - trail_time,
+                            customer_window.end - customer.setup_time,
+                        )
+                        if min_arrival <= max_arrival:
+                            target_arrivals.extend(
+                                _window_arrival_samples(
+                                    min_arrival,
+                                    max_arrival,
+                                    config.samples_per_customer,
+                                )
+                            )
                 
                 target_arrivals = sorted(list(set(target_arrivals)))
                 
@@ -315,25 +531,26 @@ def generate_rescue_candidates(
                         + instance.time_matrix[source.index][customer.index]
                         + return_time
                     )
-                    needs_return_layover = (
-                        customer.layover_customer
-                        and total_driving > driver.max_driving_duration
-                    )
-                    end = departure + return_time + (
-                        driver.layover_duration if needs_return_layover else 0
-                    )
+                    if return_layover:
+                        terminal_source_arrival = (
+                            departure
+                            + instance.time_matrix[customer.index][source.index]
+                            + driver.layover_duration
+                        )
+                        end = (
+                            terminal_source_arrival
+                            + source.setup_time
+                            + instance.time_matrix[source.index][instance.base_index]
+                        )
+                    else:
+                        terminal_source_arrival = None
+                        end = departure + return_time
                     if end > end_minute:
                         continue
                     if not is_time_window_valid(shift_start, end, driver.time_windows):
                         continue
                     if not is_time_window_valid(arrival, departure, customer.time_windows):
                         continue
-                    if (
-                        total_driving > driver.max_driving_duration
-                        and not customer.layover_customer
-                    ):
-                        continue
-
                     inventory_at_arrival = _inventory_at_arrival(
                         instance, baseline, customer_id, arrival, event_cache
                     )
@@ -342,7 +559,29 @@ def generate_rescue_candidates(
                         > customer.capacity * config.max_pre_service_fill_ratio + EPSILON
                     ):
                         continue
-                    room = max(0.0, customer.capacity - inventory_at_arrival)
+                    # A pre-existing shortage can make ``capacity - inventory``
+                    # exceed the physical tank.  No single delivery may use
+                    # that artificial room.
+                    room = min(
+                        customer.capacity,
+                        max(0.0, customer.capacity - inventory_at_arrival),
+                    )
+                    # An added delivery persists through all later inventory
+                    # checkpoints.  Reserve capacity for every already
+                    # committed future delivery before offering this column;
+                    # checking the tank only at ``arrival`` can otherwise
+                    # create a perfectly plausible early refill that makes a
+                    # later incumbent delivery overfill the tank.
+                    future_room = (
+                        customer.capacity
+                        if config.allow_future_rebalance
+                        else _future_capacity_room(
+                            instance,
+                            customer_id,
+                            arrival,
+                            event_cache,
+                        )
+                    )
                     target_room = max(
                         0.0,
                         customer.capacity * config.target_fill_ratio
@@ -351,7 +590,7 @@ def generate_rescue_candidates(
                     trailer_load = _trailer_load_at(instance, trailer_cache, trailer.index, shift_start)
                     load_quantity = max(0.0, trailer.capacity - trailer_load)
                     available_quantity = trailer_load + load_quantity
-                    quantity = min(available_quantity, room, target_room)
+                    quantity = min(available_quantity, room, future_room, target_room)
                     if quantity < customer.min_operation_quantity - EPSILON:
                         continue
 
@@ -359,6 +598,12 @@ def generate_rescue_candidates(
                     if load_quantity > EPSILON:
                         operations.append(Operation(source.index, source_arrival, -load_quantity))
                     operations.append(Operation(customer.index, arrival, quantity))
+                    if terminal_source_arrival is not None:
+                        operations.append(Operation(
+                            source.index,
+                            terminal_source_arrival,
+                            -quantity,
+                        ))
                     shift = Shift(
                         index=0,
                         driver=driver.index,
@@ -391,7 +636,102 @@ def generate_rescue_candidates(
             seen=seen,
         )
     )
+    # The executable routinely combines a deadline-bound call-in with one
+    # nearby VMI service.  Those stops are not interchangeable: the call-in
+    # fixes the route's time anchor, while the VMI stop uses the remaining
+    # payload and avoids a separate resource interval.  Keep this family
+    # deliberately bounded so cold starts remain fast.
+    candidates.extend(
+        _generate_callin_vmi_chain_rescue_candidates(
+            instance,
+            baseline,
+            callin_customers,
+            start_minute=start_minute,
+            end_minute=end_minute,
+            samples_per_customer=config.samples_per_customer,
+            event_cache=event_cache,
+            trailer_cache=trailer_cache,
+            seen=seen,
+        )
+    )
+    # In a saturated schedule, an order cannot necessarily be appended as a
+    # new shift.  Generate atomic replacements of an incumbent route instead:
+    # the inserted call-in keeps the route's other VMI stops, then the timing
+    # MIP proves the complete shifted route still fits its resource chain.
+    candidates.extend(
+        _generate_callin_route_insert_candidates(
+            instance,
+            baseline,
+            callin_customers,
+            seen=seen,
+        )
+    )
     return candidates
+
+
+def _generate_callin_route_insert_candidates(
+    instance: Instance,
+    baseline: Solution,
+    customer_ids: list[int],
+    *,
+    seen: set[tuple[object, ...]],
+) -> list[Shift]:
+    """Insert an unmet call-in in place of one incumbent route column.
+
+    These are route *replacements*, not overlapping additions.  They are
+    particularly important when every compatible driver/trailer pair is busy
+    inside the order's time window.
+    """
+    derived = derive_solution(instance, baseline)
+    result: list[Shift] = []
+    for customer_id in customer_ids:
+        customer = instance.customer_by_point[customer_id]
+        order_info = _next_unsatisfied_callin_order(customer, baseline)
+        if order_info is None:
+            continue
+        _order_index, order = order_info
+        for position, shift in enumerate(baseline.shifts):
+            if shift.trailer not in customer.allowed_trailers:
+                continue
+            if shift.start > order.latest_time:
+                continue
+            # The replacement must end before every fixed successor sharing
+            # either resource; derive the latest permissible endpoint once.
+            latest_end: int | None = None
+            driver_gap = instance.drivers[shift.driver].min_inter_shift_duration
+            for other_position, other in enumerate(baseline.shifts):
+                if other_position == position:
+                    continue
+                if other.driver == shift.driver and other.start >= shift.start:
+                    bound = other.start - driver_gap
+                    latest_end = bound if latest_end is None else min(latest_end, bound)
+                if other.trailer == shift.trailer and other.start >= shift.start:
+                    bound = other.start
+                    latest_end = bound if latest_end is None else min(latest_end, bound)
+            for insert_at in range(len(shift.operations) + 1):
+                operations = (
+                    shift.operations[:insert_at]
+                    + (Operation(customer_id, order.earliest_time, order.min_quantity_to_satisfy),)
+                    + shift.operations[insert_at:]
+                )
+                tentative = replace(shift, operations=operations)
+                retimed = try_optimize_shift_times(
+                    instance, tentative, latest_end=latest_end,
+                )
+                if retimed is None:
+                    continue
+                if not any(
+                    order.earliest_time <= operation.arrival <= order.latest_time
+                    and operation.point == customer_id
+                    for operation in retimed.operations
+                ):
+                    continue
+                key = _shift_key(retimed)
+                if key in seen or not _is_shift_route_valid(instance, retimed):
+                    continue
+                seen.add(key)
+                result.append(replace(retimed, index=len(result)))
+    return result
 
 
 def _generate_callin_rescue_candidates(
@@ -503,7 +843,12 @@ def _generate_callin_chain_rescue_candidates(
         if (order_info := _next_unsatisfied_callin_order(instance.customer_by_point[customer_id], baseline)) is not None
     ]
     candidates: list[Shift] = []
-    for size in range(2, min(3, len(tasks)) + 1):
+    trailer_cache = _trailer_load_cache(instance, baseline)
+    # Singleton chains matter too: a trailer may legally leave base carrying
+    # its current stock, serve a deadline-bound call-in, and reload only
+    # afterwards. Restricting this family to two call-ins omitted exactly that
+    # topology and forced an unnecessary source visit before the first order.
+    for size in range(1, min(3, len(tasks)) + 1):
         for subset in combinations(tasks, size):
             allowed = set(instance.customer_by_point[subset[0][0]].allowed_trailers)
             for customer_id, _order_index, _order in subset[1:]:
@@ -529,41 +874,240 @@ def _generate_callin_chain_rescue_candidates(
                             # before 314/124.  Starting every chain at source
                             # makes that physically impossible once trailer
                             # state is enforced.
-                            initial_carried = trailer.initial_quantity
-                            if initial_carried + EPSILON >= first_order.min_quantity_to_satisfy:
-                                lead = instance.time_matrix[instance.base_index][first_customer.index]
-                            else:
-                                lead = (
-                                    instance.time_matrix[instance.base_index][source.index]
-                                    + source.setup_time
-                                    + instance.time_matrix[source.index][first_customer.index]
-                                )
-                            for window in driver.time_windows:
-                                earliest = max(first_order.earliest_time, start_minute + lead, window.start + lead)
-                                latest = min(first_order.latest_time - first_customer.setup_time, end_minute - lead, window.end - lead)
-                                if earliest > latest:
-                                    continue
-                                for first_arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
-                                    shift = _build_callin_chain(
-                                        instance,
-                                        route,
-                                        driver.index,
-                                        trailer_id,
-                                        source.index,
-                                        first_arrival - lead,
-                                        initial_carried,
-                                    )
-                                    if shift is None:
+                            # Explore both legal starts.  Trailer state is
+                            # sampled at the resulting start minute; using the
+                            # XML initial quantity here silently creates route
+                            # columns that strict state flow can never select.
+                            for lead in (
+                                instance.time_matrix[instance.base_index][first_customer.index],
+                                instance.time_matrix[instance.base_index][source.index]
+                                + source.setup_time
+                                + instance.time_matrix[source.index][first_customer.index],
+                            ):
+                                for window in driver.time_windows:
+                                    earliest = max(first_order.earliest_time, start_minute + lead, window.start + lead)
+                                    latest = min(first_order.latest_time - first_customer.setup_time, end_minute - lead, window.end - lead)
+                                    if earliest > latest:
                                         continue
-                                    derived = _derive_single_shift(instance, shift)
-                                    if derived.end > end_minute or not is_time_window_valid(shift.start, derived.end, driver.time_windows):
-                                        continue
-                                    key = _shift_key(shift)
-                                    if key in seen:
-                                        continue
-                                    seen.add(key)
-                                    candidates.append(replace(shift, index=len(candidates)))
+                                    for first_arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
+                                        shift_start = first_arrival - lead
+                                        shift = _build_callin_chain(
+                                            instance,
+                                            route,
+                                            driver.index,
+                                            trailer_id,
+                                            source.index,
+                                            shift_start,
+                                            _trailer_load_at(instance, trailer_cache, trailer_id, shift_start),
+                                        )
+                                        if shift is None:
+                                            continue
+                                        derived = _derive_single_shift(instance, shift)
+                                        if derived.end > end_minute or not is_time_window_valid(shift.start, derived.end, driver.time_windows):
+                                            continue
+                                        key = _shift_key(shift)
+                                        if key in seen:
+                                            continue
+                                        seen.add(key)
+                                        candidates.append(replace(shift, index=len(candidates)))
     return candidates
+
+
+def _generate_callin_vmi_chain_rescue_candidates(
+    instance: Instance,
+    baseline: Solution,
+    customer_ids: list[int],
+    *,
+    start_minute: int,
+    end_minute: int,
+    samples_per_customer: int,
+    event_cache: dict[int, list],
+    trailer_cache: dict[int, list[tuple[int, float]]],
+    seen: set[tuple[object, ...]],
+) -> list[Shift]:
+    """Generate short call-in-then-VMI routes from native state projections.
+
+    A support stop is selected from low projected VMI tanks, ranked by urgency
+    and travel from the call-in anchor.  This is a generic topology rule, not
+    an instance-specific route list.
+    """
+    tasks = [
+        (customer_id, order_info[0], order_info[1])
+        for customer_id in customer_ids
+        if (order_info := _next_unsatisfied_callin_order(
+            instance.customer_by_point[customer_id], baseline
+        )) is not None
+    ]
+    # A useful companion is often not yet failing: it is a tank which will
+    # otherwise consume another shift later in the horizon.  Rank all VMI
+    # tanks by their lowest projected fill ratio, then use geography only as a
+    # tie-breaker for each call-in route.
+    support_margin: dict[int, float] = {}
+    for customer in instance.customers:
+        if customer.call_in:
+            continue
+        events = event_cache.get(customer.index, ())
+        relevant = [
+            event.ending_inventory / max(customer.capacity, EPSILON)
+            for event in events
+            if start_minute <= event.time_start < end_minute
+        ]
+        if relevant:
+            support_margin[customer.index] = min(relevant)
+    candidates: list[Shift] = []
+    # One or two call-ins plus one VMI stop captures the useful shared-shift
+    # shape without an exponential route enumeration.
+    for size in range(1, min(2, len(tasks)) + 1):
+        for subset in combinations(tasks, size):
+            allowed = set(instance.customer_by_point[subset[0][0]].allowed_trailers)
+            for customer_id, _order_index, _order in subset[1:]:
+                allowed &= set(instance.customer_by_point[customer_id].allowed_trailers)
+            if not allowed:
+                continue
+            for callin_route in permutations(subset):
+                last_callin = callin_route[-1][0]
+                nearby_support = sorted(
+                    (
+                        customer_id for customer_id in support_margin
+                        if customer_id not in {task[0] for task in callin_route}
+                    ),
+                    key=lambda customer_id: (
+                        support_margin[customer_id],
+                        instance.time_matrix[last_callin][customer_id],
+                        customer_id,
+                    ),
+                )[:3]
+                for support_id in nearby_support:
+                    support_customer = instance.customer_by_point[support_id]
+                    compatible = allowed & set(support_customer.allowed_trailers)
+                    if not compatible:
+                        continue
+                    first_customer = instance.customer_by_point[callin_route[0][0]]
+                    first_order = callin_route[0][2]
+                    for driver in instance.drivers:
+                        for trailer_id in driver.trailer_ids:
+                            if trailer_id not in compatible:
+                                continue
+                            trailer = instance.trailers[trailer_id]
+                            if any(order.min_quantity_to_satisfy > trailer.capacity + EPSILON for _, _, order in callin_route):
+                                continue
+                            for source in instance.sources:
+                                if trailer_id not in source.allowed_trailers:
+                                    continue
+                                for window in driver.time_windows:
+                                    # Actual state at the candidate start is
+                                    # determined below; this conservative lead
+                                    # leaves room for an initial reload.
+                                    lead = (
+                                        instance.time_matrix[instance.base_index][source.index]
+                                        + source.setup_time
+                                        + instance.time_matrix[source.index][first_customer.index]
+                                    )
+                                    earliest = max(first_order.earliest_time, start_minute + lead, window.start + lead)
+                                    latest = min(first_order.latest_time - first_customer.setup_time, end_minute - 1)
+                                    if earliest > latest:
+                                        continue
+                                    for first_arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
+                                        start = first_arrival - lead
+                                        initial_carried = _trailer_load_at(
+                                            instance, trailer_cache, trailer_id, start
+                                        )
+                                        shift = _build_callin_vmi_chain(
+                                            instance,
+                                            baseline,
+                                            event_cache,
+                                            callin_route,
+                                            support_id,
+                                            driver.index,
+                                            trailer_id,
+                                            source.index,
+                                            start,
+                                            initial_carried,
+                                        )
+                                        if shift is None:
+                                            continue
+                                        derived = _derive_single_shift(instance, shift)
+                                        if derived.end > end_minute or not is_time_window_valid(shift.start, derived.end, driver.time_windows):
+                                            continue
+                                        key = _shift_key(shift)
+                                        if key in seen:
+                                            continue
+                                        seen.add(key)
+                                        candidates.append(replace(shift, index=len(candidates)))
+    return candidates
+
+
+def _build_callin_vmi_chain(
+    instance: Instance,
+    baseline: Solution,
+    event_cache: dict[int, list],
+    callin_route,
+    support_id: int,
+    driver_id: int,
+    trailer_id: int,
+    source_id: int,
+    start: int,
+    initial_carried: float,
+) -> Shift | None:
+    """Build one mixed chain, refilling whenever the next stop needs it."""
+    trailer = instance.trailers[trailer_id]
+    operations: list[Operation] = []
+    current_point = instance.base_index
+    current_time = start
+    carried = initial_carried
+
+    def refill() -> tuple[int, int, float]:
+        nonlocal current_point, current_time, carried
+        source_arrival = current_time + instance.time_matrix[current_point][source_id]
+        load = max(0.0, trailer.capacity - carried)
+        if load > EPSILON:
+            operations.append(Operation(source_id, source_arrival, -load))
+            carried += load
+        current_time = source_arrival + instance.setup_time_for_point(source_id)
+        current_point = source_id
+        return current_point, current_time, carried
+
+    for customer_id, _order_index, order in callin_route:
+        quantity = order.min_quantity_to_satisfy
+        if carried + EPSILON < quantity:
+            refill()
+        customer = instance.customer_by_point[customer_id]
+        raw_arrival = max(current_time + instance.time_matrix[current_point][customer_id], order.earliest_time)
+        arrival = next(
+            (
+                max(raw_arrival, window.start)
+                for window in customer.time_windows
+                if max(raw_arrival, window.start) + customer.setup_time <= window.end
+                and max(raw_arrival, window.start) + customer.setup_time <= order.latest_time
+            ),
+            None,
+        )
+        if arrival is None:
+            return None
+        operations.append(Operation(customer_id, arrival, quantity))
+        carried -= quantity
+        current_time = arrival + customer.setup_time
+        current_point = customer_id
+
+    support_customer = instance.customer_by_point[support_id]
+    # A full refill before the VMI stop is inexpensive in column generation
+    # and lets the selector decide whether sharing this route is worthwhile.
+    if carried < support_customer.min_operation_quantity - EPSILON:
+        refill()
+    arrival = current_time + instance.time_matrix[current_point][support_id]
+    departure = arrival + support_customer.setup_time
+    breach = _first_breach_minute(instance, baseline, support_id, event_cache)
+    if (breach is not None and arrival >= breach) or not is_time_window_valid(arrival, departure, support_customer.time_windows):
+        return None
+    inventory = _inventory_at_arrival(instance, baseline, support_id, arrival, event_cache)
+    room = min(support_customer.capacity, max(0.0, support_customer.capacity - inventory))
+    target = max(0.0, support_customer.capacity * 0.95 - inventory)
+    quantity = min(carried, room, target)
+    if quantity < support_customer.min_operation_quantity - EPSILON:
+        return None
+    operations.append(Operation(support_id, arrival, quantity))
+    shift = Shift(index=0, driver=driver_id, trailer=trailer_id, start=start, operations=tuple(operations))
+    return shift if _is_shift_route_valid(instance, shift) else None
 
 
 def _build_callin_chain(
@@ -725,6 +1269,7 @@ def generate_chain_rescue_candidates(
     failing_customers: list[int],
     *,
     config: RescueConfig,
+    max_candidates: int | None = None,
 ) -> list[Shift]:
     start_minute = max(config.start_day, config.replace_from_day) * MINUTES_PER_DAY
     end_minute = config.end_day * MINUTES_PER_DAY
@@ -738,6 +1283,7 @@ def generate_chain_rescue_candidates(
         config,
         event_cache,
         route_cache,
+        max_sequences=(max(128, max_candidates * 8) if max_candidates else None),
     )
     candidates: list[Shift] = []
     seen: set[tuple[object, ...]] = set()
@@ -821,6 +1367,8 @@ def generate_chain_rescue_candidates(
                     if shift is None:
                         continue
                     candidates.append(replace(shift, index=len(candidates)))
+                    if max_candidates is not None and len(candidates) >= max_candidates:
+                        return candidates
 
     return candidates
 
@@ -831,6 +1379,7 @@ def generate_multi_reload_candidates(
     failing_customers: list[int],
     *,
     config: RescueConfig,
+    max_candidates: int | None = None,
 ) -> list[Shift]:
     start_minute = max(config.start_day, config.replace_from_day) * MINUTES_PER_DAY
     end_minute = config.end_day * MINUTES_PER_DAY
@@ -844,6 +1393,7 @@ def generate_multi_reload_candidates(
         config,
         event_cache,
         route_cache,
+        max_sequences=(max(128, max_candidates * 8) if max_candidates else None),
     )
     candidates: list[Shift] = []
     seen: set[tuple[object, ...]] = set()
@@ -938,6 +1488,8 @@ def generate_multi_reload_candidates(
                     if shift is None:
                         continue
                     candidates.append(replace(shift, index=len(candidates)))
+                    if max_candidates is not None and len(candidates) >= max_candidates:
+                        return candidates
 
     # Generate pure reload shifts to allow pre-loading at base
     for driver in instance.drivers:
@@ -958,17 +1510,20 @@ def generate_multi_reload_candidates(
             if duration > 720:
                 continue
             for window in driver.time_windows:
-                if not (start_minute <= window.start < end_minute):
+                shift_start = max(start_minute, window.start)
+                if shift_start + duration > min(end_minute, window.end):
                     continue
-                if window.end - window.start < duration:
-                    continue
-                shift_start = window.start
                 source_arrival = shift_start + instance.time_matrix[instance.base_index][source.index]
-                # Load max capacity
+                carried = _trailer_load_at(
+                    instance, trailer_cache, trailer.index, shift_start,
+                )
+                load_quantity = max(0.0, trailer.capacity - carried)
+                if load_quantity <= EPSILON:
+                    continue
                 op = Operation(
                     point=source.index,
                     arrival=source_arrival,
-                    quantity=-trailer.capacity
+                    quantity=-load_quantity,
                 )
                 shift = Shift(
                     index=0,
@@ -981,6 +1536,8 @@ def generate_multi_reload_candidates(
                 if key not in seen:
                     seen.add(key)
                     candidates.append(replace(shift, index=len(candidates)))
+                    if max_candidates is not None and len(candidates) >= max_candidates:
+                        return candidates
 
     # Generate single-customer direct shifts starting from base (utilizing pre-loaded trailers)
     for c_id in failing_customers:
@@ -1021,9 +1578,32 @@ def generate_multi_reload_candidates(
                 
                 for anchor_arrival in target_arrivals:
                     shift_start = anchor_arrival - lead_to_anchor
-                    
-                    # Construct shift
-                    op = Operation(point=c_id, arrival=anchor_arrival, quantity=0.0)
+                    inventory_at_arrival = _inventory_at_arrival(
+                        instance,
+                        baseline,
+                        c_id,
+                        anchor_arrival,
+                        event_cache,
+                    )
+                    room = min(
+                        customer.capacity,
+                        max(0.0, customer.capacity - inventory_at_arrival),
+                    )
+                    target_room = max(
+                        0.0,
+                        customer.capacity * config.target_fill_ratio - inventory_at_arrival,
+                    )
+                    # This path intentionally starts from an existing carried
+                    # load.  It is how a 510-minute direct round-trip can
+                    # serve a remote tank that is infeasible via a source.
+                    trailer_load = _trailer_load_at(
+                        instance, trailer_cache, trailer.index, shift_start,
+                    )
+                    quantity = min(trailer_load, room, target_room)
+                    if quantity < customer.min_operation_quantity - EPSILON:
+                        continue
+
+                    op = Operation(point=c_id, arrival=anchor_arrival, quantity=quantity)
                     shift = Shift(
                         index=0,
                         driver=driver.index,
@@ -1038,6 +1618,8 @@ def generate_multi_reload_candidates(
                     if not _is_shift_route_valid(instance, shift):
                         continue
                     candidates.append(replace(shift, index=len(candidates)))
+                    if max_candidates is not None and len(candidates) >= max_candidates:
+                        return candidates
 
     return candidates
 
@@ -1049,6 +1631,7 @@ def _multi_reload_sequences(
     config: RescueConfig,
     event_cache: dict[int, list],
     route_cache: RouteCache | None = None,
+    max_sequences: int | None = None,
 ) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
     sequences = _chain_sequences(
         instance,
@@ -1073,6 +1656,8 @@ def _multi_reload_sequences(
                 continue
             seen.add(key)
             output.append(key)
+            if max_sequences is not None and len(output) >= max_sequences:
+                return output
     return output
 
 
@@ -1228,6 +1813,7 @@ def _chain_sequences(
     config: RescueConfig,
     event_cache: dict[int, list],
     route_cache: RouteCache | None = None,
+    max_sequences: int | None = None,
 ) -> list[tuple[int, ...]]:
     route_cache = route_cache or RouteCache(instance)
     failing = [
@@ -1243,7 +1829,10 @@ def _chain_sequences(
     seen: set[tuple[int, ...]] = set()
 
     def expand_chain(current_chain: tuple[int, ...]) -> None:
-        if len(current_chain) >= config.max_chain_length:
+        if (
+            len(current_chain) >= config.max_chain_length
+            or (max_sequences is not None and len(sequences) >= max_sequences)
+        ):
             return
             
         last_customer = current_chain[-1]
@@ -1261,10 +1850,16 @@ def _chain_sequences(
             if new_chain not in seen:
                 seen.add(new_chain)
                 sequences.append(new_chain)
+                if max_sequences is not None and len(sequences) >= max_sequences:
+                    return
             expand_chain(new_chain)
+            if max_sequences is not None and len(sequences) >= max_sequences:
+                return
 
     for anchor in failing:
         expand_chain((anchor,))
+        if max_sequences is not None and len(sequences) >= max_sequences:
+            break
 
     return sequences
 
@@ -1296,10 +1891,33 @@ def _build_chain_shift(
     if load_quantity > EPSILON:
         operations.append(Operation(source_id, source_arrival, -load_quantity))
 
-    total_driving = instance.time_matrix[instance.base_index][source_id]
     delivered_count = 0
     for customer_id in sequence:
         customer = instance.customer_by_point[customer_id]
+        # A reload is an extension arc, not a once-per-route special case.
+        # Refill whenever the current trailer stock cannot cover the useful
+        # fill at the next customer.  This is the essential primitive behind
+        # the long source -> several customers -> source -> several customers
+        # chains observed in the executable's cold starts.
+        inventory_at_current_time = _inventory_at_arrival(
+            instance, baseline, customer_id, current_time, event_cache
+        )
+        desired_quantity = min(
+            max(0.0, customer.capacity - inventory_at_current_time),
+            max(0.0, customer.capacity * config.target_fill_ratio - inventory_at_current_time),
+        )
+        if (
+            desired_quantity >= customer.min_operation_quantity - EPSILON
+            and trailer_load + EPSILON < desired_quantity
+        ):
+            reload_arrival = current_time + instance.time_matrix[current_point][source_id]
+            reload_quantity = max(0.0, trailer.capacity - trailer_load)
+            if reload_quantity <= EPSILON:
+                return None
+            operations.append(Operation(source_id, reload_arrival, -reload_quantity))
+            trailer_load += reload_quantity
+            current_time = reload_arrival + source.setup_time
+            current_point = source_id
         arrival = current_time + instance.time_matrix[current_point][customer_id]
         departure = arrival + customer.setup_time
         breach_minute = _first_breach_minute(instance, baseline, customer_id, event_cache)
@@ -1326,29 +1944,13 @@ def _build_chain_shift(
         operations.append(Operation(customer_id, arrival, quantity))
         delivered_count += 1
         trailer_load -= quantity
-        total_driving += instance.time_matrix[current_point][customer_id]
         current_time = departure
         current_point = customer_id
 
     if delivered_count < 2:
         return None
-    total_driving += instance.time_matrix[current_point][instance.base_index]
-    has_layover_customer = any(
-        instance.customer_by_point[customer_id].layover_customer
-        for customer_id in sequence
-    )
-    needs_return_layover = (
-        has_layover_customer
-        and total_driving > driver.max_driving_duration
-    )
-    end = (
-        current_time
-        + instance.time_matrix[current_point][instance.base_index]
-        + (driver.layover_duration if needs_return_layover else 0)
-    )
+    end = current_time + instance.time_matrix[current_point][instance.base_index]
     if end > end_minute:
-        return None
-    if total_driving > driver.max_driving_duration and not has_layover_customer:
         return None
     if not is_time_window_valid(shift_start, end, driver.time_windows):
         return None
@@ -1486,6 +2088,31 @@ def _room_at_arrival(
     return max(0.0, customer.capacity - inventory)
 
 
+def _future_capacity_room(
+    instance: Instance,
+    customer_id: int,
+    arrival: int,
+    event_cache: dict[int, list],
+) -> float:
+    """Maximum extra quantity that can persist after ``arrival`` safely.
+
+    A new delivery raises the inventory at its own step and every subsequent
+    step by the same amount.  Therefore the available room is the smallest
+    residual capacity in the *existing* future trajectory, not just the room
+    when the truck arrives.  This is deliberately conservative: a joint
+    quantity optimizer can later reduce a future delivery, but a standalone
+    route column must never assume that it will.
+    """
+    customer = instance.customer_by_point[customer_id]
+    first_step = min(max(arrival // instance.unit, 0), instance.horizon - 1)
+    residuals = [
+        customer.capacity - event.ending_inventory
+        for event in event_cache.get(customer_id, ())
+        if event.step >= first_step
+    ]
+    return max(0.0, min(residuals)) if residuals else customer.capacity
+
+
 def _arrival_samples(
     start_minute: int,
     latest_arrival: int,
@@ -1570,6 +2197,13 @@ def _is_shift_route_valid(instance: Instance, shift: Shift) -> bool:
         if driving > driver.max_driving_duration + EPSILON:
             return False
         previous_driving = derived_operation.driving_since_layover
+    if derived.operations:
+        return_driving = (
+            derived.operations[-1].driving_since_layover
+            + instance.time_matrix[derived.operations[-1].point][instance.base_index]
+        )
+        if return_driving > driver.max_driving_duration + EPSILON:
+            return False
     return True
 
 

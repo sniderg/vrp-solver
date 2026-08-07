@@ -33,7 +33,13 @@ dependencies = [
 
 [project.optional-dependencies]
 gurobi = [
-    "gurobipy"
+    "gurobipy",
+    "numba"
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [project.scripts]

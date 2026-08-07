@@ -5,6 +5,7 @@ from dataclasses import replace
 import numpy as np
 
 from .model import Instance, Solution, Shift, TimeWindow
+from .rules import derive_solution
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,40 @@ def try_optimize_shift_times(
     This mirrors Solver.exe's affected-shift callback: a structural mutation is
     committed only when the timing model can produce a schedule.
     """
+    candidate = _try_optimize_shift_times(
+        instance, shift, latest_end=latest_end, layover_before_index=None,
+    )
+    if candidate is not None:
+        return candidate
+
+    # A represented layover is a gap of layover_duration before an operation,
+    # taken after service at an eligible customer. Enumerate the bounded set
+    # of legal split positions instead of adding a fragile big-M choice to
+    # every timing model.
+    for operation_index in range(1, len(shift.operations)):
+        previous = instance.customer_by_point.get(
+            shift.operations[operation_index - 1].point,
+        )
+        if previous is None or not previous.layover_customer:
+            continue
+        candidate = _try_optimize_shift_times(
+            instance,
+            shift,
+            latest_end=latest_end,
+            layover_before_index=operation_index,
+        )
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _try_optimize_shift_times(
+    instance: Instance,
+    shift: Shift,
+    *,
+    latest_end: int | None,
+    layover_before_index: int | None,
+) -> Shift | None:
     try:
         import highspy
     except ModuleNotFoundError as exc:
@@ -110,10 +145,14 @@ def try_optimize_shift_times(
         else:
             prev_idx = i - 1
             prev_setup = instance.setup_time_for_point(shift.operations[i-1].point)
-            # Minimum time: arrival_i >= arrival_{i-1} + setup_{i-1} + travel
-            highs.addRow(prev_setup + travel, inf, 2, np.array([a_idx, prev_idx], dtype=np.int32), np.array([1.0, -1.0], dtype=np.float64))
-            # Maximum time to avoid layover: arrival_i - arrival_{i-1} - setup_{i-1} <= driver.layover_duration + travel - 1
-            highs.addRow(-inf, driver.layover_duration + travel + prev_setup - 1, 2, np.array([a_idx, prev_idx], dtype=np.int32), np.array([1.0, -1.0], dtype=np.float64))
+            rest = driver.layover_duration if i == layover_before_index else 0
+            # Minimum time includes the represented rest at the previous
+            # eligible customer when this is the selected layover split.
+            highs.addRow(prev_setup + travel + rest, inf, 2, np.array([a_idx, prev_idx], dtype=np.int32), np.array([1.0, -1.0], dtype=np.float64))
+            if i != layover_before_index:
+                # Prevent an unselected idle gap from silently becoming a
+                # second layover in deterministic replay.
+                highs.addRow(-inf, driver.layover_duration + travel + prev_setup - 1, 2, np.array([a_idx, prev_idx], dtype=np.int32), np.array([1.0, -1.0], dtype=np.float64))
             
         last_point = op.point
 
@@ -141,7 +180,14 @@ def try_optimize_shift_times(
         new_ops = []
         for i, op in enumerate(shift.operations):
             new_ops.append(replace(op, arrival=int(round(col_values[i]))))
-        return replace(shift, operations=tuple(new_ops))
+        candidate = replace(shift, operations=tuple(new_ops))
+        # The timing MIP preserves operation-to-operation feasibility, but a
+        # changed arrival pattern can still make the final return exceed the
+        # continuous-driving limit.  Do not let a post-selection retime undo
+        # route validity established by the constructor/column gate.
+        if not _driving_valid(instance, candidate):
+            return None
+        return candidate
     else:
         logger.warning("Shift %d time optimization failed with status %s", shift.index, status)
         return None
@@ -157,6 +203,65 @@ def optimize_solution_times(instance: Instance, solution: Solution) -> Solution:
     for shift in solution.shifts:
         new_shifts.append(optimize_shift_times(instance, shift))
     return Solution(shifts=tuple(new_shifts))
+
+
+def latest_end_before_successors(
+    instance: Instance,
+    solution: Solution,
+    shift_index: int,
+) -> int:
+    """Return the hard end boundary imposed by unchanged resource successors."""
+    shift = next(item for item in solution.shifts if item.index == shift_index)
+    bound = instance.latest_time
+    driver = instance.drivers[shift.driver]
+    for successor in solution.shifts:
+        if successor.index == shift.index or successor.start <= shift.start:
+            continue
+        if successor.driver == shift.driver:
+            bound = min(bound, successor.start - driver.min_inter_shift_duration)
+        if successor.trailer == shift.trailer:
+            bound = min(bound, successor.start)
+    return bound
+
+
+def _return_driving_valid(instance: Instance, shift: Shift) -> bool:
+    derived = derive_solution(instance, Solution(shifts=(shift,)))[0]
+    if not derived.operations:
+        return True
+    driver = instance.drivers[shift.driver]
+    final = derived.operations[-1]
+    return (
+        final.driving_since_layover
+        + instance.time_matrix[final.point][instance.base_index]
+        <= driver.max_driving_duration
+    )
+
+
+def _driving_valid(instance: Instance, shift: Shift) -> bool:
+    # This function sits in the innermost route-generation loop.  Calling the
+    # full validator here also replays every customer tank over the horizon,
+    # even though retiming cannot alter quantities.  Check exactly the DRI03
+    # conditions against the already-derived shift instead.
+    derived = derive_solution(instance, Solution(shifts=(shift,)))[0]
+    driver = instance.drivers[shift.driver]
+    previous_driving = 0
+    for operation in derived.operations:
+        driving = (
+            previous_driving + operation.driving_before_layover
+            if operation.layover_before
+            else operation.driving_since_layover
+        )
+        if driving > driver.max_driving_duration + 1e-6:
+            return False
+        previous_driving = operation.driving_since_layover
+    if not derived.operations:
+        return True
+    final = derived.operations[-1]
+    return (
+        final.driving_since_layover
+        + instance.time_matrix[final.point][instance.base_index]
+        <= driver.max_driving_duration + 1e-6
+    )
 
 
 def _feasible_operation_windows(
