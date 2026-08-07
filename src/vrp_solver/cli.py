@@ -1051,6 +1051,8 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         "multiroute_pressure_block",
         "recombine_route_blocks",
     )
+    from .inventory import tank_aggregates
+
     for round_index in range(args.restart_rounds):
         errors = sum(
             violation.severity == "error"
@@ -1063,9 +1065,14 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         if remaining <= 0:
             break
         round_budget = max(0.01, remaining / rounds_left)
+        _, negative_qm, overfill_qm, safety_qm = tank_aggregates(
+            instance, solution,
+        )
         print(
             f"native_round,{round_index},errors,{errors},"
-            f"budget,{round_budget:.3f}"
+            f"budget,{round_budget:.3f},"
+            f"safety_deficit_qm,{safety_qm:.0f},"
+            f"negative_qm,{negative_qm:.0f},overfill_qm,{overfill_qm:.0f}"
         )
         solution, round_steps = surgical_search(
             instance,
@@ -1104,6 +1111,12 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     print(f"search_steps,{len(steps)}")
     print(f"wall_time_seconds,{time.monotonic() - started:.3f}")
     print(f"local_errors,{errors}")
+    _, final_negative_qm, final_overfill_qm, final_safety_qm = tank_aggregates(
+        instance, solution,
+    )
+    print(f"safety_deficit_qm,{final_safety_qm:.0f}")
+    print(f"negative_qm,{final_negative_qm:.0f}")
+    print(f"overfill_qm,{final_overfill_qm:.0f}")
     return 0 if errors == 0 else 1
 
 
