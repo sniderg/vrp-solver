@@ -112,6 +112,11 @@ class _Candidate:
     source_arrival: int | None
     load_quantity: float
     source_index: int | None = None
+    # Minutes the resource stands idle before this service (economic-fill
+    # deferral plus customer-window alignment).  Cold-start measurement on
+    # V2.12 showed 58% of in-route time was idle waiting, which holds a
+    # driver/trailer pair out of the pool while other tanks breach.
+    idle_wait: int = 0
 
 def construct_cluster_solution(
     instance: Instance,
@@ -129,6 +134,8 @@ def construct_cluster_solution(
     terminal_preload: bool = True,
     first_stop_targeted: bool = True,
     prioritize_early_callins: bool = True,
+    max_idle_wait_minutes: int | None = None,
+    idle_wait_penalty_per_hour: float = 0.0,
 ) -> tuple[Solution, ConstructionReport]:
     policy = derive_cluster_construction_policy(instance)
     if neighborhood_size is None:
@@ -282,6 +289,8 @@ def construct_cluster_solution(
                     limit_reload_after_empty_start,
                     terminal_preload,
                     first_stop_targeted,
+                    max_idle_wait_minutes,
+                    idle_wait_penalty_per_hour,
                 )
                 if shift:
                     selected_driver_state_index = driver_state_index
@@ -422,6 +431,8 @@ def _build_cluster_shift(
     limit_reload_after_empty_start,
     terminal_preload,
     first_stop_targeted,
+    max_idle_wait_minutes,
+    idle_wait_penalty_per_hour,
 ):
     driver = instance.drivers[resource.driver]
     start = max(window.start, resource.available_time)
@@ -543,6 +554,18 @@ def _build_cluster_shift(
                     and c.source_arrival is not None
                 ):
                     continue
+                # Cadence cap: once a route is under way, standing idle for
+                # hours to earn a fuller drop is worse than ending the shift
+                # and re-dispatching this resource.  A rest wait is excluded
+                # (the driver owes it) and so is the first service, whose
+                # departure the outer loop has already timed.
+                if (
+                    max_idle_wait_minutes is not None
+                    and operations
+                    and not c.layover_before
+                    and c.idle_wait > max_idle_wait_minutes
+                ):
+                    continue
                 score = _candidate_priority(
                     instance,
                     customer=customer,
@@ -559,6 +582,7 @@ def _build_cluster_shift(
                     is_first_service=not operations,
                     prefer_target_first=first_stop_targeted,
                     inventory_cache=inventory_cache,
+                    idle_wait_penalty_per_hour=idle_wait_penalty_per_hour,
                 )
                 if score > best_score:
                     best_cand = c
@@ -786,6 +810,7 @@ def _candidate_priority(
     is_first_service: bool,
     prefer_target_first: bool = True,
     inventory_cache: dict[tuple[int, tuple[tuple[int, float], ...]], tuple[float, ...]] | None = None,
+    idle_wait_penalty_per_hour: float = 0.0,
 ) -> float:
     if customer.call_in:
         next_order = _next_unsatisfied_order(customer, scheduled[customer.index])
@@ -849,6 +874,12 @@ def _candidate_priority(
     route_fit -= 120.0 * min(2.0, window_width)
     route_fit -= 6.0 * candidate.travel_time
     route_fit -= 180.0 if candidate.source_arrival is not None else 0.0
+    # Shift cadence.  Idle minutes are not free: they hold this driver and
+    # trailer out of the pool, which measurement on V2.12 tied to 40 of 63
+    # late first visits (no shift was even under way when the tank breached).
+    # A rest wait is exempt because the driver owes that time regardless.
+    if not candidate.layover_before:
+        route_fit -= idle_wait_penalty_per_hour * (candidate.idle_wait / 60.0)
 
     score = (
         urgency
@@ -1348,7 +1379,7 @@ def _candidate_for_customer(
     if qty < customer.min_operation_quantity - EPSILON:
         return None
 
-    return _Candidate(customer=customer, arrival=arrival, departure=departure, quantity=qty, travel_time=total_travel, driving_after=driving_after, layover_before=layover_before, return_layover=return_layover, source_arrival=source_arr, load_quantity=load_qty, source_index=source.index)
+    return _Candidate(customer=customer, arrival=arrival, departure=departure, quantity=qty, travel_time=total_travel, driving_after=driving_after, layover_before=layover_before, return_layover=return_layover, source_arrival=source_arr, load_quantity=load_qty, source_index=source.index, idle_wait=max(0, arrival - raw_arrival))
 
 def _first_economic_service_step(events, customer, start_step: int) -> int | None:
     threshold = customer.capacity * ECONOMIC_SERVICE_FILL_RATIO
@@ -1459,6 +1490,7 @@ def _candidate_for_call_in(
         source_arrival=source_arr,
         load_quantity=load_qty,
         source_index=source.index,
+        idle_wait=max(0, arrival - raw_arrival),
     )
 
 

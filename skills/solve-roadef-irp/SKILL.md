@@ -30,6 +30,22 @@ Use:
 
 Do not rely on quantity-only repair or repeated single-customer emergency insertion when topology is deficient. Include driver/trailer predecessor and successor boundaries in atomic block replacement.
 
+## Diagnose a stalled constructor by accounting for resource time
+
+When a cold start stalls with many safety breaches, do not theorise about coverage. Measure, per candidate and per produced route:
+
+1. Split in-route elapsed time into travel, setup, and idle waiting. Idle exceeding travel means the constructor is buying delivery size with resource availability.
+2. For every tank served after its own no-delivery breach instant, compare that instant against the *start* of the serving shift. `shift_start > breach` is starvation (no shift was even under way, so the fix is cadence or dispatch volume); `shift_start <= breach` is stretching (the route was out but arrived late, so the fix is ordering or route length).
+3. Check natural-breach coverage before blaming triage. A constructor that already serves nearly every breaching tank has a timing problem, not a selection problem.
+
+Idle waiting is the usual culprit: waiting for an economically full drop holds a driver and trailer out of the pool while other tanks breach. Cap mid-route idle waiting and price it in candidate scoring so ending a shift competes with extending it. Exempt rest waits (the driver owes that time) and the pre-first-stop wait (the planner already times each departure).
+
+A monotone inventory projection makes an "economic fill level" step always precede the safety-breach step, so clamping the economic deferral to the breach deadline is a no-op. Verify that a proposed guard can actually bind before implementing it.
+
+## Treat construction policy knobs as a seed portfolio
+
+A construction parameter that helps most instances usually breaks a few that already close. Measure the seed's error count and safety-deficit quantity-minutes for each setting across the whole corpus, then construct several seeds per run and keep the best rather than shipping one global default. Report which instances each setting helps and hurts; a mean improvement hides regressions on already-solved instances.
+
 ## Keep search and proof separate
 
 Use the local checker in the inner loop. Run the official checker when a locally feasible candidate first appears, when the best valid LR improves, and before publication. Keep feasible candidates ordered by LR and diagnostics ordered by structured violation magnitude/duration.

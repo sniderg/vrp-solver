@@ -12,6 +12,7 @@ from vrp_solver.solver.cluster_greedy import (
     _next_unsatisfied_order,
     _paper_customer_candidate,
     _preload_terminal_source,
+    construct_cluster_solution,
     construct_paper_solution,
 )
 from vrp_solver.rules import validate_solution
@@ -194,6 +195,124 @@ def test_layover_customer_return_rest_requires_representable_successor(base_inst
     )
 
     assert rejected is None
+
+
+def test_idle_wait_is_reported_on_a_deferred_candidate(base_instance) -> None:
+    """A candidate that waits for a later customer opening reports that idle.
+
+    The cadence controls price mid-route standing time, so the wait has to be
+    visible on the candidate rather than implied by its arrival.
+    """
+    # The wait must stay under the driver's layover duration, otherwise the
+    # candidate is an illegal unrepresented rest rather than plain idling.
+    driver = replace(base_instance.drivers[0], layover_duration=600)
+    customer = replace(
+        base_instance.customers[0],
+        time_windows=(TimeWindow(start=360, end=2_880),),
+    )
+    instance = replace(base_instance, drivers=(driver,), customers=(customer,))
+    resource = _ResourceState(driver=0, trailer=0, trailer_quantity=10_000.0)
+
+    candidate = _candidate_for_customer(
+        instance,
+        resource,
+        TimeWindow(start=0, end=2_880),
+        current_pt=0,
+        current_time=0,
+        driving=0,
+        customer=customer,
+        deliveries={},
+        buffer=0.2,
+    )
+
+    assert candidate is not None
+    # Travel from base is 60 minutes, so the window forces a 540 minute wait.
+    assert candidate.arrival == 360
+    assert candidate.idle_wait == 300
+
+
+def test_idle_cap_ends_a_shift_instead_of_waiting_mid_route() -> None:
+    """A capped construction refuses a stop that would idle past the cap.
+
+    Two customers open in disjoint windows.  Uncapped, one shift serves both
+    and holds the resource idle through the gap; capped, that continuation is
+    refused so the resource is released instead.  Only mid-route idling is
+    capped: the outer planner already times each shift's first departure.
+    """
+    def customer(index: int, window: TimeWindow) -> Customer:
+        return Customer(
+            index=index,
+            layover_customer=False,
+            call_in=False,
+            orders=(),
+            setup_time=30,
+            time_windows=(window,),
+            allowed_trailers=(0,),
+            forecast=(200.0,) * 48,
+            capacity=10_000.0,
+            initial_tank_quantity=4_000.0,
+            min_operation_quantity=1_000.0,
+            safety_level=500.0,
+        )
+
+    instance = Instance(
+        name="idle-cap",
+        unit=60,
+        horizon=48,
+        time_matrix=((0, 30, 30, 30), (30, 0, 30, 30), (30, 30, 0, 30), (30, 30, 30, 0)),
+        distance_matrix=(
+            (0.0, 1.0, 1.0, 1.0),
+            (1.0, 0.0, 1.0, 1.0),
+            (1.0, 1.0, 0.0, 1.0),
+            (1.0, 1.0, 1.0, 0.0),
+        ),
+        base_index=0,
+        drivers=(
+            Driver(
+                index=0,
+                min_inter_shift_duration=0,
+                max_driving_duration=1_000,
+                trailer_ids=(0,),
+                time_windows=(TimeWindow(start=0, end=2_880),),
+                layover_duration=600,
+                time_cost=0.0,
+                layover_cost=0.0,
+            ),
+        ),
+        trailers=(Trailer(index=0, capacity=30_000.0, initial_quantity=30_000.0, distance_cost=0.0),),
+        sources=(Source(index=1, allowed_trailers=(0,), setup_time=30),),
+        customers=(
+            customer(2, TimeWindow(start=0, end=300)),
+            customer(3, TimeWindow(start=480, end=900)),
+        ),
+    )
+
+    uncapped, _ = construct_cluster_solution(instance, tie_break_seed=1)
+    capped, _ = construct_cluster_solution(
+        instance, tie_break_seed=1, max_idle_wait_minutes=180,
+    )
+
+    def max_idle(solution) -> int:
+        """Largest idle gap *between* stops, excluding the pre-first-stop wait."""
+        worst = 0
+        for shift in solution.shifts:
+            previous_point, previous_time = instance.base_index, shift.start
+            for position, operation in enumerate(shift.operations):
+                leg = instance.time_matrix[previous_point][operation.point]
+                if position:
+                    worst = max(worst, operation.arrival - previous_time - leg)
+                point = instance.customer_by_point.get(operation.point)
+                setup = (
+                    point.setup_time
+                    if point is not None
+                    else instance.source_by_point[operation.point].setup_time
+                )
+                previous_time = operation.arrival + setup
+                previous_point = operation.point
+        return worst
+
+    assert max_idle(uncapped) > 180
+    assert max_idle(capped) <= 180
 
 
 def test_paper_constructor_does_not_use_a_second_layover(base_instance) -> None:

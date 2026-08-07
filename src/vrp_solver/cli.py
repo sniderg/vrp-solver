@@ -1033,14 +1033,46 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     instance = load_instance(args.instance_xml)
     policy = derive_cluster_construction_policy(instance)
     end_day = max(1, (instance.horizon * instance.unit + 1439) // 1440)
-    seed_solution, report = construct_cluster_solution(
-        instance,
-        safety_buffer=args.safety_buffer,
-        neighborhood_size=policy.neighborhood_size,
-        score_cutoff_minute=end_day * 1440,
-        global_pressure_fill=policy.global_pressure_fill,
-        tie_break_seed=args.seed,
+    # Idle-cadence portfolio.  A hard cap on mid-route idle waiting decides
+    # whether a resource keeps standing by for a fuller drop or returns to the
+    # pool.  Measured on Set B it is decisively better on most instances
+    # (V2.14 goes from 1884 seed errors to zero) and worse on a few where the
+    # uncapped economics already close, so construct both and keep the better
+    # seed instead of picking a single global default.
+    idle_caps = [None] if args.idle_cap is not None and args.idle_cap <= 0 else (
+        [args.idle_cap] if args.idle_cap is not None else [None, 180]
     )
+    seed_solution = None
+    report = None
+    best_key = None
+    for idle_cap in idle_caps:
+        candidate_seed, candidate_report = construct_cluster_solution(
+            instance,
+            safety_buffer=args.safety_buffer,
+            neighborhood_size=policy.neighborhood_size,
+            score_cutoff_minute=end_day * 1440,
+            global_pressure_fill=policy.global_pressure_fill,
+            tie_break_seed=args.seed,
+            max_idle_wait_minutes=idle_cap,
+        )
+        candidate_errors = sum(
+            violation.severity == "error"
+            for violation in validate_solution(instance, candidate_seed)
+        )
+        from .inventory import tank_aggregates as _tank_aggregates
+
+        _, _, _, candidate_safety_qm = _tank_aggregates(instance, candidate_seed)
+        key = (candidate_errors, candidate_safety_qm)
+        print(
+            f"seed_candidate,idle_cap,{idle_cap},errors,{candidate_errors},"
+            f"safety_deficit_qm,{candidate_safety_qm:.0f}"
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            seed_solution = candidate_seed
+            report = candidate_report
+        if candidate_errors == 0:
+            break
     solution = seed_solution
     steps = []
     completed_rounds = 0
@@ -1915,6 +1947,15 @@ def build_parser() -> argparse.ArgumentParser:
     native_solve.add_argument("--no-improvement-limit", type=int, default=24)
     native_solve.add_argument("--workers", type=int, default=2)
     native_solve.add_argument("--restart-rounds", type=int, default=2)
+    native_solve.add_argument(
+        "--idle-cap",
+        type=int,
+        help=(
+            "maximum mid-route idle wait in minutes for construction; "
+            "omit to try both uncapped and 180 and keep the better seed, "
+            "or pass 0 to force uncapped"
+        ),
+    )
     native_solve.set_defaults(func=cmd_native_solve)
 
     paper_construct = subparsers.add_parser(
