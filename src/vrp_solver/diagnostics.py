@@ -6,9 +6,9 @@ import hashlib
 import json
 import math
 
-from .inventory import tank_events
+from .inventory import tank_aggregates
 from .model import Instance, Solution
-from .rules import validate_solution
+from .rules import validate_structural
 
 
 EPSILON = 1e-6
@@ -131,24 +131,19 @@ def violation_vector(instance: Instance, solution: Solution) -> ViolationVector:
     if non_finite:
         return ViolationVector(non_finite, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0)
 
-    violations = [v for v in validate_solution(instance, solution) if v.severity == "error"]
+    # DYN01 is the only vector component sourced from tank replay; every other
+    # counted code is emitted by the structural (per-shift) validators, and
+    # QS01/QS02 are deliberately excluded.  The aggregate pass projects all
+    # tanks vectorized instead of building per-step TankEvent objects.
+    violations = [v for v in validate_structural(instance, solution) if v.severity == "error"]
+    dyn01_events, negative, overfill, safety = tank_aggregates(instance, solution)
     reference = sum(v.code in REFERENCE_CODES for v in violations)
-    physical = sum(v.code in PHYSICAL_CODES for v in violations)
+    physical = sum(v.code in PHYSICAL_CODES for v in violations) + dyn01_events
     resource_timing = sum(v.code in RESOURCE_TIMING_CODES for v in violations)
     known = REFERENCE_CODES | PHYSICAL_CODES | RESOURCE_TIMING_CODES | {"QS01", "QS02"}
     other = sum(v.code not in known for v in violations)
 
     missed_orders, missed_deficit = _missed_order_deficit(instance, solution)
-    negative = 0.0
-    overfill = 0.0
-    safety = 0.0
-    for event in tank_events(instance, solution):
-        if event.negative:
-            negative += -event.ending_inventory * instance.unit
-        if event.overfilled_after_delivery:
-            overfill += (event.ending_inventory - event.capacity) * instance.unit
-        if event.safety_breach:
-            safety += (event.safety_level - event.ending_inventory) * instance.unit
 
     return ViolationVector(
         non_finite_values=0,

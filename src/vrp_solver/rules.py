@@ -130,6 +130,21 @@ def validate_solution(instance: Instance, solution: Solution) -> list[RuleViolat
     return violations
 
 
+def validate_structural(instance: Instance, solution: Solution) -> list[RuleViolation]:
+    """Shift-attributed rules only: references, route physics, resources.
+
+    Tank bounds and service quality attach to customers (``shift is None``),
+    so callers that only count per-shift structural errors can skip the
+    full-horizon inventory replay those checks require.
+    """
+    derived = derive_solution(instance, solution)
+    violations: list[RuleViolation] = []
+    violations.extend(_validate_shift_references(instance, solution))
+    violations.extend(_validate_shift_operations(instance, derived))
+    violations.extend(_validate_resource_constraints(instance, derived))
+    return violations
+
+
 def is_time_window_valid(arrival: int, departure: int, windows: tuple[TimeWindow, ...]) -> bool:
     """Check if a service interval is within any of the provided time windows."""
     return any(window.start <= arrival and departure <= window.end for window in windows)

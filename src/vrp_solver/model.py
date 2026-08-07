@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 
 @dataclass(frozen=True)
@@ -81,11 +82,11 @@ class Instance:
     def latest_time(self) -> int:
         return (self.horizon + 1) * self.unit
 
-    @property
+    @cached_property
     def customer_by_point(self) -> dict[int, Customer]:
         return {customer.index: customer for customer in self.customers}
 
-    @property
+    @cached_property
     def source_by_point(self) -> dict[int, Source]:
         return {source.index: source for source in self.sources}
 

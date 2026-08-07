@@ -216,6 +216,65 @@ def project_customer_inventory(
     return events
 
 
+def tank_aggregates(
+    instance: Instance,
+    solution: Solution,
+) -> tuple[int, float, float, float]:
+    """One vectorized pass over every VMI tank.
+
+    Returns ``(dyn01_events, negative_qm, overfill_qm, safety_qm)`` where the
+    quantity-minutes match the per-event accumulation over ``tank_events``:
+    one DYN01 event per negative or overfilled bucket, and each deficit or
+    excess weighted by the instance time unit.  Inventory projection is a
+    cumulative sum, so all customers are projected at once without building
+    per-step ``TankEvent`` objects.
+    """
+    vmi = [customer for customer in instance.customers if not customer.call_in]
+    if not vmi:
+        return 0, 0.0, 0.0, 0.0
+    horizon = instance.horizon
+    n = len(vmi)
+    initial = np.empty(n, dtype=np.float64)
+    capacity = np.empty(n, dtype=np.float64)
+    safety = np.empty(n, dtype=np.float64)
+    net = np.zeros((n, horizon), dtype=np.float64)
+    row_by_point: dict[int, int] = {}
+    for i, customer in enumerate(vmi):
+        row_by_point[customer.index] = i
+        initial[i] = customer.initial_tank_quantity
+        capacity[i] = customer.capacity
+        safety[i] = customer.safety_level
+        forecast = customer.forecast
+        if forecast:
+            length = min(len(forecast), horizon)
+            net[i, :length] = np.negative(forecast[:length])
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            if operation.quantity <= 0:
+                continue
+            row = row_by_point.get(operation.point)
+            if row is None:
+                continue
+            step = min(max(operation.arrival // instance.unit, 0), horizon - 1)
+            net[row, step] += operation.quantity
+
+    ending = np.cumsum(net, axis=1)
+    ending += initial[:, None]
+
+    negative_mask = ending < -EPSILON
+    overfill_mask = ending > capacity[:, None] + EPSILON
+    safety_deficit = safety[:, None] - ending
+    safety_mask = safety_deficit > EPSILON
+
+    dyn01 = int(negative_mask.sum()) + int(overfill_mask.sum())
+    negative_qm = float(-ending[negative_mask].sum()) * instance.unit
+    overfill_qm = float(
+        (ending - capacity[:, None])[overfill_mask].sum()
+    ) * instance.unit
+    safety_qm = float(safety_deficit[safety_mask].sum()) * instance.unit
+    return dyn01, negative_qm, overfill_qm, safety_qm
+
+
 def tank_violations(instance: Instance, solution: Solution) -> list[TankViolation]:
     violations: list[TankViolation] = []
 

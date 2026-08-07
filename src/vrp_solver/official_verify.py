@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 
@@ -71,9 +72,13 @@ def verify_v2_solution(
     if not archive.is_file():
         return _unavailable(f"official V2 checker archive does not exist: {archive}", archive)
 
-    mono = shutil.which("mono")
-    if mono is None:
-        return _unavailable("Mono is not installed or not on PATH", archive)
+    if sys.platform == "win32":
+        launcher: list[str] = []
+    else:
+        mono = shutil.which("mono")
+        if mono is None:
+            return _unavailable("Mono is not installed or not on PATH", archive)
+        launcher = [mono]
 
     archive_hash = _sha256(archive)
     try:
@@ -94,7 +99,7 @@ def verify_v2_solution(
         executable_path.write_bytes(executable)
         try:
             process = subprocess.run(
-                [mono, str(executable_path), str(instance), str(solution)],
+                launcher + [str(executable_path), str(instance), str(solution)],
                 input="\n",
                 text=True,
                 stdout=subprocess.PIPE,

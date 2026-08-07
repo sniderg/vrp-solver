@@ -25,7 +25,7 @@ from ..joint_block_timing import (
 )
 from ..inventory import tank_events
 from ..model import Instance, Operation, Shift, Solution
-from ..rules import derive_solution, validate_solution
+from ..rules import derive_solution, validate_solution, validate_structural
 from .pressure import pressure_points
 from .multiroute_block import repair_pressure_multiroute_block
 from .targeted_rescue import (
@@ -130,7 +130,7 @@ def surgical_search(
         elif structural_errors:
             structural_codes = {
                 violation.code
-                for violation in validate_solution(instance, current)
+                for violation in validate_structural(instance, current)
                 if (
                     violation.severity == "error"
                     and violation.shift is not None
@@ -1297,7 +1297,7 @@ def _minimum_quantity_candidates(
     """Raise one subminimum delivery to the customer's legal floor."""
     result: list[Solution] = []
     seen: set[tuple[int, int]] = set()
-    for violation in validate_solution(instance, solution):
+    for violation in validate_structural(instance, solution):
         if (
             violation.severity != "error"
             or violation.code != "SHI16"
@@ -1477,7 +1477,7 @@ def _delete_operation_candidates(instance, solution, config, rng) -> list[Soluti
     # uniform capping can spend whole rounds deleting already-valid work.
     invalid_shifts = {
         violation.shift
-        for violation in validate_solution(instance, solution)
+        for violation in validate_structural(instance, solution)
         if violation.severity == "error" and violation.shift is not None
     }
     # A full-shift removal is the exact end state of repeatedly applying the
@@ -3490,7 +3490,7 @@ def _split_invalid_shift_candidates(
     """
     invalid = {
         violation.shift
-        for violation in validate_solution(instance, solution)
+        for violation in validate_structural(instance, solution)
         if (
             violation.severity == "error"
             and violation.code in {"LAY02", "DRI03"}
@@ -3560,7 +3560,7 @@ def _resource_reassignment_candidates(
     derived = derive_solution(instance, solution)
     targets = {
         violation.shift
-        for violation in validate_solution(instance, solution)
+        for violation in validate_structural(instance, solution)
         if (
             violation.severity == "error"
             and violation.code in {"DRI01", "TL01"}
@@ -3695,7 +3695,7 @@ def _resource_retime_candidates(
     derived = derive_solution(instance, solution)
     targets = {
         violation.shift
-        for violation in validate_solution(instance, solution)
+        for violation in validate_structural(instance, solution)
         if (
             violation.severity == "error"
             and violation.code in {"DRI01", "TL01"}
@@ -3916,7 +3916,7 @@ def _repair_resource_assignments(
     if any(
         violation.severity == "error"
         and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
-        for violation in validate_solution(instance, candidate)
+        for violation in validate_structural(instance, candidate)
     ):
         return None
     return candidate
@@ -4008,7 +4008,7 @@ def _greedy_rebuild_resource_assignments(
     if any(
         violation.severity == "error"
         and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
-        for violation in validate_solution(instance, candidate)
+        for violation in validate_structural(instance, candidate)
     ):
         return None
     return candidate
@@ -4076,7 +4076,7 @@ def _propagate_resource_retimes(
         if not any(
             violation.severity == "error"
             and violation.code in {"DRI01", "TL01"}
-            for violation in validate_solution(instance, candidate)
+            for violation in validate_structural(instance, candidate)
         ):
             return candidate
         return None
@@ -4229,7 +4229,13 @@ def _score_candidate_index(index):
 
 
 def _score_candidates(instance, candidates, end_day, workers):
-    if workers <= 1 or len(candidates) <= 1:
+    # Worker state is shared through module globals, which requires fork
+    # semantics; on platforms without fork (Windows) score serially.
+    if (
+        workers <= 1
+        or len(candidates) <= 1
+        or "fork" not in multiprocessing.get_all_start_methods()
+    ):
         return [(candidate, _score(instance, candidate, end_day)) for candidate in candidates]
     global _WORKER_INSTANCE, _WORKER_CANDIDATES, _WORKER_END_DAY
     _WORKER_INSTANCE = instance
@@ -4386,9 +4392,12 @@ def _structure_signature(solution: Solution) -> tuple[object, ...]:
 
 
 def _structural_shift_errors(instance: Instance, solution: Solution) -> int:
+    # Tank and service-quality violations never carry a shift index, so the
+    # structural validator (which skips the full-horizon inventory replay)
+    # counts exactly the same set.
     return sum(
         1
-        for violation in validate_solution(instance, solution)
+        for violation in validate_structural(instance, solution)
         if (
             violation.severity == "error"
             and violation.shift is not None
