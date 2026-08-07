@@ -125,6 +125,46 @@ def solution_fingerprint(solution: Solution) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def violation_vector_with_structural(
+    instance: Instance,
+    solution: Solution,
+) -> tuple[ViolationVector, int]:
+    """Return the violation vector plus the per-shift structural error count.
+
+    Acceptance loops need both facts for every candidate; computing them
+    together reuses one structural validation pass instead of two.
+    """
+    non_finite = _non_finite_count(solution)
+    if non_finite:
+        return ViolationVector(non_finite, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0), 0
+    violations = [v for v in validate_structural(instance, solution) if v.severity == "error"]
+    structural = sum(
+        1
+        for v in violations
+        if v.shift is not None and v.code not in {"QS01", "QS02"}
+    )
+    dyn01_events, negative, overfill, safety = tank_aggregates(instance, solution)
+    reference = sum(v.code in REFERENCE_CODES for v in violations)
+    physical = sum(v.code in PHYSICAL_CODES for v in violations) + dyn01_events
+    resource_timing = sum(v.code in RESOURCE_TIMING_CODES for v in violations)
+    known = REFERENCE_CODES | PHYSICAL_CODES | RESOURCE_TIMING_CODES | {"QS01", "QS02"}
+    other = sum(v.code not in known for v in violations)
+    missed_orders, missed_deficit = _missed_order_deficit(instance, solution)
+    vector = ViolationVector(
+        non_finite_values=0,
+        reference_errors=reference,
+        physical_errors=physical,
+        missed_orders=missed_orders,
+        missed_order_deficit=float(missed_deficit),
+        negative_quantity_minutes=float(negative),
+        overfill_quantity_minutes=float(overfill),
+        safety_deficit_quantity_minutes=float(safety),
+        resource_timing_errors=resource_timing,
+        other_errors=other,
+    )
+    return vector, structural
+
+
 def violation_vector(instance: Instance, solution: Solution) -> ViolationVector:
     non_finite = _non_finite_count(solution)
     # Avoid sending malformed non-finite values through arithmetic-heavy replay.

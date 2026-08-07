@@ -14,6 +14,7 @@ from ..diagnostics import (
     ViolationVector,
     solution_fingerprint,
     violation_vector,
+    violation_vector_with_structural,
 )
 from ..highs_repair import repair_quantities_with_highs
 from ..highs_time_opt import try_optimize_shift_times
@@ -104,6 +105,30 @@ def surgical_search(
         None if config.time_limit_seconds is None
         else time.monotonic() + config.time_limit_seconds
     )
+    scoring_pool = _scoring_pool(instance, config.end_day, config.workers)
+    try:
+        return _surgical_search_loop(
+            instance, initial, config=config, progress=progress,
+            rng=rng, deadline=deadline, scoring_pool=scoring_pool,
+        )
+    finally:
+        if scoring_pool is not None:
+            scoring_pool.terminate()
+            scoring_pool.join()
+
+
+def _surgical_search_loop(
+    instance: Instance,
+    initial: Solution,
+    *,
+    config: SurgicalSearchConfig,
+    progress: Callable[[str], None] | None,
+    rng: random.Random,
+    deadline: float | None,
+    scoring_pool,
+) -> tuple[Solution, tuple[SurgicalStep, ...]]:
+    from ..xml_io import save_solution
+
     current = _reindex(initial)
     current_score = _score(instance, current, config.end_day)
     best = current
@@ -343,10 +368,13 @@ def surgical_search(
         )
         scored = _score_candidates(
             instance, limited_candidates, config.end_day, config.workers,
+            pool=scoring_pool,
         )
         for candidate, candidate_score in scored:
             evaluated += 1
-            candidate_vector = violation_vector(instance, candidate)
+            candidate_vector, candidate_structural = (
+                violation_vector_with_structural(instance, candidate)
+            )
             if not _hard_invariants_not_worse(
                 current_vector, candidate_vector,
             ):
@@ -355,10 +383,7 @@ def surgical_search(
             # validates every affected route before committing its mutation.
             # Once that invariant exists, never trade it away for a lower
             # aggregate QS error count.
-            if (
-                structural_errors == 0
-                and _structural_shift_errors(instance, candidate) != 0
-            ):
+            if structural_errors == 0 and candidate_structural != 0:
                 continue
             if (
                 move_score is None
@@ -4219,33 +4244,42 @@ def _candidate_frontier(candidates, *, budget: int, stagnation: int):
 
 
 _WORKER_INSTANCE = None
-_WORKER_CANDIDATES = None
 _WORKER_END_DAY = None
 
 
-def _score_candidate_index(index):
-    candidate = _WORKER_CANDIDATES[index]
-    return index, _score(_WORKER_INSTANCE, candidate, _WORKER_END_DAY)
-
-
-def _score_candidates(instance, candidates, end_day, workers):
-    # Worker state is shared through module globals, which requires fork
-    # semantics; on platforms without fork (Windows) score serially.
-    if (
-        workers <= 1
-        or len(candidates) <= 1
-        or "fork" not in multiprocessing.get_all_start_methods()
-    ):
-        return [(candidate, _score(instance, candidate, end_day)) for candidate in candidates]
-    global _WORKER_INSTANCE, _WORKER_CANDIDATES, _WORKER_END_DAY
+def _pool_initializer(instance, end_day):
+    global _WORKER_INSTANCE, _WORKER_END_DAY
     _WORKER_INSTANCE = instance
-    _WORKER_CANDIDATES = candidates
     _WORKER_END_DAY = end_day
-    context = multiprocessing.get_context("fork")
-    with context.Pool(processes=min(workers, len(candidates))) as pool:
-        indexed_scores = list(pool.imap_unordered(_score_candidate_index, range(len(candidates)), chunksize=1))
-    indexed_scores.sort(key=lambda item: item[0])
-    return [(candidates[index], score) for index, score in indexed_scores]
+
+
+def _score_candidate_payload(candidate):
+    return _score(_WORKER_INSTANCE, candidate, _WORKER_END_DAY)
+
+
+def _scoring_pool(instance, end_day, workers):
+    """Persistent worker pool for candidate scoring.
+
+    The initializer carries the (large, immutable) instance to each worker
+    exactly once, so this works under spawn as well as fork.  Callers own the
+    pool for the whole search run; per-call pool creation would pay the spawn
+    import cost on every iteration.
+    """
+    if workers <= 1:
+        return None
+    context = multiprocessing.get_context()
+    return context.Pool(
+        processes=workers,
+        initializer=_pool_initializer,
+        initargs=(instance, end_day),
+    )
+
+
+def _score_candidates(instance, candidates, end_day, workers, pool=None):
+    if pool is None or len(candidates) <= 1:
+        return [(candidate, _score(instance, candidate, end_day)) for candidate in candidates]
+    scores = pool.map(_score_candidate_payload, candidates, chunksize=1)
+    return list(zip(candidates, scores))
 
 
 def _accept_move(
