@@ -44,22 +44,40 @@ meaningful among officially valid solutions.
 
 ## Current demonstrated milestones
 
-| Instance | Provenance | Released checker | Wall time | Shift cost | LR |
-| --- | --- | ---: | ---: | ---: | ---: |
-| V2.13 | **native-cold-start** | **VALID** | 345 s | 15,895.40 | — |
-| V2.24 | **native-cold-start** | **VALID** | 789 s | 14,384.82 | — |
-| V2.25 | **native-cold-start** | **VALID** | ~80 min total | 36,994.19 | 0.035982 |
-| V2.12 | native-repair | VALID | — | 49,246.08 | 0.027209 |
+| Instance | Provenance | Released checker | Wall time | LR |
+| --- | --- | ---: | ---: | ---: |
+| V2.13 | **native-cold-start** | **VALID** | 345 s | — |
+| V2.16.2 | **native-cold-start** | **VALID** | 86 s | 0.058143 |
+| V2.19 | **native-cold-start** | **VALID** | 104 s | 0.096702 |
+| V2.20.2 | **native-cold-start** | **VALID** | 150 s | 0.032622 |
+| V2.21.2 | **native-cold-start** | **VALID** | 678 s | 0.032982 |
+| V2.24 | **native-cold-start** | **VALID** | 789 s | — |
+| V2.25 | **native-cold-start** | **VALID** | ~80 min total | 0.035982 |
+| V2.12 | native-repair | VALID | — | 0.027209 |
 
-All three cold starts were produced on 2026-08-07 by `vrp-solver native-solve`
+All seven cold starts were produced on 2026-08-07 by `vrp-solver native-solve`
 (instance XML + seed only; V2.25 additionally continued through
 `surgical_search` restart rounds from its own native checkpoint) and verified
-with the released checker on Windows. Exact XMLs:
+with the released checker on Windows. Six of the seven finished inside the
+official 30-minute budget. Exact XMLs (SHA-256):
 
 - V2.13: `scratch/replicate_V2.13_native.xml`
+- V2.16.2: `scratch/opt_V2.16.2_native.xml`
+  `1171cc6aea229d4b4ccacb2ca92cf864f75cc5529175dc1ce3216fb8a0dc7eb1`
+- V2.19: `scratch/opt_V2.19_native.xml`
+  `a2063f882a53abff71f1c0a3c934f6dbd835fc63ddca5f97a084a03704ee4c1d`
+- V2.20.2: `scratch/opt_V2.20.2_native.xml`
+  `f96c58268188efdc46cb8f320de7370cd6f3e2bc258a949c75e241e3284b13eb`
+- V2.21.2: `scratch/opt_V2.21.2_native.xml`
+  `237cab0c61d310427dc2d50e1aa106704ee3fd293e8bc9fce3d489a40381db05`
 - V2.24: `scratch/replicate_V2.24_native.xml`
-- V2.25: `scratch/opt3_V2.25_native.xml`, SHA-256
+- V2.25: `scratch/opt3_V2.25_native.xml`
   `a407cde5d2f0ddc1ba34a0471328ac7cd374067c48b046aee07b9b2f1c4bedc7`
+
+Remaining Set B instances (V2.14, V2.15, V2.17, V2.18, V2.22, V2.23, V2.26,
+and a V2.12 cold start) have not reached zero errors. The common failure
+signature is constructor coverage: unserved must-breach customers at
+construction correlate exactly with the stalled searches.
 
 The V2.12 row is a native repair of a pre-existing candidate
 (`scratch/v212_skill_orders_final_local.xml`, SHA-256
