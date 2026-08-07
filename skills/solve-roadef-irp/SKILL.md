@@ -72,6 +72,19 @@ Idle waiting is the usual culprit: waiting for an economically full drop holds a
 
 A monotone inventory projection makes an "economic fill level" step always precede the safety-breach step, so clamping the economic deferral to the breach deadline is a no-op. Verify that a proposed guard can actually bind before implementing it.
 
+## Diagnose a stalled *search* by instrumenting candidate generation
+
+A search that plateaus is often not out of ideas — it is generating nothing. Before tuning acceptance or adding operators, count per step: candidates generated, candidates surviving each filter, and steps accepted. Two distinct pathologies look identical from the error count:
+
+- **Empty generation.** Operators return zero candidates and still consume a step. Log the count per operator per step; an operator that repeatedly yields zero is burning budget. Walk its filter chain and count survivors at every stage to find the single binding stage rather than guessing.
+- **Unhelpful generation.** Operators return plenty of candidates but none improve. This is a scoring or targeting problem, not a reachability one.
+
+When insertion operators yield nothing, check the chain in this order, because each step refutes cheap theories before expensive ones: is the breaching entity even targeted; does a legal host exist; does the quantity floor admit the needed top-up; can the route be retimed. Verify the retiming model can reproduce each **unmodified** existing route first — if it can, later rejections are real infeasibilities, not modelling blind spots, and adding candidate start times or relaxing bounds will not help.
+
+Distinguish *aggregate* slack from *jointly available* slack. A driver 50% idle and a trailer 50% idle can still admit no new route, because a shift needs both simultaneously, plus the driver's inter-shift separation on each side. Enumerate joint free intervals directly; per-resource utilisation is misleading on its own. Conversely, when large in-shift idle time coexists with a small marginal need, capacity is present but trapped inside committed shifts.
+
+Trapped in-shift idle time is not necessarily reachable from construction policy. Tightening a construction idle cap only changes which routes get built; it cannot compact routes an incumbent already committed. Measuring trapped idle therefore identifies the *quantity* of recoverable capacity, not the mechanism — sweeping construction knobs to chase it produced strictly worse incumbents on an instance whose search had already gone much further. Reclaiming it requires a repair-time move that shortens or re-times committed shifts. Distinguish "capacity exists" from "this knob can reach it" before spending a sweep.
+
 ## Treat construction policy knobs as a seed portfolio
 
 A construction parameter that helps most instances usually breaks a few that already close. Measure the seed's error count and safety-deficit quantity-minutes for each setting across the whole corpus, then construct several seeds per run and keep the best rather than shipping one global default. Report which instances each setting helps and hurts; a mean improvement hides regressions on already-solved instances.
