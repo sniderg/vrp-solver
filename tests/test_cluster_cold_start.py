@@ -148,7 +148,13 @@ def test_customer_window_wait_uses_next_opening(base_instance) -> None:
     assert _align_arrival_to_customer_window(customer, 680) is None
 
 
-def test_layover_customer_cannot_create_an_unrepresented_return_rest(base_instance) -> None:
+def test_layover_customer_return_rest_requires_representable_successor(base_instance) -> None:
+    """A final-stop rest is legal only when a successor source stop fits.
+
+    The checker derives a rest from the following operation's leading gap, so
+    the candidate must flag ``return_layover`` (forcing the terminal source
+    visit) rather than being rejected outright.
+    """
     driver = replace(base_instance.drivers[0], max_driving_duration=100, layover_duration=60)
     customer = replace(base_instance.customers[0], layover_customer=True)
     instance = replace(base_instance, drivers=(driver,), customers=(customer,))
@@ -166,7 +172,28 @@ def test_layover_customer_cannot_create_an_unrepresented_return_rest(base_instan
         buffer=0.2,
     )
 
-    assert candidate is None
+    assert candidate is not None
+    assert candidate.return_layover
+
+    # Without a compatible source there is no successor operation to carry
+    # the rest, so the candidate must be rejected as before.
+    no_source = replace(
+        instance,
+        sources=(replace(instance.sources[0], allowed_trailers=()),),
+    )
+    rejected = _candidate_for_customer(
+        no_source,
+        resource,
+        TimeWindow(start=0, end=2_880),
+        current_pt=0,
+        current_time=0,
+        driving=0,
+        customer=customer,
+        deliveries={},
+        buffer=0.2,
+    )
+
+    assert rejected is None
 
 
 def test_paper_constructor_does_not_use_a_second_layover(base_instance) -> None:

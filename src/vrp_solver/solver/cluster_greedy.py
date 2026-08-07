@@ -432,6 +432,7 @@ def _build_cluster_shift(
     driving = 0
     layover_used = False
     return_layover = False
+    rest_needs_successor = False
     end_after_return = start
 
     served_this_shift = set()
@@ -593,13 +594,16 @@ def _build_cluster_shift(
                 driving = 0
                 layover_used = True
                 return_layover = False
+                rest_needs_successor = True
                 end_after_return = current_time + instance.time_matrix[current_pt][instance.base_index]
                 continue
             end_after_return += driver.layover_duration
             break
+        rest_needs_successor = False
 
     if not operations: return None
     if not return_layover and terminal_preload:
+        operation_count_before = len(operations)
         end_after_return = _preload_terminal_source(
             instance,
             resource,
@@ -609,7 +613,13 @@ def _build_cluster_shift(
             current_time,
             driving,
             score_cutoff_minute,
+            force_visit=rest_needs_successor,
         )
+        if rest_needs_successor and len(operations) == operation_count_before:
+            # The rest at the final stop is derived from the next operation's
+            # leading gap.  With no successor placeable the rest would be
+            # unrepresented and the route replays as a driving violation.
+            return None
     resource.available_time = end_after_return + driver.min_inter_shift_duration
     resource.trailer_available_time = end_after_return
     return Shift(index=shift_idx, driver=resource.driver, trailer=resource.trailer, start=start, operations=tuple(operations))
@@ -1083,6 +1093,45 @@ def _apply_cand(ops, resource, scheduled, ignore, planned_volume_by_day, cand, i
     ignore[cand.customer.index] = max(ignore[cand.customer.index], arrival_step + 1)
 
 
+def _rest_successor_source_fits(
+    instance: Instance,
+    resource: _ResourceState,
+    window: TimeWindow,
+    customer: Customer,
+    departure: int,
+    score_cutoff_minute: int | None,
+) -> bool:
+    """Check a post-rest source visit and return leg exist for this stop.
+
+    A rest at a layover-eligible final customer is representable only when
+    some later operation follows it -- the checker derives the rest from that
+    operation's leading time gap.  The terminal preload is that successor, so
+    its window, cutoff, and fresh-spell driving limits must all hold.
+    """
+    driver = instance.drivers[resource.driver]
+    rest_end = departure + driver.layover_duration
+    for source in instance.sources:
+        if resource.trailer not in source.allowed_trailers:
+            continue
+        source_arrival = rest_end + instance.time_matrix[customer.index][source.index]
+        if score_cutoff_minute is not None and source_arrival >= score_cutoff_minute:
+            continue
+        end = (
+            source_arrival
+            + source.setup_time
+            + instance.time_matrix[source.index][instance.base_index]
+        )
+        if end > window.end:
+            continue
+        total_driving = (
+            instance.time_matrix[customer.index][source.index]
+            + instance.time_matrix[source.index][instance.base_index]
+        )
+        if is_driving_duration_valid(driver, total_driving):
+            return True
+    return False
+
+
 def _preload_terminal_source(
     instance: Instance,
     resource: _ResourceState,
@@ -1092,18 +1141,22 @@ def _preload_terminal_source(
     current_time: int,
     driving: int,
     score_cutoff_minute: int | None,
+    force_visit: bool = False,
 ) -> int:
     """Finish at a source when it can safely stage a full trailer for next shift.
 
     The original executable makes substantial use of inventory carried between
     shifts.  Returning a loaded trailer is valid in the ROADEF model and avoids
     forcing every new shift to begin with a source detour.
+
+    ``force_visit`` keeps the source stop even with nothing to load: a rest at
+    the final customer needs a successor operation to be representable.
     """
     driver = instance.drivers[resource.driver]
     trailer = instance.trailers[resource.trailer]
-    load_quantity = trailer.capacity - resource.trailer_quantity
+    load_quantity = max(0.0, trailer.capacity - resource.trailer_quantity)
     direct_end = current_time + instance.time_matrix[current_pt][instance.base_index]
-    if load_quantity <= EPSILON:
+    if load_quantity <= EPSILON and not force_visit:
         return direct_end
 
     source_candidates = sorted(
@@ -1237,9 +1290,30 @@ def _candidate_for_customer(
         driving_after = driving + total_travel
         if not is_driving_duration_valid(instance.drivers[resource.driver], driving_after + ret_travel):
             # A final return has no XML operation at which a rest can be
-            # represented.  Treating a layover-capable customer as an
-            # implicit return rest produces DRI03 under the released checker.
-            return None
+            # represented.  A rest AT a layover-eligible stop is legal when a
+            # later operation follows it: the builder rests here, zeroes the
+            # driving spell, and the terminal source preload provides the
+            # successor operation whose leading gap represents the rest.
+            # Verify that successor is actually placeable before accepting.
+            if (
+                customer.layover_customer
+                and not layover_used
+                and not layover_before
+                and is_driving_duration_valid(
+                    instance.drivers[resource.driver], driving_after,
+                )
+                and _rest_successor_source_fits(
+                    instance,
+                    resource,
+                    window,
+                    customer,
+                    departure,
+                    score_cutoff_minute,
+                )
+            ):
+                return_layover = True
+            else:
+                return None
     arrival_step = min(max(arrival // instance.unit, 0), instance.horizon - 1)
     inv_at_arr = events[arrival_step].after_consumption
 
