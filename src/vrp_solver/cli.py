@@ -14,6 +14,7 @@ from .audit import audit_solution
 from .contest import score_prefix_with_feasibility_tail
 from .solver.greedy import construct_solution
 from .solver.cluster_greedy import (
+    ConstructionReport,
     construct_cluster_solution,
     construct_paper_solution,
     derive_cluster_construction_policy,
@@ -1045,6 +1046,30 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     seed_solution = None
     report = None
     best_key = None
+    resume_from = getattr(args, "resume_from", None)
+    if resume_from is not None:
+        # Continue this solver's own earlier native output.  Provenance is
+        # preserved only because the checkpoint came from this same cold-start
+        # pipeline; never point this at a reference or oracle XML.
+        seed_solution = load_solution(resume_from)
+        report = ConstructionReport(
+            shifts=len(seed_solution.shifts),
+            operations=sum(len(shift.operations) for shift in seed_solution.shifts),
+            delivered_quantity=sum(
+                operation.quantity
+                for shift in seed_solution.shifts
+                for operation in shift.operations
+                if operation.quantity > 0
+            ),
+            unscheduled_customers=(),
+            exhausted_resources=False,
+        )
+        resume_errors = sum(
+            violation.severity == "error"
+            for violation in validate_solution(instance, seed_solution)
+        )
+        print(f"resumed_from,{resume_from},errors,{resume_errors}")
+        idle_caps = []
     for idle_cap in idle_caps:
         candidate_seed, candidate_report = construct_cluster_solution(
             instance,
@@ -1076,12 +1101,18 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     solution = seed_solution
     steps = []
     completed_rounds = 0
+    # Rotating the first operator across rounds is what closes hard instances:
+    # this exact rotation took V2.25 from 156 errors to 24 to 18 to 0.  Each
+    # round continues from the previous round's incumbent, so a long run is
+    # equivalent to the checkpoint-continuation recipe and needs no external
+    # driver script.
     restart_first_operators = (
         None,
-        "replace_operation_point",
         "pressure_band_resource_block",
         "multiroute_pressure_block",
         "recombine_route_blocks",
+        "create_shift",
+        "insert_operation",
     )
     from .inventory import tank_aggregates
 
@@ -1150,6 +1181,101 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     print(f"negative_qm,{final_negative_qm:.0f}")
     print(f"overfill_qm,{final_overfill_qm:.0f}")
     return 0 if errors == 0 else 1
+
+
+def cmd_native_solve_batch(args: argparse.Namespace) -> int:
+    """Cold-start every instance in a directory, then verify each output.
+
+    One command, one solver: each instance runs the same ``native-solve``
+    pipeline in its own process, and every output is submitted to the released
+    checker.  Concurrency exists because candidate generation dominates a
+    single solve, so a portfolio of instances uses cores far better than
+    in-run worker threads.
+    """
+    instances = sorted(
+        path
+        for path in Path(args.instance_dir).glob("*.xml")
+        if not any(marker in path.stem for marker in ("_solution", "_rescued", "_best"))
+    )
+    if args.only:
+        wanted = set(args.only)
+        instances = [path for path in instances if path.stem in wanted]
+    if not instances:
+        print("no_instances_found,0")
+        return 1
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"instances,{len(instances)},concurrency,{args.concurrency}")
+
+    solver = [sys.executable, "-u", "-m", "vrp_solver.cli"]
+    running: list[tuple[Path, Path, Path, subprocess.Popen]] = []
+    results: dict[str, tuple[str, str]] = {}
+    pending = list(instances)
+
+    def launch(instance_path: Path):
+        output_path = output_dir / f"{instance_path.stem}_native.xml"
+        log_path = output_dir / f"{instance_path.stem}.log"
+        command = solver + [
+            "native-solve",
+            str(instance_path),
+            str(output_path),
+            "--seed", str(args.seed),
+            "--time-limit", str(args.time_limit),
+            "--restart-rounds", str(args.restart_rounds),
+            "--no-improvement-limit", str(args.no_improvement_limit),
+            "--candidates-per-move", str(args.candidates_per_move),
+        ]
+        if args.idle_cap is not None:
+            command += ["--idle-cap", str(args.idle_cap)]
+        handle = log_path.open("w", encoding="utf-8")
+        process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
+        process._log_handle = handle  # type: ignore[attr-defined]
+        print(f"launched,{instance_path.stem}", flush=True)
+        return (instance_path, output_path, log_path, process)
+
+    while pending or running:
+        while pending and len(running) < max(1, args.concurrency):
+            running.append(launch(pending.pop(0)))
+        time.sleep(2.0)
+        for entry in list(running):
+            instance_path, output_path, log_path, process = entry
+            if process.poll() is None:
+                continue
+            running.remove(entry)
+            process._log_handle.close()  # type: ignore[attr-defined]
+            if not output_path.exists():
+                results[instance_path.stem] = ("no_output", "-")
+                print(f"result,{instance_path.stem},no_output,-", flush=True)
+                continue
+            report = verify_v2_solution(
+                instance_path,
+                output_path,
+                checker_archive=args.checker_archive or default_v2_archive(PROJECT_ROOT),
+                timeout_seconds=args.verify_timeout,
+            )
+            status = "valid" if report.valid else "invalid"
+            ratio = (
+                f"{report.logistic_ratio:.6f}"
+                if report.valid and report.logistic_ratio is not None
+                else "-"
+            )
+            results[instance_path.stem] = (status, ratio)
+            print(f"result,{instance_path.stem},{status},{ratio}", flush=True)
+
+    valid = sum(1 for status, _ in results.values() if status == "valid")
+    print(f"summary_valid,{valid},summary_total,{len(results)}")
+    for name in sorted(results):
+        status, ratio = results[name]
+        print(f"summary,{name},{status},{ratio}")
+    if args.summary_csv:
+        with Path(args.summary_csv).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["instance", "official_status", "logistic_ratio"])
+            for name in sorted(results):
+                writer.writerow([name, *results[name]])
+        print(f"wrote,{args.summary_csv}")
+    return 0 if valid == len(results) else 1
 
 
 def cmd_paper_construct_solution(args: argparse.Namespace) -> int:
@@ -1948,6 +2074,15 @@ def build_parser() -> argparse.ArgumentParser:
     native_solve.add_argument("--workers", type=int, default=2)
     native_solve.add_argument("--restart-rounds", type=int, default=2)
     native_solve.add_argument(
+        "--resume-from",
+        type=Path,
+        help=(
+            "continue searching from a checkpoint this solver produced earlier, "
+            "skipping construction; only pass a native output, never a "
+            "reference or oracle XML"
+        ),
+    )
+    native_solve.add_argument(
         "--idle-cap",
         type=int,
         help=(
@@ -1957,6 +2092,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     native_solve.set_defaults(func=cmd_native_solve)
+
+    native_batch = subparsers.add_parser(
+        "native-solve-batch",
+        help="cold-start every instance in a directory and verify each output",
+    )
+    native_batch.add_argument("instance_dir", type=Path)
+    native_batch.add_argument("output_dir", type=Path)
+    native_batch.add_argument("--only", nargs="*", help="instance stems to include")
+    native_batch.add_argument("--seed", type=int, default=1)
+    native_batch.add_argument("--time-limit", type=float, default=1800.0)
+    native_batch.add_argument("--restart-rounds", type=int, default=6)
+    native_batch.add_argument("--no-improvement-limit", type=int, default=10_000)
+    native_batch.add_argument("--candidates-per-move", type=int, default=120)
+    native_batch.add_argument("--idle-cap", type=int)
+    native_batch.add_argument("--concurrency", type=int, default=7)
+    native_batch.add_argument("--checker-archive", type=Path)
+    native_batch.add_argument("--verify-timeout", type=float, default=180.0)
+    native_batch.add_argument("--summary-csv", type=Path)
+    native_batch.set_defaults(func=cmd_native_solve_batch)
 
     paper_construct = subparsers.add_parser(
         "paper-construct-solution",

@@ -7,6 +7,36 @@ description: Design, implement, diagnose, benchmark, and independently validate 
 
 Treat official validity as the first objective and LR as the objective among valid solutions.
 
+## Run a cold start
+
+Two commands. The first reads only an instance XML and a seed; the second decides validity.
+
+```bash
+vrp-solver native-solve <instance.xml> <out.xml> \
+  --seed 1 --time-limit 1200 --no-improvement-limit 10000 --restart-rounds 1
+
+vrp-solver verify-official <instance.xml> <out.xml>
+```
+
+Substitute `.venv/Scripts/python.exe -m vrp_solver.cli` (add `-u` when redirecting a log, or it stays empty until exit) or `uv run vrp-solver` when `vrp-solver` is not on `PATH`. Requires `roadef_2016_data/Checker_V2.2_07032016.zip`, SHA-256 `fc5c4aec01b78fd10d6fd733ea6659baf676b34b6d3a0e93fab8751bbb5b494a`.
+
+Publish only on `official_valid,True`. `local_errors,0` is necessary, never sufficient. Compare `official_logistic_ratio` only among valid solutions. Track `safety_deficit_qm` to see movement when the error count plateaus.
+
+High-leverage flags: `--seed` (vary it — outcomes differ substantially), `--candidates-per-move 120` (beats 32 decisively), `--restart-rounds 1` with a high `--no-improvement-limit` (restart rounds discard progress), and `--idle-cap` (caps mid-route idle waiting; omit to build both an uncapped and a capped seed and keep the better one). Run one process per instance in parallel rather than raising `--workers`; candidate generation dominates. Full runbook: [README.md](../../README.md#run-a-native-cold-start-solve-start-here). Per-instance status: [NATIVE_BENCHMARK_RESULTS.md](../../NATIVE_BENCHMARK_RESULTS.md).
+
+For a whole corpus, use one command rather than a driver script — it runs the identical pipeline per instance in its own process, verifies each output with the released checker, and exits non-zero unless all are valid:
+
+```bash
+vrp-solver native-solve-batch <instance-dir> <out-dir> \
+  --seed 1 --time-limit 1800 --concurrency 7 --summary-csv <out-dir>/summary.csv
+```
+
+To continue a stalled instance, pass its earlier native output to `native-solve --resume-from`; construction is skipped and the search continues from that incumbent. Only ever resume from this pipeline's own output — resuming from a reference or oracle XML makes the result `native-repair`, not a cold start.
+
+## Keep every published result on one CLI path
+
+When a hard instance is finally closed, the recipe that closed it must move into the shipped entry point, not stay in a scratch driver. Two failure modes recur: the entry point's operator schedule silently differs from the script's (so the published command cannot reproduce the published artifact), and continuation exists only as an external loop (so long runs are unreproducible). Fix both by making the entry point rotate operators across restart rounds internally, continuing each round from the prior incumbent, and by exposing checkpoint continuation as a flag. Then re-verify one known-good instance end-to-end through the CLI before claiming reproducibility, and re-run the corpus batch — an aligned pipeline often improves already-valid instances too, so re-hash and re-record their artifacts instead of assuming the old numbers still describe the best output.
+
 ## Preserve provenance
 
 Label outputs as `native-cold-start`, `native-repair`, `oracle`, or `reference`. Never describe oracle/reference topology or repair of a supplied candidate as native cold start. Keep oracle routes out of native construction and use them only for aggregate analysis.

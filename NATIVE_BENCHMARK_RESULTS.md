@@ -47,7 +47,7 @@ meaningful among officially valid solutions.
 | Instance | Provenance | Released checker | Wall time | LR |
 | --- | --- | ---: | ---: | ---: |
 | V2.13 | **native-cold-start** | **VALID** | 345 s | — |
-| V2.16.2 | **native-cold-start** | **VALID** | 86 s | 0.058143 |
+| V2.16.2 | **native-cold-start** | **VALID** | 62 s | 0.042634 |
 | V2.19 | **native-cold-start** | **VALID** | 104 s | 0.096702 |
 | V2.20.2 | **native-cold-start** | **VALID** | 150 s | 0.032622 |
 | V2.21.2 | **native-cold-start** | **VALID** | 678 s | 0.032982 |
@@ -63,8 +63,10 @@ with the released checker on Windows. Seven of the eight finished inside the
 official 30-minute budget. Exact XMLs (SHA-256):
 
 - V2.13: `scratch/replicate_V2.13_native.xml`
-- V2.16.2: `scratch/opt_V2.16.2_native.xml`
-  `1171cc6aea229d4b4ccacb2ca92cf864f75cc5529175dc1ce3216fb8a0dc7eb1`
+- V2.16.2: `scratch/cold_V2.16.2_batch.xml`
+  `527becb29ddc9d21f835b01c19ede4844d86e09e1f13a37971f8cce91fba1a8b`
+  (LR 0.042634, produced by `native-solve-batch`, superseding
+  `scratch/opt_V2.16.2_native.xml` at LR 0.058143)
 - V2.19: `scratch/opt_V2.19_native.xml`
   `a2063f882a53abff71f1c0a3c934f6dbd835fc63ddca5f97a084a03704ee4c1d`
 - V2.20.2: `scratch/opt_V2.20.2_native.xml`
@@ -111,10 +113,55 @@ For comparison, the supplied V2.12 reference is also officially valid with
 
 ## Reproduction
 
+### Reproduce a native cold start from scratch
+
+V2.14 is the cheapest end-to-end check: the constructor alone closes it, so the
+run takes about a minute. Solve, then verify.
+
 ```bash
-uv run vrp-solver verify-official \
-  roadef_2016_data/set_B/Instances_B_V25-11042016/V2.12.xml \
-  scratch/v212_skill_orders_final_local.xml
+vrp-solver native-solve \
+  roadef_2016_data/set_B/Instances_B_V25-11042016/V2.14.xml \
+  out/V2.14_native.xml \
+  --seed 1 --time-limit 1200 --no-improvement-limit 10000 --restart-rounds 1
+
+vrp-solver verify-official \
+  roadef_2016_data/set_B/Instances_B_V25-11042016/V2.14.xml \
+  out/V2.14_native.xml
+```
+
+Expected: `local_errors,0` and `search_steps,0` from the solve, then
+`official_valid,True` with `official_logistic_ratio,0.084934`.
+
+Substitute `.venv/Scripts/python.exe -m vrp_solver.cli` or `uv run vrp-solver`
+for `vrp-solver` if it is not on `PATH`. The other instances in the table above
+need longer time limits and do not close from construction alone; see the
+runbook in [README.md](README.md#run-a-native-cold-start-solve-start-here) for
+seed portfolios, flags, and what to do when a run stalls.
+
+### Reproduce the whole corpus in one command
+
+Every entry in the milestone table comes from the same `native-solve` pipeline,
+so the corpus reproduces without any per-instance scripting:
+
+```bash
+vrp-solver native-solve-batch \
+  roadef_2016_data/set_B/Instances_B_V25-11042016 \
+  out/setB \
+  --seed 1 --time-limit 1800 --concurrency 7 \
+  --summary-csv out/setB/summary.csv
+```
+
+This solves each instance in its own process, then verifies each output with the
+released checker and exits non-zero unless all are valid. Use
+`--only V2.14 V2.16.2` for a two-minute smoke test; both are expected `valid`
+at LR 0.084934 and 0.042634.
+
+### Re-verify a published artifact
+
+```bash
+vrp-solver verify-official \
+  roadef_2016_data/set_B/Instances_B_V25-11042016/V2.14.xml \
+  scratch/cold_V2.14_cadence.xml
 ```
 
 Expected publication marker:
@@ -123,6 +170,9 @@ Expected publication marker:
 official_status,valid
 official_valid,True
 ```
+
+Checker archive `roadef_2016_data/Checker_V2.2_07032016.zip` must be present,
+SHA-256 `fc5c4aec01b78fd10d6fd733ea6659baf676b34b6d3a0e93fab8751bbb5b494a`.
 
 Local simulation and native rule checks remain useful diagnostics, but they do
 not confer official validity.

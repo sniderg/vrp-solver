@@ -39,6 +39,9 @@ roadef_2016_data
 /scratch/*/
 /scratch/*.log
 
+# Default native-solve / native-solve-batch output directory
+/out/
+
 # OS-specific
 .DS_Store
 Thumbs.db
