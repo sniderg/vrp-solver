@@ -86,6 +86,48 @@ def test_compact_joint_timing_reclaims_internal_idle_time() -> None:
     ]
 
 
+def test_ordered_closed_block_can_reverse_resource_sequence() -> None:
+    instance = Instance(
+        name="ordered-block",
+        unit=60,
+        horizon=4,
+        time_matrix=((0, 10, 10), (10, 0, 10), (10, 10, 0)),
+        distance_matrix=tuple(tuple(0.0 for _ in range(3)) for _ in range(3)),
+        base_index=0,
+        drivers=(Driver(0, 0, 120, (0,), (TimeWindow(0, 240),), 60, 0.0, 0.0),),
+        trailers=(Trailer(0, 1_000.0, 1_000.0, 0.0),),
+        sources=(Source(0, (0,), 0),),
+        customers=(
+            Customer(1, False, False, (), 0, (TimeWindow(100, 240),), (0,), (0.0,) * 4, 1_000.0, 0.0, 1.0, 0.0),
+            Customer(2, False, False, (), 0, (TimeWindow(0, 50),), (0,), (0.0,) * 4, 1_000.0, 0.0, 1.0, 0.0),
+        ),
+    )
+    solution = Solution((
+        Shift(10, 0, 0, 0, (Operation(1, 100, 1.0),)),
+        Shift(11, 0, 0, 30, (Operation(2, 40, 1.0),)),
+    ))
+
+    fixed_order = retime_resource_blocks(
+        instance, solution, (10,), max_shifts=2, compact=True,
+    )
+    reordered = retime_resource_blocks(
+        instance,
+        solution,
+        (10,),
+        max_shifts=2,
+        compact=True,
+        allow_resource_reorder=True,
+    )
+
+    assert fixed_order is None
+    assert reordered is not None
+    assert next(shift for shift in reordered.shifts if shift.index == 11).start == 0
+    assert not [
+        violation for violation in validate_solution(instance, reordered)
+        if violation.severity == "error"
+    ]
+
+
 def test_created_shift_can_use_slot_released_by_compaction() -> None:
     instance = Instance(
         name="create-with-compaction",

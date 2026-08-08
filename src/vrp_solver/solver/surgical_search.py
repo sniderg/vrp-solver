@@ -938,6 +938,11 @@ def _resource_safe_created_candidates(
     result: list[Solution] = []
     cap = max(64, config.candidates_per_move * 8)
     compaction_attempts = max(8, min(32, config.candidates_per_move))
+    # Ordered-block timing is a substantially larger MIP than fixed-order
+    # compaction. Probe one highest-priority route per call; repeated search
+    # rounds naturally diversify the route generator without burning a whole
+    # round on equivalent sequence models.
+    sequence_attempts = 1
     resource_pairs = tuple(
         (driver.index, trailer_id)
         for driver in instance.drivers
@@ -948,6 +953,7 @@ def _resource_safe_created_candidates(
             continue
         created = candidate.shifts[-1]
         preferred = [(created.driver, created.trailer)]
+        result_count = len(result)
         alternatives = [
             (driver_id, trailer_id)
             for driver_id, trailer_id in resource_pairs
@@ -1024,6 +1030,35 @@ def _resource_safe_created_candidates(
                     break
                 else:
                     continue
+                break
+        if len(result) == result_count and sequence_attempts > 0:
+            sequence_attempts -= 1
+            for driver_id, trailer_id in (*preferred, *alternatives):
+                if not _route_allows_trailer(instance, created, trailer_id):
+                    continue
+                ordered = retime_resource_blocks(
+                    instance,
+                    Solution((
+                        *solution.shifts,
+                        replace(
+                            created,
+                            driver=driver_id,
+                            trailer=trailer_id,
+                        ),
+                    )),
+                    (created.index,),
+                    max_shifts=24,
+                    compact=True,
+                    allow_resource_reorder=True,
+                )
+                if ordered is None:
+                    continue
+                if any(
+                    violation.severity == "error"
+                    for violation in validate_structural(instance, ordered)
+                ):
+                    continue
+                result.append(normalize_source_loads(instance, _reindex(ordered)))
                 break
         if len(result) >= cap:
             break

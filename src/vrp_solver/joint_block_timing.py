@@ -9,6 +9,7 @@ boundaries.
 from __future__ import annotations
 
 from dataclasses import replace
+from itertools import combinations
 
 import numpy as np
 
@@ -48,6 +49,7 @@ def retime_resource_blocks(
     *,
     max_shifts: int = 8,
     compact: bool = False,
+    allow_resource_reorder: bool = False,
 ) -> Solution | None:
     """Jointly retime the union of several connected resource components.
 
@@ -84,9 +86,36 @@ def retime_resource_blocks(
     selected_shifts = sorted(
         (by_index[index] for index in selected), key=lambda shift: shift.index,
     )
+    if allow_resource_reorder and not _closed_resource_component(
+        solution, selected_shifts,
+    ):
+        return None
     return _solve_joint_timing(
-        instance, solution, selected_shifts, derived, compact=compact,
+        instance,
+        solution,
+        selected_shifts,
+        derived,
+        compact=compact,
+        allow_resource_reorder=allow_resource_reorder,
     )
+
+
+def _closed_resource_component(
+    solution: Solution,
+    block: list[Shift],
+) -> bool:
+    """Ensure ordered timing cannot cross an unmodelled resource boundary."""
+    block_ids = {shift.index for shift in block}
+    for resource in ("driver", "trailer"):
+        resource_ids = {getattr(shift, resource) for shift in block}
+        for resource_id in resource_ids:
+            if any(
+                shift.index not in block_ids
+                for shift in solution.shifts
+                if getattr(shift, resource) == resource_id
+            ):
+                return False
+    return True
 
 
 def generate_pressure_block_insertions(
@@ -338,6 +367,7 @@ def _solve_joint_timing(
     derived,
     *,
     compact: bool,
+    allow_resource_reorder: bool,
 ) -> Solution | None:
     try:
         import highspy
@@ -462,28 +492,64 @@ def _solve_joint_timing(
                     add_row(-inf, previous_setup + travel + driver.layover_duration - 1, [arrival, previous], [1.0, -1.0])
             previous_point = operation.point
 
-    # Preserve original order on every shared resource.  Outside-block shifts
-    # remain fixed boundaries; inside-block shifts are coupled decision vars.
-    for resource in ("driver", "trailer"):
-        resource_ids = {getattr(shift, resource) for shift in block}
-        for resource_id in resource_ids:
-            ordered = sorted(
-                [shift for shift in solution.shifts if getattr(shift, resource) == resource_id],
-                key=lambda shift: (shift.start, shift.index),
+    if allow_resource_reorder:
+        for left, right in combinations(block, 2):
+            shared_driver = left.driver == right.driver
+            shared_trailer = left.trailer == right.trailer
+            if not (shared_driver or shared_trailer):
+                continue
+            gap = (
+                instance.drivers[left.driver].min_inter_shift_duration
+                if shared_driver else 0
             )
-            for previous, following in zip(ordered, ordered[1:]):
-                if previous.index not in block_ids and following.index not in block_ids:
-                    continue
-                gap = (instance.drivers[resource_id].min_inter_shift_duration if resource == "driver" else 0)
-                if previous.index in block_ids:
-                    previous_arrival = arrivals[(previous.index, len(previous.operations) - 1)]
-                    previous_end_offset = instance.setup_time_for_point(previous.operations[-1].point) + instance.time_matrix[previous.operations[-1].point][instance.base_index]
-                    if following.index in block_ids:
-                        add_row(previous_end_offset + gap, inf, [starts[following.index], previous_arrival], [1.0, -1.0])
-                    else:
-                        add_row(-inf, following.start - previous_end_offset - gap, [previous_arrival], [1.0])
-                elif following.index in block_ids:
-                    add_row(derived[previous.index].end + gap, inf, [starts[following.index]], [1.0])
+            order = add_column(0.0, 0.0, 1.0)
+            highs.changeColIntegrality(order, highspy.HighsVarType.kInteger)
+            left_arrival = arrivals[(left.index, len(left.operations) - 1)]
+            right_arrival = arrivals[(right.index, len(right.operations) - 1)]
+            left_end = (
+                instance.setup_time_for_point(left.operations[-1].point)
+                + instance.time_matrix[left.operations[-1].point][instance.base_index]
+            )
+            right_end = (
+                instance.setup_time_for_point(right.operations[-1].point)
+                + instance.time_matrix[right.operations[-1].point][instance.base_index]
+            )
+            # order=1 means left precedes right; otherwise right precedes left.
+            add_row(
+                left_end + gap - big_m,
+                inf,
+                [starts[right.index], left_arrival, order],
+                [1.0, -1.0, -big_m],
+            )
+            add_row(
+                right_end + gap,
+                inf,
+                [starts[left.index], right_arrival, order],
+                [1.0, -1.0, big_m],
+            )
+    else:
+        # Preserve original order on every shared resource. Outside-block shifts
+        # remain fixed boundaries; inside-block shifts are coupled decision vars.
+        for resource in ("driver", "trailer"):
+            resource_ids = {getattr(shift, resource) for shift in block}
+            for resource_id in resource_ids:
+                ordered = sorted(
+                    [shift for shift in solution.shifts if getattr(shift, resource) == resource_id],
+                    key=lambda shift: (shift.start, shift.index),
+                )
+                for previous, following in zip(ordered, ordered[1:]):
+                    if previous.index not in block_ids and following.index not in block_ids:
+                        continue
+                    gap = (instance.drivers[resource_id].min_inter_shift_duration if resource == "driver" else 0)
+                    if previous.index in block_ids:
+                        previous_arrival = arrivals[(previous.index, len(previous.operations) - 1)]
+                        previous_end_offset = instance.setup_time_for_point(previous.operations[-1].point) + instance.time_matrix[previous.operations[-1].point][instance.base_index]
+                        if following.index in block_ids:
+                            add_row(previous_end_offset + gap, inf, [starts[following.index], previous_arrival], [1.0, -1.0])
+                        else:
+                            add_row(-inf, following.start - previous_end_offset - gap, [previous_arrival], [1.0])
+                    elif following.index in block_ids:
+                        add_row(derived[previous.index].end + gap, inf, [starts[following.index]], [1.0])
 
     highs.run()
     if highs.getModelStatus() != highspy.HighsModelStatus.kOptimal:
