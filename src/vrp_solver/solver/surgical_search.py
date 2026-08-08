@@ -937,23 +937,20 @@ def _resource_safe_created_candidates(
     current_derived = derive_solution(instance, solution)
     result: list[Solution] = []
     cap = max(64, config.candidates_per_move * 8)
-    compaction_attempts = max(8, min(32, config.candidates_per_move))
-    # Ordered-block timing is a substantially larger MIP than fixed-order
-    # compaction. Probe one highest-priority route per call; repeated search
-    # rounds naturally diversify the route generator without burning a whole
-    # round on equivalent sequence models.
-    sequence_attempts = 1
     resource_pairs = tuple(
         (driver.index, trailer_id)
         for driver in instance.drivers
         for trailer_id in driver.trailer_ids
     )
+
+    # Preserve the original fast path exactly. Expensive timing repair is a
+    # fallback for an empty placement neighbourhood, not another candidate
+    # family that perturbs already-working instances.
     for candidate in candidates:
         if len(candidate.shifts) != len(solution.shifts) + 1:
             continue
         created = candidate.shifts[-1]
         preferred = [(created.driver, created.trailer)]
-        result_count = len(result)
         alternatives = [
             (driver_id, trailer_id)
             for driver_id, trailer_id in resource_pairs
@@ -981,57 +978,60 @@ def _resource_safe_created_candidates(
                 _reindex(Solution((*solution.shifts, placed))),
             ))
             break
-        else:
-            # The ordinary placement gate sees only fixed incumbent intervals.
-            # Give a bounded number of high-pressure columns a chance to
-            # shorten their jointly blocking driver/trailer chains first.
-            # This is an atomic endpoint: a compacted incumbent alone does not
-            # improve inventory and therefore would never survive acceptance.
-            if compaction_attempts <= 0:
+        if len(result) >= cap:
+            break
+    if result:
+        return result
+
+    compaction_attempts = max(8, min(32, config.candidates_per_move))
+    sequence_attempts = 1
+    for candidate in candidates:
+        if (
+            len(candidate.shifts) != len(solution.shifts) + 1
+            or compaction_attempts <= 0
+        ):
+            continue
+        compaction_attempts -= 1
+        created = candidate.shifts[-1]
+        preferred = [(created.driver, created.trailer)]
+        alternatives = [
+            pair for pair in resource_pairs if pair not in preferred
+        ]
+        for driver_id, trailer_id in (*preferred, *alternatives):
+            if not _route_allows_trailer(instance, created, trailer_id):
                 continue
-            compaction_attempts -= 1
-            for driver_id, trailer_id in (*preferred, *alternatives):
-                if not _route_allows_trailer(instance, created, trailer_id):
-                    continue
-                assigned = replace(
-                    created,
-                    driver=driver_id,
-                    trailer=trailer_id,
+            assigned = replace(
+                created,
+                driver=driver_id,
+                trailer=trailer_id,
+            )
+            for order_start in _compaction_order_starts(solution, assigned):
+                compacted = retime_resource_blocks(
+                    instance,
+                    Solution((
+                        *solution.shifts,
+                        replace(assigned, start=order_start),
+                    )),
+                    (assigned.index,),
+                    max_shifts=8,
+                    compact=True,
                 )
-                # The timing MIP preserves resource order.  A newly generated
-                # route's provisional start gives just one such order; also
-                # place it immediately before and after the nearest occupied
-                # pair slots.  Its times remain decision variables, so these
-                # are sequence choices, not timestamp guesses.
-                for order_start in _compaction_order_starts(
-                    solution, assigned,
-                ):
-                    compacted = retime_resource_blocks(
-                        instance,
-                        Solution((
-                            *solution.shifts,
-                            replace(assigned, start=order_start),
-                        )),
-                        (assigned.index,),
-                        max_shifts=8,
-                        compact=True,
-                    )
-                    if compacted is None:
-                        continue
-                    if any(
-                        violation.severity == "error"
-                        and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
-                        for violation in validate_structural(instance, compacted)
-                    ):
-                        continue
-                    result.append(normalize_source_loads(
-                        instance, _reindex(compacted),
-                    ))
-                    break
-                else:
+                if compacted is None:
                     continue
+                if any(
+                    violation.severity == "error"
+                    and violation.code in {"DRI01", "DRI08", "TL01", "TL03"}
+                    for violation in validate_structural(instance, compacted)
+                ):
+                    continue
+                result.append(normalize_source_loads(
+                    instance, _reindex(compacted),
+                ))
                 break
-        if len(result) == result_count and sequence_attempts > 0:
+            else:
+                continue
+            break
+        if not result and sequence_attempts > 0:
             sequence_attempts -= 1
             for driver_id, trailer_id in (*preferred, *alternatives):
                 if not _route_allows_trailer(instance, created, trailer_id):
@@ -1060,7 +1060,7 @@ def _resource_safe_created_candidates(
                     continue
                 result.append(normalize_source_loads(instance, _reindex(ordered)))
                 break
-        if len(result) >= cap:
+        if result:
             break
     return result
 
