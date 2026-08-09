@@ -5,6 +5,7 @@ from vrp_solver.model import (
     Driver,
     Instance,
     Operation,
+    Order,
     Shift,
     Solution,
     Source,
@@ -175,3 +176,37 @@ def test_rescue_represents_return_layover_with_terminal_source() -> None:
     derived = derive_solution(instance, Solution((route,)))[0]
     assert derived.layovers == 1
     assert derived.operations[-1].layover_before
+
+
+def test_rescue_prices_every_unsatisfied_callin_order() -> None:
+    base = _instance()
+    customer = replace(
+        base.customers[0],
+        call_in=True,
+        orders=(
+            Order(100.0, 100, 200, 100),
+            Order(100.0, 500, 600, 100),
+        ),
+    )
+    instance = replace(base, customers=(customer, *base.customers[1:]))
+
+    candidates = generate_rescue_candidates(
+        instance,
+        Solution(()),
+        [customer.index],
+        config=RescueConfig(
+            start_day=0,
+            end_day=1,
+            replace_from_day=0,
+            samples_per_customer=2,
+        ),
+    )
+
+    arrivals = [
+        operation.arrival
+        for shift in candidates
+        for operation in shift.operations
+        if operation.point == customer.index
+    ]
+    assert any(100 <= arrival <= 200 for arrival in arrivals)
+    assert any(500 <= arrival <= 600 for arrival in arrivals)

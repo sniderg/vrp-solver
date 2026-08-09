@@ -100,6 +100,495 @@ def retime_resource_blocks(
     )
 
 
+def schedule_route_templates(
+    instance: Instance,
+    solution: Solution,
+    *,
+    preserve_inventory_steps: bool = True,
+    reassign_trailers: bool = True,
+    preserve_trailer_order: bool = False,
+    preserve_driver_order: bool = False,
+    time_limit: float = 300.0,
+) -> Solution | None:
+    """Jointly assign resources, sequence routes, and retime a complete plan."""
+    try:
+        import highspy
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("highspy is not installed; run `uv sync --extra milp`") from exc
+
+    shifts = list(solution.shifts)
+    if not shifts:
+        return solution
+    replay = {
+        item.shift.index: item for item in derive_solution(instance, solution)
+    }
+    operation_windows = {
+        shift.index: [
+            _feasible_operation_windows(instance, operation)
+            for operation in shift.operations
+        ]
+        for shift in shifts
+    }
+    if any(
+        not windows
+        for per_shift in operation_windows.values()
+        for windows in per_shift
+    ):
+        return None
+
+    resource_options: dict[int, list[tuple[int, int]]] = {}
+    for shift in shifts:
+        has_layover = bool(replay[shift.index].layovers)
+        carried = 0.0
+        required_capacity = 0.0
+        for operation in shift.operations:
+            carried -= operation.quantity
+            required_capacity = max(required_capacity, carried)
+        options: list[tuple[int, int]] = []
+        for trailer in instance.trailers:
+            if not reassign_trailers and trailer.index != shift.trailer:
+                continue
+            if required_capacity > trailer.capacity + 1e-6:
+                continue
+            if not all(
+                (
+                    operation.point not in instance.source_by_point
+                    or trailer.index
+                    in instance.source_by_point[operation.point].allowed_trailers
+                )
+                and (
+                    operation.point not in instance.customer_by_point
+                    or trailer.index
+                    in instance.customer_by_point[operation.point].allowed_trailers
+                )
+                for operation in shift.operations
+            ):
+                continue
+            for driver in instance.drivers:
+                if trailer.index not in driver.trailer_ids:
+                    continue
+                if (
+                    has_layover
+                    and driver.layover_duration
+                    != instance.drivers[shift.driver].layover_duration
+                ):
+                    continue
+                if not _driving_valid(
+                    instance,
+                    replace(shift, driver=driver.index, trailer=trailer.index),
+                ):
+                    continue
+                options.append((driver.index, trailer.index))
+        if not options:
+            return None
+        resource_options[shift.index] = options
+
+    highs = highspy.Highs()
+    highs.setOptionValue("output_flag", False)
+    highs.setOptionValue("time_limit", time_limit)
+    inf = highspy.kHighsInf
+    big_m = float(max(30_000, instance.latest_time + 30_000))
+
+    def add_column(
+        cost: float = 0.0,
+        lower: float = 0.0,
+        upper: float = inf,
+        *,
+        integer: bool = False,
+    ) -> int:
+        column = highs.getNumCol()
+        highs.addCol(
+            cost, lower, upper, 0,
+            np.array([], dtype=np.int32),
+            np.array([], dtype=np.float64),
+        )
+        if integer:
+            highs.changeColIntegrality(column, highspy.HighsVarType.kInteger)
+        return column
+
+    def add_row(lower, upper, columns, values) -> None:
+        highs.addRow(
+            lower,
+            upper,
+            len(columns),
+            np.array(columns, dtype=np.int32),
+            np.array(values, dtype=np.float64),
+        )
+
+    starts: dict[int, int] = {}
+    start_deviations: dict[int, int] = {}
+    arrivals: dict[tuple[int, int], int] = {}
+    arrival_deviations: dict[tuple[int, int], int] = {}
+    assignment_columns: dict[tuple[int, int, int], int] = {}
+    operation_window_columns: dict[tuple[int, int, int], int] = {}
+    driver_window_columns: dict[tuple[int, int, int], int] = {}
+
+    for shift in shifts:
+        starts[shift.index] = add_column(0.0001)
+        start_deviations[shift.index] = add_column(0.01)
+        for position, _operation in enumerate(shift.operations):
+            arrivals[(shift.index, position)] = add_column()
+            arrival_deviations[(shift.index, position)] = add_column(0.001)
+            for choice in range(
+                len(operation_windows[shift.index][position])
+            ):
+                operation_window_columns[
+                    (shift.index, position, choice)
+                ] = add_column(upper=1.0, integer=True)
+        for driver, trailer in resource_options[shift.index]:
+            assignment_columns[
+                (shift.index, driver, trailer)
+            ] = add_column(upper=1.0, integer=True)
+        for driver in instance.drivers:
+            if not any(
+                option_driver == driver.index
+                for option_driver, _trailer in resource_options[shift.index]
+            ):
+                continue
+            for choice in range(len(driver.time_windows)):
+                driver_window_columns[
+                    (shift.index, driver.index, choice)
+                ] = add_column(upper=1.0, integer=True)
+
+    for shift in shifts:
+        shift_id = shift.index
+        start = starts[shift_id]
+        start_deviation = start_deviations[shift_id]
+        add_row(
+            -inf, shift.start,
+            [start, start_deviation], [1.0, -1.0],
+        )
+        add_row(
+            shift.start, inf,
+            [start, start_deviation], [1.0, 1.0],
+        )
+        assignments = [
+            assignment_columns[(shift_id, driver, trailer)]
+            for driver, trailer in resource_options[shift_id]
+        ]
+        add_row(1.0, 1.0, assignments, [1.0] * len(assignments))
+
+        last_arrival = arrivals[(shift_id, len(shift.operations) - 1)]
+        last_operation = shift.operations[-1]
+        end_offset = (
+            instance.setup_time_for_point(last_operation.point)
+            + instance.time_matrix[last_operation.point][instance.base_index]
+        )
+        for driver in instance.drivers:
+            driver_assignments = [
+                assignment_columns[(shift_id, option_driver, trailer)]
+                for option_driver, trailer in resource_options[shift_id]
+                if option_driver == driver.index
+            ]
+            if not driver_assignments:
+                continue
+            windows = [
+                driver_window_columns[
+                    (shift_id, driver.index, choice)
+                ]
+                for choice in range(len(driver.time_windows))
+            ]
+            add_row(
+                0.0, 0.0,
+                [*windows, *driver_assignments],
+                [*([1.0] * len(windows)), *([-1.0] * len(driver_assignments))],
+            )
+            for choice, window in enumerate(driver.time_windows):
+                enabled = driver_window_columns[
+                    (shift_id, driver.index, choice)
+                ]
+                add_row(
+                    window.start - big_m,
+                    inf,
+                    [start, enabled],
+                    [1.0, -big_m],
+                )
+                add_row(
+                    -inf,
+                    window.end + big_m - end_offset,
+                    [last_arrival, enabled],
+                    [1.0, big_m],
+                )
+
+        layover_before = {
+            position
+            for position, operation in enumerate(replay[shift_id].operations)
+            if operation.layover_before
+        }
+        previous_point = instance.base_index
+        for position, operation in enumerate(shift.operations):
+            arrival = arrivals[(shift_id, position)]
+            deviation = arrival_deviations[(shift_id, position)]
+            add_row(
+                -inf, operation.arrival,
+                [arrival, deviation], [1.0, -1.0],
+            )
+            add_row(
+                operation.arrival, inf,
+                [arrival, deviation], [1.0, 1.0],
+            )
+            windows = operation_windows[shift_id][position]
+            selectors = [
+                operation_window_columns[(shift_id, position, choice)]
+                for choice in range(len(windows))
+            ]
+            add_row(1.0, 1.0, selectors, [1.0] * len(selectors))
+            setup = instance.setup_time_for_point(operation.point)
+            for choice, window in enumerate(windows):
+                enabled = operation_window_columns[
+                    (shift_id, position, choice)
+                ]
+                add_row(
+                    window.start - big_m,
+                    inf,
+                    [arrival, enabled],
+                    [1.0, -big_m],
+                )
+                add_row(
+                    -inf,
+                    window.end + big_m - setup,
+                    [arrival, enabled],
+                    [1.0, big_m],
+                )
+            customer = instance.customer_by_point.get(operation.point)
+            if (
+                preserve_inventory_steps
+                and customer is not None
+                and not customer.call_in
+                and operation.quantity > 0.0
+            ):
+                step = min(
+                    max(operation.arrival // instance.unit, 0),
+                    instance.horizon - 1,
+                )
+                add_row(
+                    step * instance.unit,
+                    (step + 1) * instance.unit - 1,
+                    [arrival],
+                    [1.0],
+                )
+            travel = instance.time_matrix[previous_point][operation.point]
+            if position == 0:
+                add_row(
+                    travel,
+                    inf,
+                    [arrival, start],
+                    [1.0, -1.0],
+                )
+                max_layover = instance.drivers[shift.driver].layover_duration
+                add_row(
+                    -inf,
+                    travel + max_layover - 1,
+                    [arrival, start],
+                    [1.0, -1.0],
+                )
+            else:
+                previous = arrivals[(shift_id, position - 1)]
+                previous_setup = instance.setup_time_for_point(
+                    shift.operations[position - 1].point
+                )
+                rest = (
+                    instance.drivers[shift.driver].layover_duration
+                    if position in layover_before
+                    else 0
+                )
+                add_row(
+                    previous_setup + travel + rest,
+                    inf,
+                    [arrival, previous],
+                    [1.0, -1.0],
+                )
+                if position not in layover_before:
+                    add_row(
+                        -inf,
+                        previous_setup
+                        + travel
+                        + instance.drivers[shift.driver].layover_duration
+                        - 1,
+                        [arrival, previous],
+                        [1.0, -1.0],
+                    )
+            previous_point = operation.point
+
+    for left, right in combinations(shifts, 2):
+        left_last = arrivals[(left.index, len(left.operations) - 1)]
+        right_last = arrivals[(right.index, len(right.operations) - 1)]
+        left_end_offset = (
+            instance.setup_time_for_point(left.operations[-1].point)
+            + instance.time_matrix[left.operations[-1].point][instance.base_index]
+        )
+        right_end_offset = (
+            instance.setup_time_for_point(right.operations[-1].point)
+            + instance.time_matrix[right.operations[-1].point][instance.base_index]
+        )
+        for driver in instance.drivers:
+            left_assignments = [
+                assignment_columns[(left.index, option_driver, trailer)]
+                for option_driver, trailer in resource_options[left.index]
+                if option_driver == driver.index
+            ]
+            right_assignments = [
+                assignment_columns[(right.index, option_driver, trailer)]
+                for option_driver, trailer in resource_options[right.index]
+                if option_driver == driver.index
+            ]
+            if not left_assignments or not right_assignments:
+                continue
+            if preserve_driver_order:
+                if (left.start, left.index) <= (right.start, right.index):
+                    early, late = left, right
+                    early_last = left_last
+                    early_end_offset = left_end_offset
+                else:
+                    early, late = right, left
+                    early_last = right_last
+                    early_end_offset = right_end_offset
+                add_row(
+                    early_end_offset + driver.min_inter_shift_duration
+                    - 2 * big_m,
+                    inf,
+                    [
+                        starts[late.index],
+                        early_last,
+                        *left_assignments,
+                        *right_assignments,
+                    ],
+                    [
+                        1.0,
+                        -1.0,
+                        *(
+                            [-big_m]
+                            * (len(left_assignments) + len(right_assignments))
+                        ),
+                    ],
+                )
+                continue
+            order = add_column(upper=1.0, integer=True)
+            gap = driver.min_inter_shift_duration
+            add_row(
+                left_end_offset + gap - 3 * big_m,
+                inf,
+                [
+                    starts[right.index], left_last, order,
+                    *left_assignments, *right_assignments,
+                ],
+                [
+                    1.0, -1.0, -big_m,
+                    *([-big_m] * (len(left_assignments) + len(right_assignments))),
+                ],
+            )
+            add_row(
+                right_end_offset + gap - 2 * big_m,
+                inf,
+                [
+                    starts[left.index], right_last, order,
+                    *left_assignments, *right_assignments,
+                ],
+                [
+                    1.0, -1.0, big_m,
+                    *([-big_m] * (len(left_assignments) + len(right_assignments))),
+                ],
+            )
+        for trailer in instance.trailers:
+            if (
+                preserve_trailer_order
+                and not reassign_trailers
+                and left.trailer == trailer.index
+                and right.trailer == trailer.index
+            ):
+                if (left.start, left.index) <= (right.start, right.index):
+                    early, late = left, right
+                    early_last = left_last
+                    early_end_offset = left_end_offset
+                else:
+                    early, late = right, left
+                    early_last = right_last
+                    early_end_offset = right_end_offset
+                add_row(
+                    early_end_offset,
+                    inf,
+                    [starts[late.index], early_last],
+                    [1.0, -1.0],
+                )
+                continue
+            left_assignments = [
+                assignment_columns[(left.index, driver, option_trailer)]
+                for driver, option_trailer in resource_options[left.index]
+                if option_trailer == trailer.index
+            ]
+            right_assignments = [
+                assignment_columns[(right.index, driver, option_trailer)]
+                for driver, option_trailer in resource_options[right.index]
+                if option_trailer == trailer.index
+            ]
+            if not left_assignments or not right_assignments:
+                continue
+            order = add_column(upper=1.0, integer=True)
+            add_row(
+                left_end_offset - 3 * big_m,
+                inf,
+                [
+                    starts[right.index], left_last, order,
+                    *left_assignments, *right_assignments,
+                ],
+                [
+                    1.0, -1.0, -big_m,
+                    *([-big_m] * (len(left_assignments) + len(right_assignments))),
+                ],
+            )
+            add_row(
+                right_end_offset - 2 * big_m,
+                inf,
+                [
+                    starts[left.index], right_last, order,
+                    *left_assignments, *right_assignments,
+                ],
+                [
+                    1.0, -1.0, big_m,
+                    *([-big_m] * (len(left_assignments) + len(right_assignments))),
+                ],
+            )
+
+    highs.run()
+    status = highs.modelStatusToString(highs.getModelStatus())
+    has_solution = (
+        highs.getInfo().primal_solution_status == 2
+        or "Optimal" in status
+        or "Feasible" in status
+    )
+    if not has_solution:
+        return None
+    values = highs.getSolution().col_value
+    scheduled: list[Shift] = []
+    for shift in shifts:
+        driver, trailer = max(
+            resource_options[shift.index],
+            key=lambda option: values[
+                assignment_columns[(shift.index, option[0], option[1])]
+            ],
+        )
+        operations = tuple(
+            replace(
+                operation,
+                arrival=int(round(values[arrivals[(shift.index, position)]])),
+            )
+            for position, operation in enumerate(shift.operations)
+        )
+        scheduled.append(
+            replace(
+                shift,
+                driver=driver,
+                trailer=trailer,
+                start=int(round(values[starts[shift.index]])),
+                operations=operations,
+            )
+        )
+    result = Solution(tuple(scheduled))
+    if any(not _driving_valid(instance, shift) for shift in result.shifts):
+        return None
+    return result
+
+
 def _closed_resource_component(
     solution: Solution,
     block: list[Shift],

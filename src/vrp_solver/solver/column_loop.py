@@ -5,6 +5,7 @@ import pickle
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Iterable
 
 from ..contest import score_prefix_with_feasibility_tail
 from ..inventory import tank_events
@@ -79,6 +80,7 @@ class ColumnLoopConfig:
     protect_exact_prior_quantities: bool = False
     use_prior_incumbent: bool = True
     cap_new_candidate_quantities: bool = True
+    horizon_wide_vmi_columns: bool = False
     # Call-ins are discrete commitments rather than inventory targets.  When a
     # repair has missed one, make just that known order hard in the selector so
     # it cannot trade it for a cheaper VMI-only plan.
@@ -231,7 +233,13 @@ def column_generation_rescue(
             config.replace_from_day,
             config.end_day,
         )
-        generated = _top_diverse_columns(instance, generated, pressure, config)
+        generated = _top_diverse_columns(
+            instance,
+            generated,
+            pressure,
+            config,
+            required_customers=pressure_customers,
+        )
 
         # Cap delivery quantities for new candidates to avoid causing downstream
         # overfill when combined with existing baseline window deliveries.
@@ -474,6 +482,7 @@ def _rescue_config(config: ColumnLoopConfig) -> RescueConfig:
         # Baseline-window routes are optional columns in the full selector.
         # It may jointly replace a later delivery after adding an early refill.
         allow_future_rebalance=True,
+        horizon_wide_vmi_columns=config.horizon_wide_vmi_columns,
     )
 
 
@@ -484,18 +493,26 @@ def _pressure_customers(
 ) -> list[int]:
     ranked = pressure_points(instance, solution, end_day=config.end_day)
     required_call_ins: list[int] = []
-    if config.strict_missing_callin_orders:
-        for customer_index, _ in _missing_callin_order_keys(
-            instance, solution, config.end_day
-        ):
-            if customer_index not in required_call_ins:
-                required_call_ins.append(customer_index)
+    # The selector below always treats due call-in orders as hard constraints.
+    # Pricing must therefore include every missing order customer, even when
+    # the optional VMI pressure budget is already full.
+    for customer_index, _ in _missing_callin_order_keys(
+        instance, solution, config.end_day
+    ):
+        if customer_index not in required_call_ins:
+            required_call_ins.append(customer_index)
+    optional_budget = max(
+        0, config.max_pressure_customers - len(required_call_ins),
+    )
     if ranked:
         ordered = [*required_call_ins]
         ordered.extend(
             point.customer for point in ranked if point.customer not in required_call_ins
         )
-        return ordered[: config.max_pressure_customers]
+        return [
+            *required_call_ins,
+            *ordered[len(required_call_ins):][:optional_budget],
+        ]
     cutoff_step = min(instance.horizon, config.end_day * MINUTES_PER_DAY // instance.unit)
     breach_scores: dict[int, tuple[int, float]] = {}
     urgency_scores: dict[int, tuple[int, float]] = {}
@@ -526,10 +543,13 @@ def _pressure_customers(
     ordered = [*breach_order]
     ordered.extend(point for point in urgency_order if point not in breach_scores)
     if not ordered:
-        return _failing_customers(instance, solution, _rescue_config(config))
-    return [*required_call_ins, *(
+        ordered = _failing_customers(
+            instance, solution, _rescue_config(config),
+        )
+    optional = [
         point for point in ordered if point not in required_call_ins
-    )][: config.max_pressure_customers]
+    ][:optional_budget]
+    return [*required_call_ins, *optional]
 
 
 def _augment_with_ml_priorities(
@@ -709,6 +729,8 @@ def _top_diverse_columns(
     candidates: list[Shift],
     pressure,
     config: ColumnLoopConfig,
+    *,
+    required_customers: Iterable[int] = (),
 ) -> list[Shift]:
     route_cache = RouteCache(instance)
     ranked = sorted(
@@ -723,34 +745,53 @@ def _top_diverse_columns(
     seen_routes: set[tuple[int, ...]] = set()
     bucket_counts: dict[tuple[int, int, int], int] = {}
     anchor_counts: dict[int, int] = {}
-    route_signature_counts: dict[tuple[tuple[int, ...], int, int], int] = {}
+    route_signature_counts: dict[tuple[tuple[int, ...], int, int, int], int] = {}
     source_region_counts: dict[int, int] = {}
-    for shift in ranked:
+
+    def add(shift: Shift, *, enforce_caps: bool) -> bool:
         customers = _served_customers(instance, shift)
         if not customers:
-            continue
+            return False
         route_key = (tuple(customers), shift.start // 240, shift.driver, shift.trailer)
         if route_key in seen_routes and config.bucket_route_signature_cap <= 1:
-            continue
+            return False
         bucket = (shift.driver, shift.trailer, shift.start // 240)
         anchor = customers[0]
         source_region = _first_source_region(instance, shift)
-        sig_key = (tuple(customers), shift.driver, shift.trailer)
+        sig_key = (
+            tuple(customers),
+            shift.start // MINUTES_PER_DAY,
+            shift.driver,
+            shift.trailer,
+        )
         route_signature_counts[sig_key] = route_signature_counts.get(sig_key, 0)
-        if bucket_counts.get(bucket, 0) >= config.bucket_resource_time_cap:
-            continue
-        if anchor_counts.get(anchor, 0) >= config.bucket_anchor_cap:
-            continue
-        if route_signature_counts.get(sig_key, 0) >= config.bucket_route_signature_cap:
-            continue
-        if source_region_counts.get(source_region, 0) >= config.bucket_source_region_cap:
-            continue
+        if enforce_caps and (
+            bucket_counts.get(bucket, 0) >= config.bucket_resource_time_cap
+            or anchor_counts.get(anchor, 0) >= config.bucket_anchor_cap
+            or route_signature_counts.get(sig_key, 0) >= config.bucket_route_signature_cap
+            or source_region_counts.get(source_region, 0) >= config.bucket_source_region_cap
+        ):
+            return False
         seen_routes.add(route_key)
         bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
         anchor_counts[anchor] = anchor_counts.get(anchor, 0) + 1
         route_signature_counts[sig_key] += 1
         source_region_counts[source_region] = source_region_counts.get(source_region, 0) + 1
         selected.append(shift)
+        return True
+
+    uncovered = set(required_customers)
+    for shift in ranked:
+        served = set(_served_customers(instance, shift))
+        if not uncovered.intersection(served):
+            continue
+        if add(shift, enforce_caps=False):
+            uncovered.difference_update(served)
+        if not uncovered or len(selected) >= config.max_candidates_per_iteration:
+            break
+
+    for shift in ranked:
+        add(shift, enforce_caps=True)
         if len(selected) >= config.max_candidates_per_iteration:
             break
     return selected

@@ -3,8 +3,16 @@ from __future__ import annotations
 from dataclasses import replace
 
 from vrp_solver.contest import score_prefix_with_feasibility_tail
-from vrp_solver.model import Operation, Solution, Shift
-from vrp_solver.solver.column_loop import ColumnLoopStep
+from vrp_solver.model import Operation, Order, Solution, Shift
+from vrp_solver.solver.column_loop import (
+    ColumnLoopConfig,
+    ColumnLoopStep,
+    _pressure_customers,
+)
+from vrp_solver.solver.highs_selector import (
+    SelectorConfig,
+    select_shifts_with_highs,
+)
 from vrp_solver.solver.rolling_cg import RollingCGConfig, clip_to_tank_capacity, robust_rolling_rescue
 from vrp_solver.solver.rolling_cg import _accept_window, _validate_committed_scenarios
 from vrp_solver.solver.scenario import ForecastDistribution
@@ -17,6 +25,61 @@ def test_validate_committed_scenarios_accepts_empty_scenarios() -> None:
         True,
         0,
     )
+
+
+def test_pricing_never_truncates_hard_callin_customers() -> None:
+    base = tiny_instance(forecast=(0.0,))
+    call_in = replace(
+        base.customers[0],
+        call_in=True,
+        orders=(Order(10.0, 0, 60, 100),),
+    )
+    instance = replace(base, customers=(call_in,))
+
+    customers = _pressure_customers(
+        instance,
+        Solution(()),
+        ColumnLoopConfig(end_day=1, max_pressure_customers=0),
+    )
+
+    assert customers == [call_in.index]
+
+
+def test_selector_does_not_require_orders_beyond_window() -> None:
+    base = tiny_instance(forecast=(0.0, 0.0, 0.0))
+    call_in = replace(
+        base.customers[0],
+        call_in=True,
+        initial_tank_quantity=0.0,
+        safety_level=0.0,
+        orders=(
+            Order(10.0, 0, 60, 100),
+            Order(10.0, 3_000, 4_000, 100),
+        ),
+    )
+    instance = replace(base, customers=(call_in,))
+    candidate = Shift(
+        0,
+        0,
+        0,
+        0,
+        (
+            Operation(1, 0, -10.0),
+            Operation(call_in.index, 1, 10.0),
+        ),
+    )
+
+    selected = select_shifts_with_highs(
+        instance,
+        Solution(()),
+        [candidate],
+        start_day=0,
+        end_day=1,
+        variable_quantities=True,
+        selector_config=SelectorConfig(strict_orders=True),
+    )
+
+    assert len(selected.shifts) == 1
 
 
 def test_validate_committed_scenarios_counts_infeasible_samples() -> None:

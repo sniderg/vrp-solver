@@ -134,6 +134,18 @@ def _surgical_search_loop(
     current_score = _score(instance, current, config.end_day)
     best = current
     best_score = current_score
+    output_best = current
+    output_best_score = current_score
+
+    def record_output_candidate(candidate: Solution, score: ContestScore) -> bool:
+        nonlocal output_best, output_best_score
+        if _output_key(score) >= _output_key(output_best_score):
+            return False
+        output_best, output_best_score = candidate, score
+        if config.output_xml:
+            save_solution(output_best, config.output_xml)
+        return True
+
     rewards = [1024.0] * len(OPERATORS)
     attempts = [0] * len(OPERATORS)
     last_used = [-10_000] * len(OPERATORS)
@@ -371,6 +383,7 @@ def _surgical_search_loop(
             instance, limited_candidates, config.end_day, config.workers,
             pool=scoring_pool,
         )
+        improved_output_this_step = False
         for candidate, candidate_score in scored:
             evaluated += 1
             candidate_vector, candidate_structural = (
@@ -386,6 +399,10 @@ def _surgical_search_loop(
             # aggregate QS error count.
             if structural_errors == 0 and candidate_structural != 0:
                 continue
+            improved_output_this_step = (
+                record_output_candidate(candidate, candidate_score)
+                or improved_output_this_step
+            )
             if (
                 move_score is None
                 or move_vector is None
@@ -503,6 +520,11 @@ def _surgical_search_loop(
                     instance, repaired, config.end_day,
                 )
                 repaired_vector = violation_vector(instance, repaired)
+                if _structural_shift_errors(instance, repaired) == 0:
+                    improved_output_this_step = (
+                        record_output_candidate(repaired, repaired_score)
+                        or improved_output_this_step
+                    )
                 if (
                     _structural_shift_errors(instance, repaired) == 0
                     and _hard_invariants_not_worse(
@@ -697,14 +719,14 @@ def _surgical_search_loop(
             current, current_score = move_candidate, move_score
         current_best_vector = violation_vector(instance, current)
         incumbent_best_vector = violation_vector(instance, best)
-        improved_best = (
+        improved_repair_best = (
             current_best_vector.key(),
             _repair_key(instance, current, current_score),
         ) < (
             incumbent_best_vector.key(),
             _repair_key(instance, best, best_score),
         )
-        if improved_best:
+        if improved_repair_best:
             best, best_score = current, current_score
             if _feasibility_key(best_score) < previous_feasibility:
                 stagnation = 0
@@ -715,8 +737,6 @@ def _surgical_search_loop(
             # Verified EWMA constants from Ghidra (0x140023580):
             # strong reward (3584) when new best solution is found
             rewards[operator_index] = 0.5 * rewards[operator_index] + 0.5 * 3584.0
-            if config.output_xml:
-                save_solution(best, config.output_xml)
         else:
             stagnation += 1
             # large improvement reward (1024) for accepted move, failure reward (512) for rejected move
@@ -727,14 +747,20 @@ def _surgical_search_loop(
             # which permits multi-step repairs across a neutral/worse bridge.
             if accepted and move_structural is None and rng.randrange(4) == 0:
                 current, current_score = best, best_score
+        improved_best = (
+            record_output_candidate(current, current_score)
+            or improved_output_this_step
+        )
         attempts[operator_index] += 1
         last_used[operator_index] = iteration
 
         step = SurgicalStep(
             iteration, operator, evaluated, accepted,
-            best_score.feasibility_errors, best_score.hard_violations,
-            best_score.safety_kg_min, best_score.scored_estimated_cost,
-            _logistic_ratio(best_score),
+            output_best_score.feasibility_errors,
+            output_best_score.hard_violations,
+            output_best_score.safety_kg_min,
+            output_best_score.scored_estimated_cost,
+            _logistic_ratio(output_best_score),
         )
         steps.append(step)
         if progress:
@@ -746,9 +772,9 @@ def _surgical_search_loop(
                 f"deficit,{step.safety_kg_min:.3f},cost,{step.cost:.3f},"
                 f"lr,{step.logistic_ratio:.10f}"
             )
-        if best_score.feasible or stagnation >= config.no_improvement_limit:
+        if output_best_score.feasible or stagnation >= config.no_improvement_limit:
             break
-    return best, tuple(steps)
+    return output_best, tuple(steps)
 
 
 def _remaining_time(deadline: float | None) -> float:
@@ -4467,6 +4493,16 @@ def _key(score: ContestScore):
     return (
         score.hard_violations,
         score.feasibility_errors,
+        score.safety_kg_min,
+        _logistic_ratio(score),
+    )
+
+
+def _output_key(score: ContestScore):
+    """Rank persisted incumbents by observed errors before repair staging."""
+    return (
+        score.feasibility_errors,
+        score.hard_violations,
         score.safety_kg_min,
         _logistic_ratio(score),
     )

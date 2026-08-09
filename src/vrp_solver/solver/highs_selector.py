@@ -8,6 +8,7 @@ import os
 
 from ..model import Instance, Solution, Shift, Operation
 from ..inventory import project_customer_inventory, tank_events
+from ..highs_time_opt import _feasible_operation_windows
 from ..rules import derive_solution
 from .gurobi_bridge import _shared_gurobi_env
 from .ml_priors import MLRoutePriors
@@ -49,6 +50,11 @@ class SelectorConfig:
     # from returning the least-infeasible incumbent while its pool is sparse.
     strict_feasibility: bool = False
     strict_inventory: bool = False
+    enforce_resource_conflicts: bool = True
+    enforce_driver_conflicts: bool = True
+    enforce_trailer_conflicts: bool = True
+    driver_day_capacity: int | None = None
+    flexible_driver_conflicts: bool = False
     # Restrict hard safety constraints to a retailer-focused neighbourhood.
     # This supports an IRP destroy/reinsert probe without pretending that a
     # sparse global column pool can repair every unrelated retailer at once.
@@ -220,9 +226,28 @@ def select_shifts_with_highs(
 
     # 1. Resource Overlap Constraints
     intervals = _candidate_intervals(instance, candidates)
-    _add_driver_overlap_constraints(highs, instance, candidates, x_indices, intervals)
-    _add_trailer_overlap_constraints(highs, candidates, x_indices, intervals)
-    _add_prefix_conflict_constraints(highs, instance, prefix, candidates, x_indices, intervals)
+    if selector_config.enforce_resource_conflicts:
+        if selector_config.enforce_driver_conflicts:
+            if selector_config.flexible_driver_conflicts:
+                _add_flexible_driver_conflict_constraints(
+                    highs, instance, candidates, x_indices, intervals,
+                )
+            elif selector_config.driver_day_capacity is None:
+                _add_driver_overlap_constraints(
+                    highs, instance, candidates, x_indices, intervals,
+                )
+            if selector_config.driver_day_capacity is not None:
+                _add_driver_day_capacity_constraints(
+                    highs,
+                    candidates,
+                    x_indices,
+                    selector_config.driver_day_capacity,
+                )
+        if selector_config.enforce_trailer_conflicts:
+            _add_trailer_overlap_constraints(
+                highs, candidates, x_indices, intervals,
+            )
+        _add_prefix_conflict_constraints(highs, instance, prefix, candidates, x_indices, intervals)
     # The legacy ending-net equality is a coarse proxy for trailer continuity.
     # Once the exact operation-by-operation state flow is enabled it becomes
     # harmful: it forbids spending genuine residual stock on a new call-in.
@@ -284,6 +309,7 @@ def select_shifts_with_highs(
         prefix,
         candidates,
         x_indices,
+        end_day=end_day,
         q_variables=q_variables if variable_quantities else None,
         q_indices=q_indices if variable_quantities else None,
         strict=(selector_config.strict_feasibility or selector_config.strict_orders),
@@ -577,6 +603,142 @@ def _add_driver_overlap_constraints(highs, instance, candidates, x_indices, inte
                         np.ones(2, dtype=np.float64),
                     )
 
+
+def _add_driver_day_capacity_constraints(
+    highs,
+    candidates,
+    x_indices,
+    capacity: int,
+) -> None:
+    by_driver_day: dict[tuple[int, int], list[int]] = {}
+    for index, shift in enumerate(candidates):
+        by_driver_day.setdefault(
+            (shift.driver, shift.start // 1440), [],
+        ).append(x_indices[index])
+    for columns in by_driver_day.values():
+        if len(columns) <= capacity:
+            continue
+        highs.addRow(
+            -1e20,
+            float(capacity),
+            len(columns),
+            np.array(columns, dtype=np.int32),
+            np.ones(len(columns), dtype=np.float64),
+        )
+
+
+def _add_flexible_driver_conflict_constraints(
+    highs,
+    instance,
+    candidates,
+    x_indices,
+    intervals,
+) -> None:
+    bounds = {
+        index: _uniform_shift_start_bounds(
+            instance, shift, intervals[index][1],
+        )
+        for index, shift in enumerate(candidates)
+    }
+    by_driver: dict[int, list[int]] = {}
+    for index, shift in enumerate(candidates):
+        by_driver.setdefault(shift.driver, []).append(index)
+    for driver_index, indices in by_driver.items():
+        gap = instance.drivers[driver_index].min_inter_shift_duration
+        for left_position, left in enumerate(indices):
+            left_earliest, left_latest, left_duration = bounds[left]
+            for right in indices[left_position + 1:]:
+                right_earliest, right_latest, right_duration = bounds[right]
+                if (
+                    left_earliest + left_duration + gap <= right_latest
+                    or right_earliest + right_duration + gap <= left_latest
+                ):
+                    continue
+                highs.addRow(
+                    0.0,
+                    1.0,
+                    2,
+                    np.array(
+                        [x_indices[left], x_indices[right]],
+                        dtype=np.int32,
+                    ),
+                    np.ones(2, dtype=np.float64),
+                )
+
+
+def _uniform_shift_start_bounds(
+    instance,
+    shift,
+    end: int,
+) -> tuple[int, int, int]:
+    lower_delta = -shift.start
+    upper_delta = instance.horizon * instance.unit - end
+    driver = instance.drivers[shift.driver]
+    containing_driver_windows = [
+        window
+        for window in driver.time_windows
+        if window.start <= shift.start and end <= window.end
+    ]
+    if containing_driver_windows:
+        lower_delta = max(
+            lower_delta,
+            min(
+                window.start - shift.start
+                for window in containing_driver_windows
+            ),
+        )
+        upper_delta = min(
+            upper_delta,
+            max(window.end - end for window in containing_driver_windows),
+        )
+    for operation in shift.operations:
+        setup = instance.setup_time_for_point(operation.point)
+        containing = [
+            window
+            for window in _feasible_operation_windows(instance, operation)
+            if window.start <= operation.arrival
+            and operation.arrival + setup <= window.end
+        ]
+        if containing:
+            lower_delta = max(
+                lower_delta,
+                min(
+                    window.start - operation.arrival
+                    for window in containing
+                ),
+            )
+            upper_delta = min(
+                upper_delta,
+                max(
+                    window.end - setup - operation.arrival
+                    for window in containing
+                ),
+            )
+        customer = instance.customer_by_point.get(operation.point)
+        if (
+            customer is not None
+            and not customer.call_in
+            and operation.quantity > EPSILON
+        ):
+            step = min(
+                max(operation.arrival // instance.unit, 0),
+                instance.horizon - 1,
+            )
+            lower_delta = max(
+                lower_delta,
+                step * instance.unit - operation.arrival,
+            )
+            upper_delta = min(
+                upper_delta,
+                (step + 1) * instance.unit - 1 - operation.arrival,
+            )
+    return (
+        shift.start + lower_delta,
+        shift.start + max(lower_delta, upper_delta),
+        end - shift.start,
+    )
+
+
 def _add_trailer_overlap_constraints(highs, candidates, x_indices, intervals):
     by_trailer = {}
     for i, s in enumerate(candidates):
@@ -844,6 +1006,7 @@ def _add_order_coverage_constraints(
     candidates,
     x_indices,
     *,
+    end_day: int,
     q_variables: list[_QuantityVariable] | None = None,
     q_indices: list[int] | None = None,
     strict: bool = False,
@@ -895,8 +1058,11 @@ def _add_order_coverage_constraints(
                     by_shift[index] = by_shift.get(index, 0.0) + coefficient
 
     inf = 1e20
+    end_minute = end_day * 1440
     for customer in instance.customers:
         for order_index, order in enumerate(customer.orders):
+            if order.latest_time > end_minute:
+                continue
             required = order.min_quantity_to_satisfy - prefix_deliveries.get((customer.index, order_index), 0.0)
             if required <= EPSILON:
                 continue

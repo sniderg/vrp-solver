@@ -133,6 +133,8 @@ def construct_cluster_solution(
     limit_reload_after_empty_start: bool = False,
     terminal_preload: bool = True,
     first_stop_targeted: bool = True,
+    callin_opportunity_prefix: bool = False,
+    fill_doi_days: float = 2.5,
     prioritize_early_callins: bool = True,
     max_idle_wait_minutes: int | None = None,
     idle_wait_penalty_per_hour: float = 0.0,
@@ -211,17 +213,15 @@ def construct_cluster_solution(
                 (
                     0
                     if (
-                        not prioritize_early_callins
-                        and not item[0].call_in
+                        prioritize_early_callins
+                        and item[0].call_in
+                        and (item[1] + 1) * instance.unit
+                        <= early_callin_limit
                     )
                     else (
-                        0
-                        if (
-                            prioritize_early_callins
-                            and item[0].call_in
-                            and (item[1] + 1) * instance.unit <= early_callin_limit
-                        )
-                        else 1
+                        1
+                        if not item[0].call_in
+                        else 2
                     )
                 ),
                 callin_driver_scarcity.get(item[0].index, len(instance.drivers) + 1),
@@ -268,17 +268,24 @@ def construct_cluster_solution(
                 ):
                     continue
 
+                trial_scheduled = {
+                    customer_index: dict(deliveries)
+                    for customer_index, deliveries in scheduled.items()
+                }
+                trial_ignore = dict(ignore_before_step)
+                trial_planned_volume = dict(planned_volume_by_day)
+                trial_resource = replace(resource)
                 shift = _build_cluster_shift(
                     instance,
-                    resource,
+                    trial_resource,
                     window,
                     len(shifts),
                     target_customer,
                     neighborhoods,
                     source_lead_minutes,
-                    scheduled,
-                    ignore_before_step,
-                    planned_volume_by_day,
+                    trial_scheduled,
+                    trial_ignore,
+                    trial_planned_volume,
                     daily_delivery_targets,
                     safety_buffer,
                     score_cutoff_minute,
@@ -289,13 +296,18 @@ def construct_cluster_solution(
                     limit_reload_after_empty_start,
                     terminal_preload,
                     first_stop_targeted,
+                    callin_opportunity_prefix,
+                    fill_doi_days,
                     max_idle_wait_minutes,
                     idle_wait_penalty_per_hour,
                 )
                 if shift:
+                    scheduled = trial_scheduled
+                    ignore_before_step = trial_ignore
+                    planned_volume_by_day = trial_planned_volume
                     selected_driver_state_index = driver_state_index
                     selected_trailer_state_index = trailer_state_index
-                    selected_resource = resource
+                    selected_resource = trial_resource
                     break
             if shift:
                 break
@@ -431,6 +443,8 @@ def _build_cluster_shift(
     limit_reload_after_empty_start,
     terminal_preload,
     first_stop_targeted,
+    callin_opportunity_prefix,
+    fill_doi_days,
     max_idle_wait_minutes,
     idle_wait_penalty_per_hour,
 ):
@@ -473,6 +487,7 @@ def _build_cluster_shift(
             inventory_cache=inventory_cache,
             max_smoothing=max_smoothing,
             global_pressure_ids=global_pressure_ids,
+            fill_doi_days=fill_doi_days,
         )
         # The outer constructor is assigning this route to satisfy ``target``.
         # Accepting an unrelated filler as its first stop consumes this
@@ -481,7 +496,64 @@ def _build_cluster_shift(
         # as destructive for an ordinary VMI tank whose first safety breach is
         # imminent: the historical breach cannot be repaired by serving a
         # different customer now.
-        if not operations and first_stop_targeted:
+        direct_target_start = current_time
+        if (
+            callin_opportunity_prefix
+            and target.call_in
+            and not operations
+        ):
+            direct_target_start = _first_callin_departure_time(
+                instance,
+                resource,
+                window,
+                target,
+                scheduled[target.index],
+                current_time,
+                score_cutoff_minute,
+            )
+        direct_target = (
+            _candidate_for_customer(
+                instance,
+                resource,
+                window,
+                current_pt,
+                direct_target_start,
+                driving,
+                target,
+                scheduled[target.index],
+                buffer,
+                score_cutoff_minute,
+                terminal_buffer_days,
+                has_layover_customer=any(
+                    operation.point in instance.customer_by_point
+                    and instance.customer_by_point[
+                        operation.point
+                    ].layover_customer
+                    for operation in operations
+                ),
+                layover_used=layover_used,
+            )
+            if (
+                callin_opportunity_prefix
+                and target.call_in
+                and target.index not in served_this_shift
+            )
+            else None
+        )
+        guarded_callin_prefix = (
+            callin_opportunity_prefix
+            and target.call_in
+            and target.index not in served_this_shift
+            and (
+                direct_target is None
+                or (
+                    not operations
+                    and direct_target_start - current_time
+                    > driver.layover_duration
+                )
+            )
+        )
+        if not operations and first_stop_targeted and not guarded_callin_prefix:
             candidates_to_try = [target]
             # A few tanks (V2.14 customer 9 is a representative example) are
             # not reachable from base and back within one driving spell, even
@@ -549,6 +621,62 @@ def _build_cluster_shift(
             )
             if c:
                 if (
+                    guarded_callin_prefix
+                    and customer.index != target.index
+                ):
+                    probe_time = c.departure
+                    probe_driving = c.driving_after
+                    probe_layover_used = layover_used or c.layover_before
+                    if c.return_layover:
+                        if not customer.layover_customer:
+                            continue
+                        probe_time += driver.layover_duration
+                        probe_driving = 0
+                        probe_layover_used = True
+                    order_info = _next_unsatisfied_order(
+                        target, scheduled[target.index],
+                    )
+                    if order_info is None:
+                        continue
+                    _order_index, order = order_info
+                    trailer_quantity = (
+                        resource.trailer_quantity
+                        + c.load_quantity
+                        - c.quantity
+                    )
+                    direct_arrival = (
+                        probe_time
+                        + instance.time_matrix[customer.index][target.index]
+                    )
+                    earliest_arrival = direct_arrival
+                    if (
+                        trailer_quantity + EPSILON
+                        < order.min_quantity_to_satisfy
+                    ):
+                        source_arrivals = [
+                            probe_time
+                            + instance.time_matrix[
+                                customer.index
+                            ][source.index]
+                            + source.setup_time
+                            + instance.time_matrix[source.index][target.index]
+                            for source in instance.sources
+                            if resource.trailer in source.allowed_trailers
+                        ]
+                        if not source_arrivals:
+                            continue
+                        earliest_arrival = min(source_arrivals)
+                    if (
+                        earliest_arrival > order.latest_time
+                        or earliest_arrival
+                        + target.setup_time
+                        + instance.time_matrix[
+                            target.index
+                        ][instance.base_index]
+                        > window.end
+                    ):
+                        continue
+                if (
                     limit_reload_after_empty_start
                     and started_with_source_reload
                     and c.source_arrival is not None
@@ -580,10 +708,36 @@ def _build_cluster_shift(
                     daily_delivery_targets=daily_delivery_targets,
                     trailer_capacity=instance.trailers[resource.trailer].capacity,
                     is_first_service=not operations,
-                    prefer_target_first=first_stop_targeted,
+                    prefer_target_first=(
+                        first_stop_targeted and not guarded_callin_prefix
+                    ),
                     inventory_cache=inventory_cache,
                     idle_wait_penalty_per_hour=idle_wait_penalty_per_hour,
                 )
+                if guarded_callin_prefix and customer.index != target.index:
+                    order_info = _next_unsatisfied_order(
+                        target, scheduled[target.index],
+                    )
+                    if order_info is not None:
+                        _order_index, order = order_info
+                        target_reach = (
+                            c.departure
+                            + instance.time_matrix[
+                                customer.index
+                            ][target.index]
+                        )
+                        remaining_wait = max(
+                            0, order.earliest_time - target_reach,
+                        )
+                        score = (
+                            50_000.0
+                            - 20.0 * remaining_wait
+                            - 5.0
+                            * instance.time_matrix[
+                                customer.index
+                            ][target.index]
+                            - c.travel_time
+                        )
                 if score > best_score:
                     best_cand = c
                     best_score = score
@@ -625,7 +779,10 @@ def _build_cluster_shift(
             break
         rest_needs_successor = False
 
-    if not operations: return None
+    if not operations:
+        return None
+    if target.call_in and target.index not in served_this_shift:
+        return None
     if not return_layover and terminal_preload:
         operation_count_before = len(operations)
         end_after_return = _preload_terminal_source(
@@ -821,7 +978,10 @@ def _candidate_priority(
         # way it regains its normal deadline priority and can be served after
         # a reload, as in the recovered day-one construction cadence.
         if not prefer_target_first and is_first_service:
-            score = -candidate.travel_time
+            score = (
+                -candidate.travel_time
+                - 50.0 * candidate.idle_wait
+            )
         if (
             prefer_target_first
             and is_first_service

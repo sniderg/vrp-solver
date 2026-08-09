@@ -71,6 +71,7 @@ class RescueConfig:
     # early refill.  Standalone/greedy repair cannot make that assumption and
     # must reserve all future capacity conservatively.
     allow_future_rebalance: bool = False
+    horizon_wide_vmi_columns: bool = False
     greedy_append: bool = False
     greedy_rounds: int = 16
     greedy_candidate_limit: int = 240
@@ -422,7 +423,7 @@ def generate_rescue_candidates(
             continue
         # When extending a solution (breach at or before the new window start),
         # the customer needs service throughout the new window.
-        if breach_minute <= start_minute + instance.unit:
+        if config.horizon_wide_vmi_columns or breach_minute <= start_minute + instance.unit:
             latest_customer_arrival = end_minute - 1
         else:
             latest_customer_arrival = min(breach_minute - instance.unit, end_minute - 1)
@@ -744,69 +745,70 @@ def _generate_callin_rescue_candidates(
     samples_per_customer: int,
     seen: set[tuple[object, ...]],
 ) -> list[Shift]:
-    """Generate source-backed columns for the first unmet call-in order."""
-    order_info = _next_unsatisfied_callin_order(customer, baseline)
-    if order_info is None:
+    """Generate source-backed columns for every unmet call-in order."""
+    order_infos = _unsatisfied_callin_orders(customer, baseline)
+    if not order_infos:
         return []
-    _order_index, order = order_info
-    quantity = order.min_quantity_to_satisfy
     candidates: list[Shift] = []
-    for driver in instance.drivers:
-        for trailer in instance.trailers:
-            if trailer.index not in driver.trailer_ids or trailer.index not in customer.allowed_trailers:
-                continue
-            if quantity > trailer.capacity + EPSILON:
-                continue
-            for source in instance.sources:
-                if trailer.index not in source.allowed_trailers:
+    for _order_index, order in order_infos:
+        quantity = order.min_quantity_to_satisfy
+        for driver in instance.drivers:
+            for trailer in instance.trailers:
+                if trailer.index not in driver.trailer_ids or trailer.index not in customer.allowed_trailers:
                     continue
-                lead = (
-                    instance.time_matrix[instance.base_index][source.index]
-                    + source.setup_time
-                    + instance.time_matrix[source.index][customer.index]
-                )
-                trail = customer.setup_time + instance.time_matrix[customer.index][instance.base_index]
-                for driver_window in driver.time_windows:
-                    earliest = max(
-                        order.earliest_time,
-                        start_minute + lead,
-                        driver_window.start + lead,
-                    )
-                    latest = min(
-                        order.latest_time - customer.setup_time,
-                        end_minute - trail,
-                        driver_window.end - trail,
-                    )
-                    if earliest > latest:
+                if quantity > trailer.capacity + EPSILON:
+                    continue
+                for source in instance.sources:
+                    if trailer.index not in source.allowed_trailers:
                         continue
-                    for arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
-                        shift_start = arrival - lead
-                        source_arrival = shift_start + instance.time_matrix[instance.base_index][source.index]
-                        departure = arrival + customer.setup_time
-                        end = departure + instance.time_matrix[customer.index][instance.base_index]
-                        if not is_time_window_valid(shift_start, end, driver.time_windows):
-                            continue
-                        if not is_time_window_valid(arrival, departure, customer.time_windows):
-                            continue
-                        shift = Shift(
-                            index=0,
-                            driver=driver.index,
-                            trailer=trailer.index,
-                            start=shift_start,
-                            operations=(
-                                Operation(source.index, source_arrival, -quantity),
-                                Operation(customer.index, arrival, quantity),
-                            ),
+                    lead = (
+                        instance.time_matrix[instance.base_index][source.index]
+                        + source.setup_time
+                        + instance.time_matrix[source.index][customer.index]
+                    )
+                    trail = customer.setup_time + instance.time_matrix[customer.index][instance.base_index]
+                    for driver_window in driver.time_windows:
+                        earliest = max(
+                            order.earliest_time,
+                            start_minute + lead,
+                            driver_window.start + lead,
                         )
-                        key = _shift_key(shift)
-                        if key in seen or not _is_shift_route_valid(instance, shift):
+                        latest = min(
+                            order.latest_time - customer.setup_time,
+                            end_minute - trail,
+                            driver_window.end - trail,
+                        )
+                        if earliest > latest:
                             continue
-                        seen.add(key)
-                        candidates.append(replace(shift, index=len(candidates)))
+                        for arrival in _window_arrival_samples(earliest, latest, samples_per_customer):
+                            shift_start = arrival - lead
+                            source_arrival = shift_start + instance.time_matrix[instance.base_index][source.index]
+                            departure = arrival + customer.setup_time
+                            end = departure + instance.time_matrix[customer.index][instance.base_index]
+                            if not is_time_window_valid(shift_start, end, driver.time_windows):
+                                continue
+                            if not is_time_window_valid(arrival, departure, customer.time_windows):
+                                continue
+                            shift = Shift(
+                                index=0,
+                                driver=driver.index,
+                                trailer=trailer.index,
+                                start=shift_start,
+                                operations=(
+                                    Operation(source.index, source_arrival, -quantity),
+                                    Operation(customer.index, arrival, quantity),
+                                ),
+                            )
+                            key = _shift_key(shift)
+                            if key in seen or not _is_shift_route_valid(instance, shift):
+                                continue
+                            seen.add(key)
+                            candidates.append(replace(shift, index=len(candidates)))
     return candidates
 
 
-def _next_unsatisfied_callin_order(customer, solution: Solution):
+def _unsatisfied_callin_orders(customer, solution: Solution):
+    unsatisfied = []
     for order_index, order in enumerate(customer.orders):
         delivered = sum(
             operation.quantity
@@ -817,8 +819,12 @@ def _next_unsatisfied_callin_order(customer, solution: Solution):
             and order.earliest_time <= operation.arrival <= order.latest_time
         )
         if delivered + EPSILON < order.min_quantity_to_satisfy:
-            return order_index, order
-    return None
+            unsatisfied.append((order_index, order))
+    return unsatisfied
+
+
+def _next_unsatisfied_callin_order(customer, solution: Solution):
+    return next(iter(_unsatisfied_callin_orders(customer, solution)), None)
 
 
 def _generate_callin_chain_rescue_candidates(

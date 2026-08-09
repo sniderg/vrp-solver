@@ -248,7 +248,7 @@ def robust_rolling_rescue(
                 )
                 emit(
                     f"  attempt={attempt} {source_label}, "
-                    f"plan_σ={plan_sigma}, buffer_σ={buffer_sigma}, "
+                    f"plan_sigma={plan_sigma}, buffer_sigma={buffer_sigma}, "
                     f"p={plan_percentile:.1f}/{buffer_percentile:.1f}, "
                     f"capacity_buffer={capacity_buffer:.3f}"
                 )
@@ -346,14 +346,14 @@ def robust_rolling_rescue(
                 emit(
                     f"  CG Iter {step.iteration:<2} | Pool: {step.pool_size:<4} | Shifts: {step.selected_extra_shifts:<2} | "
                     f"Errors: {step.feasibility_errors:<3} | Hard: {step.hard_violations:<2}{feasibility_msg}{improvement_msg}\n"
-                    f"    ↳ Priors: loaded={step.prior_loaded} inserted={step.prior_inserted} "
+                    f"    -> Priors: loaded={step.prior_loaded} inserted={step.prior_inserted} "
                     f"selected={step.prior_selected} rejected={step.prior_rejected} "
                     f"rejected_pressure={step.prior_rejected_pressure_cover} skeletons={step.prior_skeletons_regenerated}\n"
-                    f"    ↳ Rejected prior routes: {step.prior_rejected_route_summary or 'None'}\n"
-                    f"    ↳ KPI: Cost = {step.cost:.2f} | LogRatio = {step.logistic_ratio:.6f}\n"
-                    f"    ↳ Commit (Day {commit_end_day}) Safety: min DOI = {step.min_commit_doi:.2f}d ({danger_status_commit}) | Top Vulnerable: {v_commit_str}\n"
-                    f"    ↳ Next (Day {step.next_after_commit_day}) Safety: min DOI = {step.min_next_after_commit_doi:.2f}d ({danger_status_next}) | Top Vulnerable: {v_next_str}\n"
-                    f"    ↳ Lookahead (Day {solve_end_day}) Safety: min DOI = {step.min_lookahead_doi:.2f}d ({danger_status_lookahead}) | Top Vulnerable: {v_lookahead_str}"
+                    f"    -> Rejected prior routes: {step.prior_rejected_route_summary or 'None'}\n"
+                    f"    -> KPI: Cost = {step.cost:.2f} | LogRatio = {step.logistic_ratio:.6f}\n"
+                    f"    -> Commit (Day {commit_end_day}) Safety: min DOI = {step.min_commit_doi:.2f}d ({danger_status_commit}) | Top Vulnerable: {v_commit_str}\n"
+                    f"    -> Next (Day {step.next_after_commit_day}) Safety: min DOI = {step.min_next_after_commit_doi:.2f}d ({danger_status_next}) | Top Vulnerable: {v_next_str}\n"
+                    f"    -> Lookahead (Day {solve_end_day}) Safety: min DOI = {step.min_lookahead_doi:.2f}d ({danger_status_lookahead}) | Top Vulnerable: {v_lookahead_str}"
                 )
                 progress_log.write_step(
                     "iteration_improved" if improved else "iteration",
@@ -391,6 +391,7 @@ def robust_rolling_rescue(
                 incumbent_commit_score,
                 true_score,
                 scenario_failures,
+                lookahead_score,
             )
             emit(
                 f"  commit score: errors={true_score.feasibility_errors} "
@@ -780,7 +781,12 @@ def _accept_window(
     incumbent_score: ContestScore,
     candidate_score: ContestScore,
     scenario_failures: int,
+    lookahead_score: ContestScore | None = None,
 ) -> tuple[bool, str]:
+    # Prefix truncation can split a shift that crosses the commit boundary,
+    # creating a structural error even though the complete executable plan is valid.
+    if lookahead_score is not None and lookahead_score.feasible:
+        candidate_score = lookahead_score
     if incumbent_score.feasible and not candidate_score.feasible:
         return False, "rejected: infeasible true prefix would replace feasible incumbent"
     if candidate_score.hard_violations > incumbent_score.hard_violations and not candidate_score.feasible:
