@@ -19,6 +19,10 @@ from ..rules import (
     validate_solution,
 )
 from ..movement import nearest_neighbors
+from ..highs_time_opt import try_optimize_shift_times
+from .targeted_rescue import normalize_source_loads
+
+
 
 
 EPSILON = 1e-6
@@ -308,7 +312,7 @@ def construct_cluster_solution(
         trailers[selected_trailer_state_index].trailer_quantity = selected_resource.trailer_quantity
         shifts.append(shift)
 
-    unscheduled = tuple(
+    unscheduled = list(
         customer.index
         for customer in instance.customers
         if (
@@ -332,6 +336,10 @@ def construct_cluster_solution(
         unscheduled_customers=unscheduled,
         exhausted_resources=exhausted_resources,
     )
+
+
+
+
 
 def _all_needs(instance, scheduled, ignore_before_step, score_cutoff_minute=None, inventory_cache=None):
     needs = []
