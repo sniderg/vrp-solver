@@ -460,10 +460,20 @@ def robust_rolling_rescue(
             if s.start >= committed_day * MINUTES_PER_DAY
         ])
 
-        # For the next round, start with the full window solution as baseline.
+        # For the next round, start with the full window solution plus downstream baseline shifts.
         # This preserves the 'plan' part of the solution so the next round
         # isn't starting from an empty schedule for its lookahead window.
-        current_solution = window_solution
+        downstream_shifts = tuple(
+            shift for shift in baseline.shifts
+            if shift.start >= solve_end_day * MINUTES_PER_DAY
+        )
+        current_solution = Solution(
+            shifts=tuple(
+                replace(shift, index=i)
+                for i, shift in enumerate((*window_solution.shifts, *downstream_shifts))
+            )
+        )
+
 
         steps.append(
             RollingCGStep(
