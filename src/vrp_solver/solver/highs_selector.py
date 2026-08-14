@@ -173,16 +173,19 @@ def select_shifts_with_highs(
             if phase == "auto":
                 phase = "feasibility" if pressure_by_customer else "cost"
             if phase == "feasibility":
+                est_volume = sum(op.quantity for op in s.operations if op.quantity > 0)
                 obj_coeff = (
                     0.05 * travel_cost
-                    + 1_000.0
+                    + 200.0
                     - (2_500.0 * len(served_customers))
                     - (1_250.0 * max(0, len(served_customers) - 1))
                     - (2_500.0 * order_stops)
-                    - (3.0 * pressure_bonus)
+                    - (10.0 * pressure_bonus)
+                    - (0.05 * est_volume)
                 )
                 if i in selector_config.priority_shift_indices:
                     obj_coeff -= selector_config.priority_shift_bonus
+
             else:
                 obj_coeff = (
                     travel_cost
