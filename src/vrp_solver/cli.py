@@ -64,6 +64,12 @@ RATIO_RE = re.compile(r"Logistic Ratio\s*=\s*([0-9]+(?:[.,][0-9]+)?)")
 RULES_INDEX = PROJECT_ROOT / "roadef_2016_data" / "rules_index.md"
 
 
+def _flush_print(*args: object, **kwargs: object) -> None:
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
+
 def cmd_instance_summary(args: argparse.Namespace) -> int:
     instance = load_instance(args.instance_xml)
     customers_by_kind = {
@@ -196,7 +202,7 @@ def cmd_rolling_highs_select(args: argparse.Namespace) -> int:
         initial_solution=initial_solution,
         seed_candidate_solution=seed_candidate_solution,
         config=config,
-        progress=print,
+        progress=_flush_print,
     )
     save_solution(solution, args.output_xml)
     print(f"Saved rolling solution to {args.output_xml}")
@@ -389,7 +395,7 @@ def cmd_powerful_repair(args: argparse.Namespace) -> int:
             restart_every=args.restart_every,
             stop_when_feasible=not args.continue_after_feasible,
         ),
-        progress=print,
+        progress=_flush_print,
         checkpoint=lambda solution: save_solution(solution, args.output_xml),
     )
     save_solution(solution, args.output_xml)
@@ -419,7 +425,7 @@ def cmd_surgical_search(args: argparse.Namespace) -> int:
             lahc_capacity=getattr(args, "lahc_capacity", 50),
             use_markov_sequence=getattr(args, "use_markov", False),
         ),
-        progress=print,
+        progress=_flush_print,
     )
     save_solution(solution, args.output_xml)
     print(f"Saved surgical-search solution to {args.output_xml}")
@@ -489,7 +495,7 @@ def cmd_robust_rolling_rescue(args: argparse.Namespace) -> int:
         use_prior_incumbent=not args.no_prior_incumbent,
     )
     solution, steps = robust_rolling_rescue(
-        instance, baseline, config=config, progress=print
+        instance, baseline, config=config, progress=_flush_print
     )
     
     if args.rebalance:
@@ -535,7 +541,7 @@ def cmd_robust_batch_rescue(args: argparse.Namespace) -> int:
         targets,
         args.output_dir,
         config=config,
-        progress=print,
+        progress=_flush_print,
         rebalance=not args.no_rebalance,
     )
     csv_path = args.output_dir / "robust_batch_results.csv"
@@ -639,7 +645,7 @@ def cmd_week_ahead_ci_rescue(args: argparse.Namespace) -> int:
         instance,
         baseline,
         config=config,
-        progress=print,
+        progress=_flush_print,
     )
     from .solver.highs_selector import rebalance_drivers
     if not args.no_rebalance:
@@ -776,8 +782,9 @@ def cmd_robust_policy_sweep(args: argparse.Namespace) -> int:
         policies,
         args.output_dir,
         horizon_days=args.horizon_days,
-        progress=print,
+        progress=_flush_print,
         resume=args.resume,
+
         force=args.force,
         results_csv=args.output_dir / "policy_sweep_results.csv",
     )
