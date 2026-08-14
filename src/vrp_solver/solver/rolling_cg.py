@@ -17,7 +17,9 @@ from typing import Callable
 from ..contest import ContestScore, score_prefix_with_feasibility_tail, truncate_solution
 from ..model import Instance, Shift, Solution
 from .column_loop import ColumnLoopConfig, column_generation_rescue
+from .targeted_rescue import normalize_source_loads
 from .scenario import (
+
     ForecastDistribution,
     build_hedged_instance_from_distribution,
     build_scenario_instance_from_distribution,
@@ -460,19 +462,56 @@ def robust_rolling_rescue(
             if s.start >= committed_day * MINUTES_PER_DAY
         ])
 
-        # For the next round, start with the full window solution plus downstream baseline shifts.
+        # For the next round, start with the full window solution plus non-conflicting downstream baseline shifts.
         # This preserves the 'plan' part of the solution so the next round
         # isn't starting from an empty schedule for its lookahead window.
         downstream_shifts = tuple(
             shift for shift in baseline.shifts
             if shift.start >= solve_end_day * MINUTES_PER_DAY
         )
+        window_driver_intervals: dict[int, list[tuple[int, int]]] = {}
+        window_trailer_intervals: dict[int, list[tuple[int, int]]] = {}
+        for s in window_solution.shifts:
+            end_time = (
+                s.operations[-1].arrival
+                + instance.setup_time_for_point(s.operations[-1].point)
+                + instance.time_matrix[s.operations[-1].point][instance.base_index]
+                if s.operations
+                else s.start
+            )
+            driver_obj = instance.drivers[s.driver]
+            window_driver_intervals.setdefault(s.driver, []).append(
+                (s.start, end_time + driver_obj.min_inter_shift_duration)
+            )
+            window_trailer_intervals.setdefault(s.trailer, []).append((s.start, end_time))
+
+        clean_downstream = []
+        for s in downstream_shifts:
+            end_time = (
+                s.operations[-1].arrival
+                + instance.setup_time_for_point(s.operations[-1].point)
+                + instance.time_matrix[s.operations[-1].point][instance.base_index]
+                if s.operations
+                else s.start
+            )
+            d_conflict = any(
+                s.start < d_end and end_time > d_start
+                for d_start, d_end in window_driver_intervals.get(s.driver, [])
+            )
+            t_conflict = any(
+                s.start < t_end and end_time > t_start
+                for t_start, t_end in window_trailer_intervals.get(s.trailer, [])
+            )
+            if not d_conflict and not t_conflict:
+                clean_downstream.append(s)
+
         current_solution = Solution(
             shifts=tuple(
                 replace(shift, index=i)
-                for i, shift in enumerate((*window_solution.shifts, *downstream_shifts))
+                for i, shift in enumerate((*window_solution.shifts, *clean_downstream))
             )
         )
+
 
 
         steps.append(
@@ -534,17 +573,19 @@ def robust_rolling_rescue(
     progress_log.write_final(horizon_days, committed_day, final_score, len(output_solution.shifts))
     progress_log.close()
 
-    # Reindex shifts and apply final physics clipping to prevent any residual overfills
+    # Reindex shifts, normalize source loads, and apply final physics clipping to prevent any residual overfills
+    normalized = normalize_source_loads(instance, output_solution)
     indexed_solution = Solution(
         shifts=tuple(
             replace(shift, index=i)
             for i, shift in enumerate(
-                sorted(output_solution.shifts, key=lambda s: (s.start, s.driver))
+                sorted(normalized.shifts, key=lambda s: (s.start, s.driver))
             )
         )
     )
     if not config.final_clip_capacity:
         return indexed_solution, steps
+
 
     clipped_solution = clip_to_tank_capacity(instance, indexed_solution)
     indexed_score = score_prefix_with_feasibility_tail(
