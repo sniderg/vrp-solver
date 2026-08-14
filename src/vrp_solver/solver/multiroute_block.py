@@ -55,7 +55,19 @@ def repair_pressure_multiroute_block(
             time_limit_seconds=time_limit_per_model,
         )
         if report.status != "Optimal":
+            repaired, report = repair_quantities_with_highs(
+                instance,
+                topology,
+                score_days=end_day,
+                feasibility_days=end_day,
+                ignore_tail_call_ins=True,
+                quantity_objective="min-delivered",
+                strict_inventory=False,
+                time_limit_seconds=time_limit_per_model,
+            )
+        if report.status != "Optimal":
             continue
+
         feasible += 1
         if assess_atomic_repair(instance, solution, repaired).accepted:
             improved += 1

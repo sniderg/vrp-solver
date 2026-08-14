@@ -1149,14 +1149,22 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
         for shift_pos, shift in enumerate(solution.shifts):
             if shift.start >= point.first_minute or shift.trailer not in customer.allowed_trailers:
                 continue
-            for op_pos in range(1, len(shift.operations) + 1):
-                available = derived[shift_pos].operations[op_pos - 1].trailer_quantity
-                quantity = min(available, customer.capacity * 0.5, 20_000.0)
-                if quantity < customer.min_operation_quantity:
-                    continue
+            trailer = instance.trailers[shift.trailer]
+            for op_pos in range(len(shift.operations) + 1):
+                if op_pos == 0:
+                    approx_arrival = shift.start + instance.time_matrix[instance.base_index][customer.index]
+                else:
+                    anchor = shift.operations[op_pos - 1]
+                    approx_arrival = anchor.arrival + instance.setup_time_for_point(anchor.point) + instance.time_matrix[anchor.point][customer.index]
+                
+                available = (
+                    derived[shift_pos].operations[op_pos - 1].trailer_quantity
+                    if op_pos > 0 and op_pos - 1 < len(derived[shift_pos].operations)
+                    else trailer.capacity * 0.5
+                )
+                quantity = max(customer.min_operation_quantity, min(available, customer.capacity * 0.5, trailer.capacity * 0.5))
                 operations = list(shift.operations)
-                anchor = operations[op_pos - 1]
-                operations.insert(op_pos, Operation(customer.index, anchor.arrival, quantity))
+                operations.insert(op_pos, Operation(customer.index, approx_arrival, quantity))
                 mutated = try_optimize_shift_times(
                     instance,
                     replace(shift, operations=tuple(operations)),
@@ -1168,7 +1176,8 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                     continue
                 shifts = list(solution.shifts)
                 shifts[shift_pos] = mutated
-                result.append(Solution(tuple(shifts)))
+                rebalanced = normalize_source_loads(instance, Solution(tuple(shifts)))
+                result.append(rebalanced)
                 if len(result) >= config.candidates_per_move * 2:
                     return _repair_mutation_resource_conflicts(
                         instance,
@@ -1180,6 +1189,7 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
         result,
         config.candidates_per_move * 2,
     )
+
 
 
 def _vmi_safety_prepend_candidates(
