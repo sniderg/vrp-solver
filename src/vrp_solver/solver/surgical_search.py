@@ -1171,9 +1171,11 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 available = (
                     derived[shift_pos].operations[op_pos - 1].trailer_quantity
                     if op_pos > 0 and op_pos - 1 < len(derived[shift_pos].operations)
-                    else trailer.capacity * 0.5
+                    else trailer.capacity
                 )
-                quantity = max(customer.min_operation_quantity, min(available, customer.capacity * 0.5, trailer.capacity * 0.5))
+                if available < customer.min_operation_quantity:
+                    continue
+                quantity = max(customer.min_operation_quantity, min(available, customer.capacity))
                 operations = list(shift.operations)
                 operations.insert(op_pos, Operation(customer.index, approx_arrival, quantity))
                 mutated = try_optimize_shift_times(
@@ -1195,6 +1197,7 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                         result,
                         config.candidates_per_move * 2,
                     )
+
     return _repair_mutation_resource_conflicts(
         instance,
         result,
