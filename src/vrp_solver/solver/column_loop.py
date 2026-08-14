@@ -483,6 +483,11 @@ def _pressure_customers(
     config: ColumnLoopConfig,
 ) -> list[int]:
     ranked = pressure_points(instance, solution, end_day=config.end_day)
+    if config.replace_from_day > 0 and ranked:
+        window_start_min = config.replace_from_day * MINUTES_PER_DAY
+        window_ranked = [p for p in ranked if p.first_minute >= window_start_min]
+        prior_ranked = [p for p in ranked if p.first_minute < window_start_min]
+        ranked = tuple((*window_ranked, *prior_ranked))
     required_call_ins: list[int] = []
     if config.strict_missing_callin_orders:
         for customer_index, _ in _missing_callin_order_keys(
@@ -496,6 +501,7 @@ def _pressure_customers(
             point.customer for point in ranked if point.customer not in required_call_ins
         )
         return ordered[: config.max_pressure_customers]
+
     cutoff_step = min(instance.horizon, config.end_day * MINUTES_PER_DAY // instance.unit)
     breach_scores: dict[int, tuple[int, float]] = {}
     urgency_scores: dict[int, tuple[int, float]] = {}
