@@ -415,12 +415,16 @@ def cmd_surgical_search(args: argparse.Namespace) -> int:
             workers=args.workers,
             first_operator=args.first_operator,
             output_xml=str(args.output_xml),
+            use_lahc=getattr(args, "use_lahc", False),
+            lahc_capacity=getattr(args, "lahc_capacity", 50),
+            use_markov_sequence=getattr(args, "use_markov", False),
         ),
         progress=print,
     )
     save_solution(solution, args.output_xml)
     print(f"Saved surgical-search solution to {args.output_xml}")
     return 0
+
 
 
 def cmd_robust_rolling_rescue(args: argparse.Namespace) -> int:
@@ -2320,7 +2324,11 @@ def build_parser() -> argparse.ArgumentParser:
         "pressure_band_resource_block", "multiroute_pressure_block",
         "recombine_route_blocks", "joint_retailer_reinsert",
     ))
+    surgical.add_argument("--use-lahc", action="store_true", help="Enable Late Acceptance Hill Climbing")
+    surgical.add_argument("--lahc-capacity", type=int, default=50, help="Capacity of LAHC history buffer")
+    surgical.add_argument("--use-markov", action="store_true", help="Enable Adaptive Markov sequence selection")
     surgical.set_defaults(func=cmd_surgical_search)
+
 
     rolling_cg = subparsers.add_parser("robust-rolling-rescue")
     rolling_cg.add_argument("instance_xml", type=Path)

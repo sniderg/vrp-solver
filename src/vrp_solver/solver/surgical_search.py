@@ -33,9 +33,11 @@ from .targeted_rescue import (
     RescueConfig,
     generate_carryover_rescue_candidates,
     generate_chain_rescue_candidates,
+    generate_multi_reload_candidates,
     generate_rescue_candidates,
     normalize_source_loads,
 )
+
 
 
 @dataclass(frozen=True)
@@ -935,6 +937,7 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
         instance, solution, pressure, config=rescue,
     )
     shifts += generate_chain_rescue_candidates(instance, solution, pressure, config=rescue)
+    shifts += generate_multi_reload_candidates(instance, solution, pressure, config=rescue)
     ordinary = [
         _reindex(Solution((*solution.shifts, replace(shift, index=len(solution.shifts)))))
         for shift in shifts
@@ -959,15 +962,23 @@ def _resource_safe_created_candidates(
     candidates: list[Solution],
     config: SurgicalSearchConfig,
 ) -> list[Solution]:
-    """Place each newly created route on a compatible idle resource pair."""
+    """Place each newly created route on a compatible idle resource pair, prioritizing underutilized drivers."""
     current_derived = derive_solution(instance, solution)
     result: list[Solution] = []
     cap = max(64, config.candidates_per_move * 8)
-    resource_pairs = tuple(
-        (driver.index, trailer_id)
-        for driver in instance.drivers
-        for trailer_id in driver.trailer_ids
+    driver_shift_counts = {driver.index: 0 for driver in instance.drivers}
+    for shift in solution.shifts:
+        driver_shift_counts[shift.driver] = driver_shift_counts.get(shift.driver, 0) + 1
+
+    resource_pairs = sorted(
+        (
+            (driver.index, trailer_id)
+            for driver in instance.drivers
+            for trailer_id in driver.trailer_ids
+        ),
+        key=lambda pair: driver_shift_counts.get(pair[0], 0),
     )
+
     for candidate in candidates:
         if len(candidate.shifts) != len(solution.shifts) + 1:
             continue

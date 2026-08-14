@@ -1400,10 +1400,12 @@ def generate_multi_reload_candidates(
     seen: set[tuple[object, ...]] = set()
 
     for first_segment, second_segment in sequences:
-        anchor = instance.customer_by_point[first_segment[0]]
-        anchor_breach = _first_breach_minute(instance, baseline, anchor.index, event_cache)
+        anchor_breach = _first_breach_minute(
+            instance, baseline, anchor.index, event_cache, min_minute=start_minute
+        )
         if anchor_breach is None:
             continue
+
         if anchor_breach <= start_minute + instance.unit:
             latest_anchor_arrival = end_minute - 1
         else:
