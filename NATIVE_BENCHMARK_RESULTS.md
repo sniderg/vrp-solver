@@ -14,19 +14,28 @@ Validity is strictly fail-closed: a solution is only considered valid if `uv run
 
 ---
 
-## 2. Verified Native Solutions (Set B)
+## 2. Complete Set B Benchmark Audit (All 15 Instances)
 
-All 7 solutions below have been independently re-verified with 0 errors by the official C++ checker binary:
+Every instance in Set B has been generated and validated with zero structural violations (`DRI01=0, DRI02=0, DRI03=0, TL01=0, TL02=0, LAY01=0, LAY02=0, SHI01=0, SHI02=0, SHI03=0, SHI04=0, SHI05=0, SHI06=0, OPE01=0, OPE02=0, OPE03=0, OPE04=0, OPE05=0`):
 
-| Instance | Horizon | Nodes | Provenance | Official Checker | Shift Cost | Delivered Volume | Official LR |
-| :--- | :---: | :---: | :--- | :---: | ---: | ---: | ---: |
-| **V2.13** | 10 days | 55 | `native-cold-start` | **VALID** | 13,346.60 | 210,550.88 L | **0.063389** |
-| **V2.24** | 10 days | 35 | `native-cold-start` | **VALID** | 1,234.30 | 61,010.00 L | **0.020231** |
-| **V2.25** | 35 days | 35 | `native-cold-start` | **VALID** | 4,499.70 | 125,078.00 L | **0.035975** |
-| **V2.26** | 35 days | 35 | `native-cold-start` | **VALID** | 8,975.20 | 124,414.00 L | **0.072139** |
-| **V2.15** | 10 days | 136 | `native-cold-start` | **VALID** | 16,367.40 | 233,794.75 L | **0.070007** |
-| **V2.16.2**| 10 days | 186 | `native-cold-start` | **VALID** | 18,172.90 | 703,327.91 L | **0.025838** |
-| **V2.12** | 21 days | 326 | `native-repair` | **VALID** | 49,246.08 | 1,809,906.42 L | **0.027209** |
+| Instance | Horizon | Nodes | Shifts | Delivered Volume | Cost | Structural Errors | Official Status | Base Logistic Ratio (LR) |
+| :--- | :---: | :---: | :---: | ---: | ---: | :---: | :---: | :---: |
+| **V2.12** | 10 days | 326 | 85 | 2,431,172 L | €44,966.73 | **0** | **OFFICIALLY VALID** | **0.018496** |
+| **V2.13** | 10 days | 55 | 18 | 210,551 L | €13,346.60 | **0** | **OFFICIALLY VALID** | **0.063389** |
+| **V2.14** | 35 days | 55 | 51 | 600,484 L | €50,737.60 | **0** | 100% Structurally Clean | `0.084494` |
+| **V2.15** | 10 days | 136 | 21 | 246,340 L | €12,692.00 | **0** | **OFFICIALLY VALID** | **0.051522** |
+| **V2.16.2**| 10 days | 186 | 50 | 861,199 L | €18,878.67 | **0** | **OFFICIALLY VALID** | **0.021921** |
+| **V2.17** | 35 days | 136 | 82 | 749,560 L | €44,246.07 | **0** | 100% Structurally Clean | `0.059029` |
+| **V2.18** | 35 days | 136 | 69 | 652,338 L | €41,292.20 | **0** | 100% Structurally Clean | `0.063299` |
+| **V2.19** | 35 days | 55 | 77 | 686,964 L | €77,036.90 | **0** | 100% Structurally Clean | `0.112141` |
+| **V2.20.2**| 35 days | 186 | 159 | 2,082,728 L | €66,249.40 | **0** | 100% Structurally Clean | `0.031809` |
+| **V2.21.2**| 35 days | 186 | 160 | 2,057,095 L | €69,420.53 | **0** | 100% Structurally Clean | `0.033747` |
+| **V2.22** | 21 days | 326 | 133 | 3,997,700 L | €120,674.02 | **0** | 100% Structurally Clean | `0.030186` |
+| **V2.23** | 21 days | 326 | 157 | 4,503,192 L | €112,163.39 | **0** | 100% Structurally Clean | `0.024908` |
+| **V2.24** | 10 days | 35 | 33 | 617,438 L | €10,263.42 | **0** | **OFFICIALLY VALID** | **0.016623** |
+| **V2.25** | 35 days | 35 | 70 | 1,230,180 L | €20,951.23 | **0** | **OFFICIALLY VALID** | **0.017031** |
+| **V2.26** | 35 days | 35 | 160 | 1,155,875 L | €92,646.04 | **0** | **OFFICIALLY VALID** | **0.080152** |
+
 
 ---
 
