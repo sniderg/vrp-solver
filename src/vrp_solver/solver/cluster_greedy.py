@@ -223,12 +223,13 @@ def construct_cluster_solution(
                     if item[0].call_in
                     else max(0, item[1] - first_vmi_breach - 2)
                 ),
-                item[1] if item[0].call_in else item[0].capacity,
                 item[1],
+                item[0].capacity,
                 0.0 if tie_break is None else tie_break[item[0].index],
                 item[0].index,
             )
         )
+
         ranked_vmi_pressure = tuple(
             customer.index
             for customer, _ in all_needs
@@ -1240,6 +1241,8 @@ def _candidate_for_customer(
             # represented.  Treating a layover-capable customer as an
             # implicit return rest produces DRI03 under the released checker.
             return None
+
+
     arrival_step = min(max(arrival // instance.unit, 0), instance.horizon - 1)
     inv_at_arr = events[arrival_step].after_consumption
 
@@ -1369,6 +1372,8 @@ def _candidate_for_call_in(
         driving_after = driving + total_travel
         if not is_driving_duration_valid(instance.drivers[resource.driver], driving_after + ret_travel):
             return None
+
+
 
     qty = min(trailer_qty, remaining)
     if qty <= EPSILON:
