@@ -48,3 +48,7 @@ vrp-solver = "vrp_solver.cli:main"
 [tool.setuptools]
 package-dir = {"" = "src"}
 packages = ["vrp_solver", "vrp_solver.solver"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
