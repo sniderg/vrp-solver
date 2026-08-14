@@ -1085,9 +1085,13 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
                 ],
                 output_xml=str(args.output_xml),
                 coverage_include_ejection=round_index > 0,
+                use_lahc=getattr(args, "use_lahc", False),
+                lahc_capacity=getattr(args, "lahc_capacity", 50),
+                use_markov_sequence=getattr(args, "use_markov", False),
             ),
             progress=print,
         )
+
         steps.extend(round_steps)
         completed_rounds += 1
         save_solution(solution, args.output_xml)
@@ -1902,7 +1906,11 @@ def build_parser() -> argparse.ArgumentParser:
     native_solve.add_argument("--no-improvement-limit", type=int, default=24)
     native_solve.add_argument("--workers", type=int, default=2)
     native_solve.add_argument("--restart-rounds", type=int, default=2)
+    native_solve.add_argument("--use-lahc", action="store_true", default=False)
+    native_solve.add_argument("--lahc-capacity", type=int, default=50)
+    native_solve.add_argument("--use-markov", action="store_true", default=False)
     native_solve.set_defaults(func=cmd_native_solve)
+
 
     paper_construct = subparsers.add_parser(
         "paper-construct-solution",

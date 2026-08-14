@@ -27,6 +27,7 @@ from ..inventory import tank_events
 from ..model import Instance, Operation, Shift, Solution
 from ..rules import derive_solution, validate_solution
 from .pressure import pressure_points
+from .markov_sequence import LateAcceptanceBuffer, MarkovSequenceSelector
 from .multiroute_block import repair_pressure_multiroute_block
 from .targeted_rescue import (
     RescueConfig,
@@ -51,6 +52,10 @@ class SurgicalSearchConfig:
     first_operator: str | None = None
     output_xml: str | None = None
     coverage_include_ejection: bool = True
+    use_lahc: bool = False
+    lahc_capacity: int = 50
+    use_markov_sequence: bool = False
+
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,7 @@ def surgical_search(
     current = _reindex(initial)
     current_score = _score(instance, current, config.end_day)
     best = current
+    best = current
     best_score = current_score
     rewards = [1024.0] * len(OPERATORS)
     attempts = [0] * len(OPERATORS)
@@ -114,6 +120,21 @@ def surgical_search(
     stagnation = 0
     steps: list[SurgicalStep] = []
     quantity_repaired_structures: set[tuple[object, ...]] = set()
+
+    lahc_buffer = (
+        LateAcceptanceBuffer(
+            capacity=config.lahc_capacity,
+            initial_score=_scalar(current_score),
+        )
+        if config.use_lahc
+        else None
+    )
+    markov_selector = (
+        MarkovSequenceSelector(seed=config.seed)
+        if config.use_markov_sequence
+        else None
+    )
+    last_operator_index: int | None = None
 
     for iteration in range(config.iterations):
         if deadline is not None and time.monotonic() >= deadline:
@@ -155,6 +176,13 @@ def surgical_search(
                 )
             else:
                 operator_index = OPERATORS.index("delete_operation")
+        elif markov_selector is not None:
+            if last_operator_index is not None and last_operator_index < markov_selector.n:
+                curr_markov_idx = last_operator_index % markov_selector.n
+                next_markov_idx = markov_selector.sample_next(curr_markov_idx)
+            else:
+                next_markov_idx = rng.randrange(markov_selector.n)
+            operator_index = next_markov_idx % len(OPERATORS)
         else:
             coverage_operator = _coverage_rebuild_operator(
                 instance,
@@ -171,6 +199,7 @@ def surgical_search(
                     feasibility_bias=not best_score.feasible,
                 )
         operator = OPERATORS[operator_index]
+
         if progress:
             progress(
                 f"surgical_start,{iteration},operator,{operator},"
@@ -666,7 +695,18 @@ def surgical_search(
                     )
                 )
             )
-            accepted = structural_gateway or ordinary_gateway
+            if lahc_buffer is not None:
+                lahc_accepted, lahc_thresh = lahc_buffer.assess_and_record(_scalar(move_score))
+                lahc_gateway = (
+                    lahc_accepted
+                    and candidate_structural <= structural_errors
+                    and _hard_invariants_not_worse(
+                        current_vector, move_vector,
+                    )
+                )
+            else:
+                lahc_gateway = False
+            accepted = structural_gateway or ordinary_gateway or lahc_gateway
         if accepted:
             current, current_score = move_candidate, move_score
         current_best_vector = violation_vector(instance, current)
@@ -701,8 +741,20 @@ def surgical_search(
             # which permits multi-step repairs across a neutral/worse bridge.
             if accepted and move_structural is None and rng.randrange(4) == 0:
                 current, current_score = best, best_score
+
+        if markov_selector is not None:
+            if last_operator_index is not None:
+                src_name = OPERATORS[last_operator_index]
+                dst_name = OPERATORS[operator_index]
+                if accepted:
+                    markov_selector.reward_sequence([src_name, dst_name], is_best=improved_best)
+            if iteration % 32 == 0:
+                markov_selector.decay_matrix()
+        last_operator_index = operator_index
+
         attempts[operator_index] += 1
         last_used[operator_index] = iteration
+
 
         step = SurgicalStep(
             iteration, operator, evaluated, accepted,
