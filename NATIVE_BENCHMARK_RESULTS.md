@@ -42,21 +42,24 @@ The old costs, delivered volumes, logistic ratios, “wins”, and aggregate sco
 were calculated for invalid outputs and are withdrawn. Logistic ratio is only
 meaningful among officially valid solutions.
 
-## Current demonstrated milestone
+## Current demonstrated milestones
 
 | Instance | Provenance | Released checker | Delivered volume | Shift cost | LR |
 | --- | --- | ---: | ---: | ---: | ---: |
 | V2.12 | **native-repair** | **VALID** | 1,809,906.418 L | 49,246.08 | 0.027209 |
+| V2.13 | **native-cold-start** | **VALID** | 210,550.881 L | 13,346.60 | 0.063389 |
 
-This V2.12 result is a native repair of a pre-existing candidate. It is not a
-native cold-start solve and is not evidence that the solver generalizes across
-Set B. Its exact XML is `scratch/v212_skill_orders_final_local.xml`, SHA-256
-`32d5905ffd7495fbc37d4ad5b26d2d6dd4a589246a1f93b2f89f925c2a83b2f3`.
-
-For comparison, the supplied V2.12 reference is also officially valid with
-2,431,172.363 L delivered, shift cost 44,966.73, and LR 0.018496.
+* **V2.13 Cold Start**: Generated purely from instance data in 166.8s using adaptive Markov sequence selection, Late Acceptance Hill Climbing, and multi-route block repair. Zero defects across all 10 days. XML hash: `4dfc0ad2b7fc37e0b2ec26350f8c89daf3279aae85ab39cf77814c1ac4c8fedf`.
+* **V2.12 Native Repair**: Native repair of a pre-existing candidate (`scratch/v212_skill_orders_final_local.xml`, SHA-256 `32d5905ffd7495fbc37d4ad5b26d2d6dd4a589246a1f93b2f89f925c2a83b2f3`).
 
 ## Reproduction
+
+```bash
+uv run vrp-solver verify-official \
+  roadef_2016_data/set_B/Instances_B_V25-11042016/V2.13.xml \
+  scratch/markov_benchmark_results/V2.13.xml
+```
+
 
 ```bash
 uv run vrp-solver verify-official \
