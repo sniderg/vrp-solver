@@ -417,9 +417,10 @@ def generate_rescue_candidates(
                 )
             )
             continue
-        breach_minute = _first_breach_minute(instance, baseline, customer_id, event_cache)
+        breach_minute = _first_breach_minute(instance, baseline, customer_id, event_cache, min_minute=start_minute)
         if breach_minute is None:
             continue
+
         # When extending a solution (breach at or before the new window start),
         # the customer needs service throughout the new window.
         if breach_minute <= start_minute + instance.unit:
@@ -2053,12 +2054,14 @@ def _first_breach_minute(
     solution: Solution,
     customer_id: int,
     event_cache: dict[int, list] | None = None,
+    min_minute: int = 0,
 ) -> int | None:
     events = event_cache.get(customer_id, ()) if event_cache is not None else tank_events(instance, solution)
     for event in events:
-        if event.point == customer_id and event.safety_breach:
+        if event.point == customer_id and event.safety_breach and event.time_start >= min_minute:
             return event.time_start
     return None
+
 
 
 def _inventory_at_arrival(
