@@ -47,7 +47,16 @@ def pressure_points(
             continue
         deficit = max(0.0, event.safety_level - event.ending_inventory)
         overfill = max(0.0, event.ending_inventory - event.capacity) if include_overfill else 0.0
-        if deficit <= EPSILON and overfill <= EPSILON:
+        # Soft terminal pressure: in the final 3 days of the evaluation horizon,
+        # flag tanks running close to safety (< safety + 25% usable capacity) so
+        # candidate generation keeps proposing replenishment shifts right up to the boundary.
+        near_horizon = (event.time_start >= cutoff_minute - 3 * MINUTES_PER_DAY)
+        terminal_urgency = (
+            max(0.0, (event.safety_level + 0.25 * (customer.capacity - event.safety_level)) - event.ending_inventory)
+            if near_horizon
+            else 0.0
+        )
+        if deficit <= EPSILON and overfill <= EPSILON and terminal_urgency <= EPSILON:
             continue
         data = by_customer.setdefault(
             event.point,
@@ -60,10 +69,11 @@ def pressure_points(
             },
         )
         data["first"] = min(data["first"], float(event.time_start))
-        data["area"] += deficit * instance.unit + overfill * instance.unit
-        data["safety"] += 1.0 if deficit > EPSILON else 0.0
+        data["area"] += (deficit + terminal_urgency) * instance.unit + overfill * instance.unit
+        data["safety"] += 1.0 if (deficit > EPSILON or terminal_urgency > EPSILON) else 0.0
         data["negative"] += 1.0 if event.ending_inventory < -EPSILON else 0.0
         data["overfill"] += 1.0 if overfill > EPSILON else 0.0
+
 
     # A call-in has no inventory trajectory, so it was previously invisible
     # to every destroy/repair operator.  Treat an unmet flexible minimum as a
