@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 
 @dataclass(frozen=True)
@@ -81,12 +82,14 @@ class Instance:
     def latest_time(self) -> int:
         return (self.horizon + 1) * self.unit
 
-    @property
+    @cached_property
     def customer_by_point(self) -> dict[int, Customer]:
+        """Return the immutable instance's customer lookup, built once."""
         return {customer.index: customer for customer in self.customers}
 
-    @property
+    @cached_property
     def source_by_point(self) -> dict[int, Source]:
+        """Return the immutable instance's source lookup, built once."""
         return {source.index: source for source in self.sources}
 
     def point_kind(self, point: int) -> str:

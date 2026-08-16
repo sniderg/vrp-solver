@@ -12,6 +12,8 @@ from vrp_solver.model import (
 from vrp_solver.rules import validate_solution
 from vrp_solver.solver.surgical_search import _early_pressure_insertion_target
 from vrp_solver.solver.surgical_search import _candidate_frontier
+from vrp_solver.solver.surgical_search import _narrow_window_pressures
+from vrp_solver.solver.pressure import PressurePoint
 
 
 def test_joint_block_timing_moves_a_resource_successor_with_its_predecessor() -> None:
@@ -109,6 +111,43 @@ def test_pressure_block_substitution_replaces_optional_vmi_stop() -> None:
 
     assert candidates
     assert candidates[0].shifts[0].operations[0].point == 2
+
+
+def test_pressure_block_substitution_can_replace_a_reload_slot() -> None:
+    instance = Instance(
+        name="joint-reload-substitute", unit=60, horizon=4,
+        time_matrix=((0, 10), (10, 0)),
+        distance_matrix=((0.0, 1.0), (1.0, 0.0)), base_index=0,
+        drivers=(Driver(0, 0, 120, (0,), (TimeWindow(0, 300),), 60, 0.0, 0.0),),
+        trailers=(Trailer(0, 1_000.0, 1_000.0, 0.0),),
+        sources=(Source(0, (0,), 0),),
+        customers=(Customer(1, False, False, (), 0, (TimeWindow(0, 300),), (0,), (0.0,) * 4, 1_000.0, 1_000.0, 1.0, 0.0),),
+    )
+    solution = Solution((Shift(0, 0, 0, 0, (Operation(0, 10, -100.0),)),))
+
+    candidates = generate_pressure_block_substitutions(
+        instance, solution, customer_point=1, first_minute=50,
+    )
+
+    assert candidates
+    assert candidates[0].shifts[0].operations[0].point == 1
+
+
+def test_hard_pressure_ranks_before_soft_terminal_headroom() -> None:
+    instance = Instance(
+        name="pressure-order", unit=60, horizon=4,
+        time_matrix=((0, 10, 10), (10, 0, 10), (10, 10, 0)),
+        distance_matrix=((0.0, 1.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 0.0)),
+        base_index=0, drivers=(), trailers=(), sources=(),
+        customers=(
+            Customer(1, False, False, (), 0, (TimeWindow(0, 300),), (), (0.0,) * 4, 1_000.0, 1_000.0, 1.0, 0.0),
+            Customer(2, False, False, (), 0, (TimeWindow(0, 300),), (), (0.0,) * 4, 1_000.0, 1_000.0, 1.0, 0.0),
+        ),
+    )
+    soft = PressurePoint(1, 20, 10_000.0, 20, 0, 0, 0, 0, 0.0)
+    hard = PressurePoint(2, 200, 1.0, 1, 0, 0, 1, 0, 0.0)
+
+    assert _narrow_window_pressures(instance, (soft, hard))[0] == hard
 
 
 def test_candidate_frontier_keeps_late_topology_families_in_budget() -> None:

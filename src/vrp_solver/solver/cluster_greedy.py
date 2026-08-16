@@ -13,6 +13,7 @@ from ..inventory import (
 )
 from ..model import Customer, Instance, Operation, Shift, Solution, TimeWindow
 from ..rules import (
+    derive_solution,
     is_driving_duration_valid,
     is_time_window_valid,
     is_trailer_allowed,
@@ -59,6 +60,32 @@ class ClusterConstructionPolicy:
 
     neighborhood_size: int
     global_pressure_fill: int
+
+
+def compatible_resource_chain_count(instance: Instance, customer: Customer) -> int:
+    """Count static driver-trailer-source chains capable of serving a customer.
+
+    This is deliberately a conservative preprocessing metric. Dynamic window
+    occupancy is handled by candidate construction, while this count prevents
+    scarce compatible chains from losing every early tie to flexible demand.
+    """
+    allowed_trailers = set(customer.allowed_trailers)
+    count = 0
+    for trailer in instance.trailers:
+        if allowed_trailers and trailer.index not in allowed_trailers:
+            continue
+        source_count = sum(
+            1 for source in instance.sources
+            if trailer.index in source.allowed_trailers
+        )
+        if source_count == 0:
+            continue
+        driver_count = sum(
+            1 for driver in instance.drivers
+            if trailer.index in driver.trailer_ids and driver.time_windows
+        )
+        count += source_count * driver_count
+    return count
 
 
 def derive_cluster_construction_policy(instance: Instance) -> ClusterConstructionPolicy:
@@ -133,13 +160,23 @@ def construct_cluster_solution(
     terminal_preload: bool = True,
     first_stop_targeted: bool = True,
     prioritize_early_callins: bool = True,
+    need_ordering: str = "scarcity",
+    long_window_urgency_override: bool = True,
+    proactive_reload_ratio: float = PROACTIVE_RELOAD_RATIO,
+    initial_solution: Solution | None = None,
+    rolling_callin_reservation: bool = False,
 ) -> tuple[Solution, ConstructionReport]:
+    if need_ordering not in {"scarcity", "urgency-band"}:
+        raise ValueError(f"unsupported need ordering: {need_ordering}")
+    if not 0.0 <= proactive_reload_ratio <= 1.0:
+        raise ValueError("proactive_reload_ratio must be between zero and one")
     policy = derive_cluster_construction_policy(instance)
     if neighborhood_size is None:
         neighborhood_size = policy.neighborhood_size
     if global_pressure_fill is None:
         global_pressure_fill = policy.global_pressure_fill
-    drivers, trailers = _initial_resources(instance)
+    prefix = initial_solution or Solution(())
+    drivers, trailers = _resources_after_prefix(instance, prefix)
     scheduled: dict[int, dict[int, float]] = {customer.index: {} for customer in instance.customers}
     ignore_before_step: dict[int, int] = {customer.index: 0 for customer in instance.customers}
     planned_volume_by_day: dict[int, float] = {}
@@ -149,8 +186,21 @@ def construct_cluster_solution(
     # customer's delivery dictionary changes, so retain the exact ending
     # levels for the duration of this construction.
     inventory_cache: dict[tuple[int, tuple[tuple[int, float], ...]], tuple[float, ...]] = {}
-    shifts: list[Shift] = []
+    shifts: list[Shift] = list(prefix.shifts)
     exhausted_resources = False
+
+    for shift in prefix.shifts:
+        for operation in shift.operations:
+            if operation.quantity <= EPSILON or operation.point not in scheduled:
+                continue
+            deliveries = scheduled[operation.point]
+            deliveries[operation.arrival] = (
+                deliveries.get(operation.arrival, 0.0) + operation.quantity
+            )
+            day = operation.arrival // 1440
+            planned_volume_by_day[day] = (
+                planned_volume_by_day.get(day, 0.0) + operation.quantity
+            )
 
     neighborhoods = _compute_neighborhoods(instance, k=neighborhood_size)
     tie_break = None
@@ -161,6 +211,17 @@ def construct_cluster_solution(
         customer.index: min(
             instance.time_matrix[source.index][customer.index]
             for source in instance.sources
+        )
+        for customer in instance.customers
+    }
+    compatible_chain_counts = {
+        customer.index: compatible_resource_chain_count(instance, customer)
+        for customer in instance.customers
+    }
+    compatible_driver_counts = {
+        customer.index: sum(
+            1 for driver in instance.drivers
+            if set(driver.trailer_ids) & set(customer.allowed_trailers)
         )
         for customer in instance.customers
     }
@@ -182,15 +243,6 @@ def construct_cluster_solution(
             score_cutoff_minute if score_cutoff_minute is not None else 3 * 1440,
             3 * 1440,
         )
-        callin_driver_scarcity = {
-            customer.index: sum(
-                1
-                for driver in instance.drivers
-                if set(driver.trailer_ids) & set(customer.allowed_trailers)
-            )
-            for customer, _ in all_needs
-            if customer.call_in
-        }
         # Breaches separated by only one or two planning buckets compete for
         # the same outgoing shift.  Treat that as a tie and favour the smaller
         # tank: it has less recovery room if a neighbouring, larger tank gets
@@ -203,8 +255,8 @@ def construct_cluster_solution(
             ),
             default=0,
         )
-        all_needs.sort(
-            key=lambda item: (
+        def common_priority(item):
+            return (
                 (
                     0
                     if (
@@ -216,23 +268,43 @@ def construct_cluster_solution(
                         if (
                             prioritize_early_callins
                             and item[0].call_in
-                            and (item[1] + 1) * instance.unit <= early_callin_limit
+                            and (
+                                (item[1] + 1) * instance.unit <= early_callin_limit
+                                or (
+                                    rolling_callin_reservation
+                                    and score_cutoff_minute is not None
+                                    and (item[1] + 1) * instance.unit
+                                    <= score_cutoff_minute + 1440
+                                )
+                            )
                         )
                         else 1
                     )
                 ),
-                callin_driver_scarcity.get(item[0].index, len(instance.drivers) + 1),
-                (
-                    0
-                    if item[0].call_in
-                    else max(0, item[1] - first_vmi_breach - 2)
-                ),
+            )
+
+        if need_ordering == "urgency-band":
+            all_needs.sort(
+                key=lambda item: common_priority(item) + (
+                    compatible_driver_counts[item[0].index]
+                    if item[0].call_in else len(instance.drivers) + 1,
+                    0 if item[0].call_in else max(0, item[1] - first_vmi_breach - 2),
+                    item[1],
+                    item[0].capacity,
+                    0.0 if tie_break is None else tie_break[item[0].index],
+                    item[0].index,
+                )
+            )
+        else:
+            all_needs.sort(
+                key=lambda item: common_priority(item) + (
+                compatible_chain_counts[item[0].index],
+                0.0 if tie_break is None else tie_break[item[0].index],
                 item[1],
                 item[0].capacity,
-                0.0 if tie_break is None else tie_break[item[0].index],
                 item[0].index,
+                )
             )
-        )
 
         ranked_vmi_pressure = tuple(
             customer.index
@@ -255,6 +327,29 @@ def construct_cluster_solution(
         selected_resource = None
         for start_time, driver_state_index, trailer_state_index, window_index, window, resource in next_window_infos:
             target_needs = all_needs
+            driver_obj = instance.drivers[resource.driver]
+            if (
+                long_window_urgency_override
+                and any(tw.end - tw.start > 1440 for tw in driver_obj.time_windows)
+            ):
+                target_needs = sorted(
+                    all_needs,
+                    key=lambda item: (
+                        0
+                        if (
+                            rolling_callin_reservation
+                            and item[0].call_in
+                            and score_cutoff_minute is not None
+                            and (item[1] + 1) * instance.unit
+                            <= score_cutoff_minute + 1440
+                        )
+                        else 1,
+                        item[1],
+                        0 if item[0].layover_customer else 1,
+                        0 if item[0].call_in else 1,
+                        item[0].capacity,
+                    )
+                )
             for target_customer, breach_step in target_needs:
                 # An expired call-in cannot be repaired by a late delivery,
                 # but an overdue VMI tank still needs service to stop the
@@ -287,6 +382,7 @@ def construct_cluster_solution(
                     limit_reload_after_empty_start,
                     terminal_preload,
                     first_stop_targeted,
+                    proactive_reload_ratio,
                 )
                 if shift:
                     selected_driver_state_index = driver_state_index
@@ -364,7 +460,14 @@ def _all_needs(instance, scheduled, ignore_before_step, score_cutoff_minute=None
 def _next_unsatisfied_order(customer, deliveries, score_cutoff_minute=None):
     """Return the next order whose required flexible minimum is outstanding."""
     for order_index, order in enumerate(customer.orders):
-        if score_cutoff_minute is not None and order.earliest_time >= score_cutoff_minute:
+        # A rolling VMI cutoff must not erase near-future contractual orders.
+        # Reserve compatible resource time through the same lookahead used by
+        # the constructor's call-in priority policy.
+        if (
+            score_cutoff_minute is not None
+            and order.earliest_time
+            >= score_cutoff_minute + 1440
+        ):
             continue
         delivered = sum(
             quantity
@@ -431,6 +534,7 @@ def _build_cluster_shift(
     limit_reload_after_empty_start,
     terminal_preload,
     first_stop_targeted,
+    proactive_reload_ratio,
 ):
     driver = instance.drivers[resource.driver]
     start = max(window.start, resource.available_time)
@@ -543,6 +647,7 @@ def _build_cluster_shift(
                     for op in operations
                 ),
                 layover_used=layover_used,
+                proactive_reload_ratio=proactive_reload_ratio,
             )
             if c:
                 if (
@@ -1158,6 +1263,7 @@ def _candidate_for_customer(
     *,
     has_layover_customer=False,
     layover_used=False,
+    proactive_reload_ratio=PROACTIVE_RELOAD_RATIO,
 ):
     if not is_trailer_allowed(instance, customer.index, resource.trailer): return None
     if customer.call_in:
@@ -1189,7 +1295,7 @@ def _candidate_for_customer(
     needs_reload = trailer_qty < customer.min_operation_quantity - EPSILON
     proactive_reload = (
         current_pt != instance.base_index
-        and trailer_qty < trailer.capacity * PROACTIVE_RELOAD_RATIO - EPSILON
+        and trailer_qty < trailer.capacity * proactive_reload_ratio - EPSILON
     )
     if needs_reload or proactive_reload:
         source_arr = time + instance.time_matrix[pt][source.index]
@@ -1226,6 +1332,30 @@ def _candidate_for_customer(
 
     layover_before = arrival - raw_arrival >= instance.drivers[resource.driver].layover_duration
     return_layover = False
+    if not layover_before and driving + total_travel + ret_travel > instance.drivers[resource.driver].max_driving_duration:
+        # Check if inserting a layover before this customer makes the route feasible
+        if not layover_used and (has_layover_customer or customer.layover_customer):
+            tentative_arrival = max(arrival, raw_arrival + instance.drivers[resource.driver].layover_duration)
+            tentative_arrival = _align_arrival_to_customer_window(customer, tentative_arrival)
+            if tentative_arrival is not None:
+                tentative_departure = tentative_arrival + customer.setup_time
+                if (
+                    tentative_departure + ret_travel <= window.end
+                    and is_time_window_valid(tentative_arrival, tentative_departure, customer.time_windows)
+                ):
+                    driving_before_last_leg = driving + travel
+                    if is_driving_duration_valid(instance.drivers[resource.driver], driving_before_last_leg):
+                        last_leg = instance.time_matrix[pt][customer.index]
+                        driving_before_layover = min(
+                            max(0, instance.drivers[resource.driver].max_driving_duration - driving_before_last_leg),
+                            last_leg,
+                        )
+                        driving_after = last_leg - driving_before_layover
+                        if is_driving_duration_valid(instance.drivers[resource.driver], driving_after + ret_travel):
+                            arrival = tentative_arrival
+                            departure = tentative_departure
+                            layover_before = True
+
     if layover_before:
         if layover_used or not (has_layover_customer or customer.layover_customer):
             return None
@@ -1308,6 +1438,11 @@ def _candidate_for_call_in(
     has_layover_customer=False,
     layover_used=False,
 ):
+    callin_cutoff_minute = (
+        None
+        if score_cutoff_minute is None
+        else score_cutoff_minute + 1440
+    )
     order_info = _next_unsatisfied_order(customer, deliveries, score_cutoff_minute)
     if order_info is None:
         return None
@@ -1334,7 +1469,7 @@ def _candidate_for_call_in(
     travel = 0
     if trailer_qty < min(remaining, trailer.capacity) - EPSILON:
         source_arr = time + instance.time_matrix[point][source.index]
-        if score_cutoff_minute is not None and source_arr >= score_cutoff_minute:
+        if callin_cutoff_minute is not None and source_arr >= callin_cutoff_minute:
             return None
         time = source_arr + source.setup_time
         travel += instance.time_matrix[point][source.index]
@@ -1347,7 +1482,7 @@ def _candidate_for_call_in(
     arrival = _align_arrival_to_customer_window(customer, arrival)
     if arrival is None:
         return None
-    if score_cutoff_minute is not None and arrival >= score_cutoff_minute:
+    if callin_cutoff_minute is not None and arrival >= callin_cutoff_minute:
         return None
     if arrival > order.latest_time:
         return None
@@ -1455,6 +1590,28 @@ def _initial_resources(instance):
         )
         for trailer in instance.trailers
     ]
+    return drivers, trailers
+
+
+def _resources_after_prefix(instance: Instance, prefix: Solution):
+    """Reconstruct exact resource state for protected-prefix continuation."""
+    drivers, trailers = _initial_resources(instance)
+    if not prefix.shifts:
+        return drivers, trailers
+
+    derived = derive_solution(instance, prefix)
+    by_driver = {state.driver: state for state in drivers}
+    by_trailer = {state.trailer: state for state in trailers}
+    for item in sorted(derived, key=lambda value: (value.shift.start, value.shift.index)):
+        driver = instance.drivers[item.shift.driver]
+        driver_state = by_driver[item.shift.driver]
+        trailer_state = by_trailer[item.shift.trailer]
+        driver_state.available_time = max(
+            driver_state.available_time,
+            item.end + driver.min_inter_shift_duration,
+        )
+        trailer_state.available_time = max(trailer_state.available_time, item.end)
+        trailer_state.trailer_quantity = item.end_trailer_quantity
     return drivers, trailers
 
 def _first_breach_step(instance, customer, deliveries, min_step=0, *, cache=None):

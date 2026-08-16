@@ -26,6 +26,23 @@ def test_rejects_empty_seed_budget() -> None:
         unified_engine.solve_cold_start(_instance(), num_seeds=0)
 
 
+def test_constructor_portfolio_uses_structural_strategies_before_random_seeds() -> None:
+    portfolio = unified_engine._construction_portfolio(4)
+
+    assert [strategy.name for strategy in portfolio] == [
+        "urgency-band",
+        "urgency-band-narrow",
+        "urgency-band-dense-reload",
+        "scarcity-chain",
+    ]
+    assert portfolio[0].long_window_urgency_override is False
+    assert portfolio[1].neighborhood_size == 3
+    assert portfolio[2].neighborhood_size == 4
+    assert portfolio[2].long_window_urgency_override is True
+    assert portfolio[2].proactive_reload_ratio == pytest.approx(0.48)
+    assert portfolio[3].need_ordering == "scarcity"
+
+
 def test_connects_constructor_quantity_repair_and_search(monkeypatch) -> None:
     instance = _instance()
     raw = Solution(())

@@ -9,6 +9,7 @@ boundaries.
 from __future__ import annotations
 
 from dataclasses import replace
+import time
 
 import numpy as np
 
@@ -84,6 +85,7 @@ def generate_pressure_block_insertions(
     radius: int = 4_320,
     max_candidates: int = 24,
     max_block_shifts: int = 5,
+    deadline: float | None = None,
 ) -> list[Solution]:
     """Insert an early VMI duplicate into nearby compatible route chains.
 
@@ -106,10 +108,14 @@ def generate_pressure_block_insertions(
     ]
     recipients.sort(key=lambda shift: (abs(shift.start - first_minute), shift.start, shift.index))
     for recipient in recipients:
+        if deadline is not None and time.monotonic() >= deadline:
+            return candidates
         # Try internal gaps first: this is where waiting time can absorb a
         # delivery even when the route tail is saturated.
         positions = list(range(1, len(recipient.operations))) + [0, len(recipient.operations)]
         for position in positions:
+            if deadline is not None and time.monotonic() >= deadline:
+                return candidates
             patterns = [(Operation(customer_point, first_minute, seed_quantity),)]
             # A duplicate visit without a preceding load may be a useful
             # insertion in an already-loaded segment.  Also enumerate an
@@ -192,12 +198,17 @@ def generate_pressure_block_substitutions(
         if shift.trailer in target.allowed_trailers
         for position, operation in enumerate(shift.operations)
         if (
-            operation.point in instance.customer_by_point
-            and operation.point != customer_point
+            operation.point != customer_point
             and operation.arrival <= first_minute
             and first_minute - operation.arrival <= radius
-            and not instance.customer_by_point[operation.point].call_in
-            and not instance.customer_by_point[operation.point].layover_customer
+            and (
+                operation.point in instance.source_by_point
+                or (
+                    operation.point in instance.customer_by_point
+                    and not instance.customer_by_point[operation.point].call_in
+                    and not instance.customer_by_point[operation.point].layover_customer
+                )
+            )
         )
     ]
     slots.sort(key=lambda item: (abs(item[0].operations[item[1]].arrival - first_minute), item[0].start, item[0].index))
@@ -240,6 +251,7 @@ def generate_pressure_substitution_ejections(
     first_minute: int,
     radius: int = 4_320,
     max_candidates: int = 24,
+    deadline: float | None = None,
 ) -> list[Solution]:
     """Replace an optional stop, then relocate it into a second route.
 
@@ -262,6 +274,8 @@ def generate_pressure_substitution_ejections(
     ]
     slots.sort(key=lambda item: abs(item[0].operations[item[1]].arrival - first_minute))
     for donor, donor_pos in slots[:12]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return result
         displaced = donor.operations[donor_pos]
         displaced_customer = instance.customer_by_point[displaced.point]
         donor_ops = list(donor.operations)
@@ -270,11 +284,15 @@ def generate_pressure_substitution_ejections(
             max(target.min_operation_quantity, 10.0e-6),
         )
         for recipient in solution.shifts:
+            if deadline is not None and time.monotonic() >= deadline:
+                return result
             if recipient.index == donor.index or recipient.trailer not in displaced_customer.allowed_trailers:
                 continue
             if abs(recipient.start - displaced.arrival) > radius:
                 continue
             for position in range(len(recipient.operations) + 1):
+                if deadline is not None and time.monotonic() >= deadline:
+                    return result
                 patterns = [(displaced,)]
                 patterns.extend(
                     (

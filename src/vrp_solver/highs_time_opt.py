@@ -26,15 +26,38 @@ def try_optimize_shift_times(
     if candidate is not None:
         return candidate
 
-    # A represented layover is a gap of layover_duration before an operation,
-    # taken after service at an eligible customer. Enumerate the bounded set
-    # of legal split positions instead of adding a fragile big-M choice to
-    # every timing model.
+    # A driver may reach a layover customer early and take the represented
+    # rest while waiting for that customer's service window.  This is a
+    # distinct, common route pattern: the layover precedes operation zero,
+    # rather than sitting between two operations.  The deterministic replay
+    # already recognises this gap, so the timing model must be able to create
+    # it as well.
+    first_customer = instance.customer_by_point.get(shift.operations[0].point)
+    if first_customer is not None and first_customer.layover_customer:
+        candidate = _try_optimize_shift_times(
+            instance,
+            shift,
+            latest_end=latest_end,
+            layover_before_index=0,
+        )
+        if candidate is not None:
+            return candidate
+
+    # Replay represents a layover as excess time before the current operation.
+    # That gap can be spent after service at the previous layover site or
+    # while waiting to begin service at the current layover site. Enumerate
+    # both legal interpretations instead of adding a fragile big-M choice.
     for operation_index in range(1, len(shift.operations)):
-        previous = instance.customer_by_point.get(
+        previous_customer = instance.customer_by_point.get(
             shift.operations[operation_index - 1].point,
         )
-        if previous is None or not previous.layover_customer:
+        current_customer = instance.customer_by_point.get(
+            shift.operations[operation_index].point,
+        )
+        if not (
+            (previous_customer is not None and previous_customer.layover_customer)
+            or (current_customer is not None and current_customer.layover_customer)
+        ):
             continue
         candidate = _try_optimize_shift_times(
             instance,
@@ -113,7 +136,14 @@ def _try_optimize_shift_times(
         
     # 3. For each operation i, exactly one window must be selected:
     # sum_{w} y_{i, w} = 1
-    M = 30000.0
+    # Inactive periodic windows must be relaxed across the *entire* instance
+    # horizon.  A fixed 30,000-minute bound silently makes early operations
+    # infeasible on the 35-day instances because their late windows still
+    # impose positive lower bounds when deselected.
+    M = float(instance.latest_time + max(
+        (instance.setup_time_for_point(op.point) for op in shift.operations),
+        default=0,
+    ))
     for i, op in enumerate(shift.operations):
         setup = instance.setup_time_for_point(op.point)
         windows = operation_windows[i]
@@ -138,10 +168,14 @@ def _try_optimize_shift_times(
         
         if i == 0:
             # a_0 >= shift.start + travel
-            highs.changeColBounds(a_idx, shift.start + travel, inf)
-            # To ensure 0 layovers, the gap from shift.start to first arrival must be < layover_duration + travel
-            # a_0 - shift.start <= driver.layover_duration + travel - 1
-            highs.addRow(-inf, shift.start + driver.layover_duration + travel - 1, 1, np.array([a_idx], dtype=np.int32), np.array([1.0], dtype=np.float64))
+            minimum_gap = travel + (
+                driver.layover_duration if layover_before_index == 0 else 0
+            )
+            highs.changeColBounds(a_idx, shift.start + minimum_gap, inf)
+            if layover_before_index != 0:
+                # To ensure zero layovers, the gap from shift start to first
+                # arrival must remain below the replay layover threshold.
+                highs.addRow(-inf, shift.start + driver.layover_duration + travel - 1, 1, np.array([a_idx], dtype=np.int32), np.array([1.0], dtype=np.float64))
         else:
             prev_idx = i - 1
             prev_setup = instance.setup_time_for_point(shift.operations[i-1].point)

@@ -1777,9 +1777,6 @@ def _append_customer_segment(
         customer = instance.customer_by_point[customer_id]
         arrival = current_time + instance.time_matrix[current_point][customer_id]
         departure = arrival + customer.setup_time
-        breach_minute = _first_breach_minute(instance, baseline, customer_id, event_cache)
-        if breach_minute is not None and arrival >= breach_minute:
-            continue
         if departure >= end_minute:
             continue
         if not is_time_window_valid(arrival, departure, customer.time_windows):
@@ -1925,9 +1922,6 @@ def _build_chain_shift(
             current_point = source_id
         arrival = current_time + instance.time_matrix[current_point][customer_id]
         departure = arrival + customer.setup_time
-        breach_minute = _first_breach_minute(instance, baseline, customer_id, event_cache)
-        if breach_minute is not None and arrival >= breach_minute:
-            continue
         if departure >= end_minute:
             continue
         if not is_time_window_valid(arrival, departure, customer.time_windows):

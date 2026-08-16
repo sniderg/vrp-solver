@@ -41,6 +41,17 @@ class SolverResult:
     unique_constructed: int = 0
     quantity_repairs: int = 0
     search_steps: int = 0
+    construction_strategy: str | None = None
+
+
+@dataclass(frozen=True)
+class _ConstructionStrategy:
+    name: str
+    seed: int = 0
+    need_ordering: str = "scarcity"
+    neighborhood_size: int | None = None
+    long_window_urgency_override: bool = True
+    proactive_reload_ratio: float = 0.40
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,45 @@ class _Candidate:
     vector: ViolationVector
     unscheduled: int
     seed: int
+    strategy: str
+
+
+def _construction_portfolio(num_seeds: int) -> tuple[_ConstructionStrategy, ...]:
+    """Return deterministic structural strategies before random restarts.
+
+    A random tie break is not a substitute for a different construction
+    basin. These entries are general policies and depend on no instance name,
+    customer ID, or copied route.
+    """
+    core = (
+        _ConstructionStrategy(
+            name="urgency-band",
+            need_ordering="urgency-band",
+            long_window_urgency_override=False,
+        ),
+        _ConstructionStrategy(
+            name="urgency-band-narrow",
+            need_ordering="urgency-band",
+            neighborhood_size=3,
+            long_window_urgency_override=False,
+        ),
+        _ConstructionStrategy(
+            name="urgency-band-dense-reload",
+            need_ordering="urgency-band",
+            neighborhood_size=4,
+            long_window_urgency_override=True,
+            proactive_reload_ratio=0.48,
+        ),
+        _ConstructionStrategy(name="scarcity-chain"),
+    )
+    strategies = list(core[:num_seeds])
+    random_seed = 1
+    while len(strategies) < num_seeds:
+        strategies.append(_ConstructionStrategy(
+            name=f"scarcity-chain-seed-{random_seed}", seed=random_seed,
+        ))
+        random_seed += 1
+    return tuple(strategies)
 
 
 def solve_cold_start(
@@ -83,11 +133,16 @@ def solve_cold_start(
     constructed: list[_Candidate] = []
     seen: set[str] = set()
     seeds_attempted = 0
-    for seed in range(num_seeds):
-        if seed > 0 and time.monotonic() >= deadline:
+    for attempt, strategy in enumerate(_construction_portfolio(num_seeds)):
+        if attempt > 0 and time.monotonic() >= deadline:
             break
         solution, report = construct_cluster_solution(
-            instance, tie_break_seed=seed,
+            instance,
+            tie_break_seed=strategy.seed,
+            need_ordering=strategy.need_ordering,
+            neighborhood_size=strategy.neighborhood_size,
+            long_window_urgency_override=strategy.long_window_urgency_override,
+            proactive_reload_ratio=strategy.proactive_reload_ratio,
         )
         seeds_attempted += 1
         fingerprint = solution_fingerprint(solution)
@@ -98,7 +153,8 @@ def solve_cold_start(
             solution=solution,
             vector=violation_vector(instance, solution),
             unscheduled=len(report.unscheduled_customers),
-            seed=seed,
+            seed=strategy.seed,
+            strategy=strategy.name,
         )
         constructed.append(candidate)
         if stop_when_feasible and candidate.vector.locally_feasible:
@@ -108,11 +164,12 @@ def solve_cold_start(
     # a horizon-long stockout.  Preserve a small, diverse frontier ordered by
     # the structured full-replay diagnostic instead.
     constructed.sort(key=lambda item: (
-        item.vector.key(), item.unscheduled, _local_ratio(instance, item.solution, horizon_days), item.seed,
+        item.vector.key(), item.unscheduled, _local_ratio(instance, item.solution, horizon_days), item.strategy,
     ))
     frontier = constructed[:frontier_size]
     best = frontier[0].solution
     best_unscheduled = frontier[0].unscheduled
+    best_strategy = frontier[0].strategy
     best_key = _candidate_key(instance, best, best_unscheduled, horizon_days)
 
     quantity_repairs = 0
@@ -136,10 +193,13 @@ def solve_cold_start(
             continue
         key = _candidate_key(instance, repaired, item.unscheduled, horizon_days)
         if key < best_key:
-            best, best_unscheduled, best_key = repaired, item.unscheduled, key
+            best, best_unscheduled, best_strategy, best_key = (
+                repaired, item.unscheduled, item.strategy, key,
+            )
         if stop_when_feasible and violation_vector(instance, repaired).locally_feasible:
             best = repaired
             best_unscheduled = item.unscheduled
+            best_strategy = item.strategy
             best_key = key
             break
 
@@ -149,15 +209,33 @@ def solve_cold_start(
     steps = ()
     remaining = deadline - time.monotonic()
     if search_iterations > 0 and remaining > 0 and not violation_vector(instance, best).locally_feasible:
+        best_vector = violation_vector(instance, best)
+        safety_only = (
+            best_vector.non_finite_values == 0
+            and best_vector.reference_errors == 0
+            and best_vector.physical_errors == 0
+            and best_vector.missed_orders == 0
+            and best_vector.negative_quantity_minutes == 0
+            and best_vector.overfill_quantity_minutes == 0
+            and best_vector.resource_timing_errors == 0
+            and best_vector.other_errors == 0
+            and best_vector.safety_deficit_quantity_minutes > 0
+        )
         searched, steps = surgical_search(
             instance,
             best,
             config=SurgicalSearchConfig(
                 end_day=horizon_days,
                 iterations=search_iterations,
-                seed=frontier[0].seed,
+                seed=next(
+                    item.seed for item in frontier
+                    if item.strategy == best_strategy
+                ),
                 time_limit_seconds=remaining,
                 workers=max(1, search_workers),
+                first_operator=(
+                    "pressure_band_resource_block" if safety_only else None
+                ),
             ),
             progress=None,
         )
@@ -181,6 +259,7 @@ def solve_cold_start(
         unique_constructed=len(constructed),
         quantity_repairs=quantity_repairs,
         search_steps=len(steps),
+        construction_strategy=best_strategy,
     )
 
 

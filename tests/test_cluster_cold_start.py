@@ -12,6 +12,7 @@ from vrp_solver.solver.cluster_greedy import (
     _next_unsatisfied_order,
     _paper_customer_candidate,
     _preload_terminal_source,
+    compatible_resource_chain_count,
     construct_paper_solution,
 )
 from vrp_solver.rules import validate_solution
@@ -77,6 +78,27 @@ def test_terminal_source_preload_carries_inventory_to_next_shift(base_instance) 
     assert operations[-1] == Operation(point=0, arrival=190, quantity=-20_000.0)
     assert resource.trailer_quantity == 20_000.0
     assert end == 220
+
+
+def test_compatible_resource_chain_count_prices_full_chain_scarcity(base_instance) -> None:
+    flexible_driver = replace(
+        base_instance.drivers[0], index=1, trailer_ids=(0, 1),
+    )
+    flexible_trailer = replace(base_instance.trailers[0], index=1)
+    flexible_source = replace(
+        base_instance.sources[0], allowed_trailers=(0, 1),
+    )
+    instance = replace(
+        base_instance,
+        drivers=(base_instance.drivers[0], flexible_driver),
+        trailers=(base_instance.trailers[0], flexible_trailer),
+        sources=(flexible_source,),
+    )
+    scarce = replace(base_instance.customers[0], allowed_trailers=(0,))
+    flexible = replace(base_instance.customers[0], allowed_trailers=(0, 1))
+
+    assert compatible_resource_chain_count(instance, scarce) == 2
+    assert compatible_resource_chain_count(instance, flexible) == 3
 
 
 def test_layover_customer_allows_economic_wait_and_resets_driving(base_instance) -> None:
@@ -148,7 +170,7 @@ def test_customer_window_wait_uses_next_opening(base_instance) -> None:
     assert _align_arrival_to_customer_window(customer, 680) is None
 
 
-def test_layover_customer_cannot_create_an_unrepresented_return_rest(base_instance) -> None:
+def test_first_stop_layover_is_explicitly_represented(base_instance) -> None:
     driver = replace(base_instance.drivers[0], max_driving_duration=100, layover_duration=60)
     customer = replace(base_instance.customers[0], layover_customer=True)
     instance = replace(base_instance, drivers=(driver,), customers=(customer,))
@@ -166,7 +188,9 @@ def test_layover_customer_cannot_create_an_unrepresented_return_rest(base_instan
         buffer=0.2,
     )
 
-    assert candidate is None
+    assert candidate is not None
+    assert candidate.layover_before
+    assert candidate.arrival - candidate.travel_time >= driver.layover_duration
 
 
 def test_paper_constructor_does_not_use_a_second_layover(base_instance) -> None:

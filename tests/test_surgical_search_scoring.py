@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from vrp_solver.model import Customer, Driver, Instance, Order, Solution, Source, TimeWindow, Trailer
 from vrp_solver.diagnostics import ViolationVector
-from vrp_solver.solver.surgical_search import _hard_invariants_not_worse, _score
+from vrp_solver.solver.surgical_search import (
+    _hard_invariants_not_worse,
+    _score,
+    _search_violation_vector,
+)
 
 
 def _vector(**changes) -> ViolationVector:
@@ -88,3 +92,29 @@ def test_vmi_safety_breach_is_hard_for_surgical_acceptance() -> None:
 
     assert score.feasibility_errors == 3
     assert score.hard_violations == 3
+
+
+def test_rolling_violation_vector_ignores_uncommitted_tail() -> None:
+    instance = Instance(
+        name="rolling-prefix-vector",
+        unit=60,
+        horizon=48,
+        time_matrix=((0, 10), (10, 0)),
+        distance_matrix=((0.0, 1.0), (1.0, 0.0)),
+        base_index=0,
+        drivers=(),
+        trailers=(),
+        sources=(),
+        customers=(
+            Customer(
+                1, False, False, (), 0, (TimeWindow(0, 2_880),), (),
+                (30.0,) * 48, 2_000.0, 1_000.0, 1.0, 100.0,
+            ),
+        ),
+    )
+
+    prefix = _search_violation_vector(instance, Solution(()), end_day=1)
+    full = _search_violation_vector(instance, Solution(()), end_day=2)
+
+    assert prefix.locally_feasible
+    assert not full.locally_feasible

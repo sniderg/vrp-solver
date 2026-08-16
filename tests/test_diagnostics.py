@@ -14,7 +14,7 @@ from vrp_solver.model import (
 from vrp_solver.highs_time_opt import (
     latest_end_before_successors, try_optimize_shift_times,
 )
-from vrp_solver.rules import validate_solution
+from vrp_solver.rules import derive_solution, validate_solution
 
 
 @pytest.fixture
@@ -135,8 +135,58 @@ def test_timing_optimizer_can_represent_layover_after_eligible_customer() -> Non
     repaired = try_optimize_shift_times(instance, shift)
 
     assert repaired is not None
-    assert repaired.operations[1].arrival >= repaired.operations[0].arrival + 60 + 120
+    assert any(operation.layover_before for operation in derive_solution(
+        instance, Solution((repaired,)),
+    )[0].operations)
     assert not [v for v in validate_solution(instance, Solution((repaired,))) if v.code == "DRI03"]
+
+
+def test_timing_optimizer_relaxes_inactive_windows_across_long_horizon() -> None:
+    instance = Instance(
+        name="long-horizon-retime", unit=60, horizon=840,
+        time_matrix=((0, 10), (10, 0)),
+        distance_matrix=((0.0, 1.0), (1.0, 0.0)), base_index=0,
+        drivers=(Driver(0, 0, 120, (0,), (TimeWindow(0, 1_000),), 1_000, 0.0, 0.0),),
+        trailers=(Trailer(0, 1_000.0, 1_000.0, 0.0),),
+        sources=(Source(0, (0,), 0),),
+        customers=(Customer(
+            1, False, False, (), 0,
+            (TimeWindow(100, 200), TimeWindow(45_000, 45_100)),
+            (0,), (0.0,) * 840, 1_000.0, 0.0, 1.0, 0.0,
+        ),),
+    )
+    shift = Shift(0, 0, 0, 0, (Operation(1, 150, 1.0),))
+
+    repaired = try_optimize_shift_times(instance, shift)
+
+    assert repaired is not None
+    assert 100 <= repaired.operations[0].arrival <= 200
+
+
+def test_timing_optimizer_can_wait_for_first_layover_customer() -> None:
+    instance = Instance(
+        name="first-stop-layover", unit=60, horizon=40,
+        time_matrix=((0, 273), (273, 0)),
+        distance_matrix=((0.0, 1.0), (1.0, 0.0)), base_index=0,
+        drivers=(Driver(0, 0, 535, (0,), (TimeWindow(0, 2_000),), 600, 0.0, 0.0),),
+        trailers=(Trailer(0, 1_000.0, 1_000.0, 0.0),),
+        sources=(Source(0, (0,), 0),),
+        customers=(Customer(
+            1, True, False, (), 30, (TimeWindow(900, 1_200),),
+            (0,), (0.0,) * 40, 1_000.0, 0.0, 1.0, 0.0,
+        ),),
+    )
+    shift = Shift(0, 0, 0, 0, (Operation(1, 900, 1.0),))
+
+    repaired = try_optimize_shift_times(instance, shift)
+
+    assert repaired is not None
+    assert repaired.operations[0].arrival >= 873
+    errors = [
+        violation for violation in validate_solution(instance, Solution((repaired,)))
+        if violation.code in {"DRI03", "LAY02", "LAY03"}
+    ]
+    assert not errors
 
 
 def test_successor_boundary_includes_driver_rest_and_trailer_availability(
@@ -150,4 +200,3 @@ def test_successor_boundary_includes_driver_rest_and_trailer_availability(
     ))
 
     assert latest_end_before_successors(bounded, solution, 10) == 70
-

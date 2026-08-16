@@ -25,6 +25,34 @@ Qualification must invoke the production chain-aware constructor. Keep any
 legacy sparse/direct constructor labelled as a diagnostic baseline so an
 entry-point mismatch cannot be mistaken for poor generalisation.
 
+### Construct service requirements, not isolated visits
+
+Convert every call-in order and VMI replenishment need into a service interval
+with earliest/latest time, minimum required quantity, safe maximum at candidate
+times, pressure area if postponed, and compatible resources. A larger early
+VMI delivery may cover several later intervals; preserve that coupling for the
+quantity model.
+
+For resource-tight and scale-extreme instances, use a restricted route-column
+master. Each column records its driver/trailer, ordered operations, reloads,
+service intervals covered, arrival ranges, load-path capacity, resource
+occupancy, and cost. Minimize uncovered mandatory demand and pressure before
+route cost. Generate dense columns by regret insertion, scarcity-first anchors,
+multi-reloads, internal gaps, fragment exchange, and bounded ejection.
+
+### Price compatibility scarcity and lookahead
+
+Measure usable capacity as compatible driver-trailer-source minutes in the
+relevant time band, not free driver-days. Increase priority when a demand has
+few compatible resource chains or consuming its last feasible chain would
+strand another mandatory interval.
+
+Use rolling-horizon construction on long/resource-tight cases. Protect a
+committed prefix, optimize an overlapping lookahead, and penalize terminal
+inventory by forecast demand and future reachability. Periodically run exact
+timing and quantity repair during construction; a terminal LP cannot create
+missing routes.
+
 ## Chain-first neighbourhood search
 
 Use `select block -> destroy -> rebuild -> exact repair -> replay -> accept`.
@@ -60,17 +88,49 @@ Activation can remove every visit to a pressured customer. Price missing topolog
 
 Customer-ID probes are only for discovering mechanics or regression fixtures. Promote reusable patterns and return to native cold-start execution.
 
+## Failure-regime routing
+
+Choose mechanics from the demonstrated failure state:
+
+- Direct-construction feasible: stop immediately for feasibility-only tasks.
+- Near-feasible: small safety area with no physical/resource/order failures;
+  use pressure-band donor exchange and exact repair.
+- Moderate topology deficiency: use multi-route densification, reload movement,
+  and fragment exchange.
+- Constructor collapse: many uncovered customers, missed orders, or large
+  negative/safety areas; rebuild construction with scarcity, dense columns,
+  and rolling lookahead instead of increasing terminal repair time.
+
+Call-in count alone does not determine difficulty. Scale, compatibility
+sparsity, time-band capacity, and achievable route density interact.
+
 ## Exact repair and acceptance
 
 Block timing must choose starts, arrivals, windows, legal layovers, and enforce travel, rest, resource chains, and fixed boundaries. Per-shift retiming is insufficient for shared resources.
 
 Quantity repair must choose deliveries, source loads, and optional activation while enforcing call-ins, cumulative VMI bounds, trailer paths, and protected prefixes. Hard mode has no inventory/order/trailer slack; elastic output is diagnostic only.
 
+Before solving, screen topology for an active visit before the breach/deadline,
+sufficient cumulative compatible trailer capacity, reachable source/carried
+load, a legal resource-chain gap, and coverage for displaced mandatory demand.
+Record screen rejections separately from timing- and quantity-infeasible models.
+
+Fail closed on unknown, ambiguous, numerical, or time-limit statuses without an
+accepted incumbent. Compare HiGHS and Gurobi only under identical construction,
+seed, topology sequence, model, and budget. Add HiGHS-first fallback on
+unresolved models only after an ablation shows improved time to official
+validity; a stronger backend cannot repair absent topology.
+
 Keep feasible candidates ordered by LR and diagnostics ordered by malformed/reference errors, physical violations, missed-order deficit, negative/overfill amount-duration, safety-deficit amount-duration, resource errors, then cost. Log candidate funnels, solver statuses/times, violation vectors, topology metrics, acceptance reason, and official verdict/hash.
 
 Propagate the run deadline into topology-generation loops and every nested
 timing/quantity solve. Checking time only between outer iterations does not
 provide a real wall-time budget.
+
+Use a process-level timeout for a strict external SLA because an in-flight
+native solver call can overrun an orchestration deadline. Checkpoint after each
+instance. Recompute final coverage and diagnostics from the returned solution;
+do not expose stale constructor telemetry as final metrics.
 
 ## Set B generalisation
 

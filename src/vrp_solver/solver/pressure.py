@@ -18,6 +18,7 @@ class PressurePoint:
     safety_steps: int
     negative_steps: int
     overfill_steps: int
+    hard_steps: int = 0
     source_lead_minutes: int = 0
     cluster_accessibility: float = 0.0
 
@@ -66,6 +67,8 @@ def pressure_points(
                 "safety": 0.0,
                 "negative": 0.0,
                 "overfill": 0.0,
+                "hard": 0.0,
+                "hard_first": float("inf"),
             },
         )
         data["first"] = min(data["first"], float(event.time_start))
@@ -73,6 +76,9 @@ def pressure_points(
         data["safety"] += 1.0 if (deficit > EPSILON or terminal_urgency > EPSILON) else 0.0
         data["negative"] += 1.0 if event.ending_inventory < -EPSILON else 0.0
         data["overfill"] += 1.0 if overfill > EPSILON else 0.0
+        data["hard"] += 1.0 if (deficit > EPSILON or overfill > EPSILON) else 0.0
+        if deficit > EPSILON or overfill > EPSILON:
+            data["hard_first"] = min(data["hard_first"], float(event.time_start))
 
 
     # A call-in has no inventory trajectory, so it was previously invisible
@@ -103,27 +109,33 @@ def pressure_points(
                 continue
             data = by_customer.setdefault(
                 customer.index,
-                {"first": float(order.latest_time), "area": 0.0, "safety": 0.0, "negative": 0.0, "overfill": 0.0},
+                {"first": float(order.latest_time), "area": 0.0, "safety": 0.0, "negative": 0.0, "overfill": 0.0, "hard": 0.0, "hard_first": float("inf")},
             )
             data["first"] = min(data["first"], float(order.latest_time))
             data["area"] += missing
             data["safety"] += 1.0
+            data["hard"] += 1.0
+            data["hard_first"] = min(data["hard_first"], float(order.latest_time))
 
     return tuple(
         PressurePoint(
             customer=customer,
-            first_minute=int(data["first"]),
+            first_minute=int(
+                data["hard_first"] if data["hard"] > 0 else data["first"]
+            ),
             deficit_area=data["area"],
             safety_steps=int(data["safety"]),
             negative_steps=int(data["negative"]),
             overfill_steps=int(data["overfill"]),
+            hard_steps=int(data["hard"]),
             source_lead_minutes=int(source_lead.get(customer, 0)),
             cluster_accessibility=_cluster_accessibility(instance, customer),
         )
         for customer, data in sorted(
             by_customer.items(),
             key=lambda item: (
-                item[1]["first"],
+                0 if item[1]["hard"] > 0 else 1,
+                item[1]["hard_first"] if item[1]["hard"] > 0 else item[1]["first"],
                 -item[1]["negative"],
                 -item[1]["area"],
                 source_lead.get(item[0], 0),

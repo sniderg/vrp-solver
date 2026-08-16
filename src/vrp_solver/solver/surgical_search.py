@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import random
 import time
-import multiprocessing
 import logging
 from itertools import combinations
 from dataclasses import dataclass, replace
 from typing import Callable
 
-from ..contest import ContestScore, score_prefix_with_feasibility_tail
+from ..contest import MINUTES_PER_DAY, truncate_instance, truncate_solution
 from ..diagnostics import (
     ViolationVector,
     solution_fingerprint,
@@ -29,6 +28,20 @@ from ..rules import derive_solution, validate_solution
 from .pressure import pressure_points
 from .markov_sequence import LateAcceptanceBuffer, MarkovSequenceSelector
 from .multiroute_block import repair_pressure_multiroute_block
+from .search_policy import (
+    accept_move as _accept_move,
+    candidate_frontier as _candidate_frontier,
+    feasibility_key as _feasibility_key,
+    hard_invariants_not_worse as _hard_invariants_not_worse,
+    logistic_ratio as _logistic_ratio,
+    repair_key as _repair_key,
+    scalar_score as _scalar,
+    score as _score,
+    score_candidates as _score_candidates,
+    score_key as _key,
+    select_operator,
+    structural_shift_errors as _structural_shift_errors,
+)
 from .targeted_rescue import (
     RescueConfig,
     generate_carryover_rescue_candidates,
@@ -96,6 +109,27 @@ class _CandidateGenerationDeadline(Exception):
         self.candidates = candidates
 
 
+def _search_violation_vector(
+    instance: Instance,
+    solution: Solution,
+    end_day: int,
+) -> ViolationVector:
+    """Replay the same committed horizon used by the search score.
+
+    Rolling search intentionally carries an incomplete lookahead tail.  A
+    full-instance vector would reject a valid prefix repair because of demand
+    beyond ``end_day``; full-horizon calls remain unchanged.
+    """
+    cutoff = min(instance.horizon * instance.unit, end_day * MINUTES_PER_DAY)
+    if cutoff >= instance.horizon * instance.unit:
+        return violation_vector(instance, solution)
+    prefix_instance = truncate_instance(
+        instance, cutoff, call_in_cutoff_minute=cutoff,
+    )
+    prefix_solution = truncate_solution(solution, cutoff)
+    return violation_vector(prefix_instance, prefix_solution)
+
+
 def surgical_search(
     instance: Instance,
     initial: Solution,
@@ -113,7 +147,6 @@ def surgical_search(
     )
     current = _reindex(initial)
     current_score = _score(instance, current, config.end_day)
-    best = current
     best = current
     best_score = current_score
     rewards = [1024.0] * len(OPERATORS)
@@ -141,7 +174,9 @@ def surgical_search(
     for iteration in range(config.iterations):
         if deadline is not None and time.monotonic() >= deadline:
             break
-        current_vector = violation_vector(instance, current)
+        current_vector = _search_violation_vector(
+            instance, current, config.end_day,
+        )
         structural_errors = _structural_shift_errors(instance, current)
         # Match the EXE's recency-aware adaptive portfolio once a valid plan
         # exists. The original starts from a feasible construction; our
@@ -196,8 +231,8 @@ def surgical_search(
             if coverage_operator is not None:
                 operator_index = OPERATORS.index(coverage_operator)
             else:
-                operator_index = _select_operator(
-                    rewards, attempts, last_used, iteration, rng,
+                operator_index = select_operator(
+                    OPERATORS, rewards, last_used, iteration, rng,
                     feasibility_bias=not best_score.feasible,
                 )
         operator = OPERATORS[operator_index]
@@ -356,6 +391,12 @@ def surgical_search(
             rng.shuffle(quantity_repairs)
             rng.shuffle(ordinary)
             candidates = quantity_repairs + ordinary
+        elif operator == "pressure_band_resource_block":
+            # The generator deliberately orders slot-preserving substitutions
+            # before insertions and deeper ejections. Preserve that family
+            # ordering so the bounded frontier cannot randomly discard every
+            # cheap pressure exchange before exact quantity recourse.
+            pass
         else:
             rng.shuffle(candidates)
         if progress:
@@ -377,7 +418,9 @@ def surgical_search(
         )
         for candidate, candidate_score in scored:
             evaluated += 1
-            candidate_vector = violation_vector(instance, candidate)
+            candidate_vector = _search_violation_vector(
+                instance, candidate, config.end_day,
+            )
             if not _hard_invariants_not_worse(
                 current_vector, candidate_vector,
             ):
@@ -507,7 +550,9 @@ def surgical_search(
                 repaired_score = _score(
                     instance, repaired, config.end_day,
                 )
-                repaired_vector = violation_vector(instance, repaired)
+                repaired_vector = _search_violation_vector(
+                    instance, repaired, config.end_day,
+                )
                 if (
                     _structural_shift_errors(instance, repaired) == 0
                     and _hard_invariants_not_worse(
@@ -559,7 +604,9 @@ def surgical_search(
                 )
                 if structural < structural_errors:
                     move_candidate, move_score = candidate, candidate_score
-                    move_vector = violation_vector(instance, candidate)
+                    move_vector = _search_violation_vector(
+                        instance, candidate, config.end_day,
+                    )
                     move_structural = structural
                     if progress:
                         progress(
@@ -609,7 +656,9 @@ def surgical_search(
                 )
                 if structural < structural_errors:
                     move_candidate, move_score = candidate, candidate_score
-                    move_vector = violation_vector(instance, candidate)
+                    move_vector = _search_violation_vector(
+                        instance, candidate, config.end_day,
+                    )
                     move_structural = structural
                     if progress:
                         progress(
@@ -645,7 +694,9 @@ def surgical_search(
                 repaired_score = _score(
                     instance, repaired, config.end_day,
                 )
-                repaired_vector = violation_vector(instance, repaired)
+                repaired_vector = _search_violation_vector(
+                    instance, repaired, config.end_day,
+                )
                 if (
                     _hard_invariants_not_worse(
                         current_vector, repaired_vector,
@@ -671,7 +722,9 @@ def surgical_search(
         accepted = False
         if move_candidate is not None and move_score is not None:
             if move_vector is None:
-                move_vector = violation_vector(instance, move_candidate)
+                move_vector = _search_violation_vector(
+                    instance, move_candidate, config.end_day,
+                )
             candidate_structural = _structural_shift_errors(
                 instance, move_candidate,
             )
@@ -711,8 +764,12 @@ def surgical_search(
             accepted = structural_gateway or ordinary_gateway or lahc_gateway
         if accepted:
             current, current_score = move_candidate, move_score
-        current_best_vector = violation_vector(instance, current)
-        incumbent_best_vector = violation_vector(instance, best)
+        current_best_vector = _search_violation_vector(
+            instance, current, config.end_day,
+        )
+        incumbent_best_vector = _search_violation_vector(
+            instance, best, config.end_day,
+        )
         improved_best = (
             current_best_vector.key(),
             _repair_key(instance, current, current_score),
@@ -803,10 +860,20 @@ def _coverage_rebuild_operator(
     monopolising the search.
     """
     missing: set[int] = set()
+    active_customers = {
+        operation.point
+        for shift in solution.shifts
+        for operation in shift.operations
+        if operation.quantity > 0
+    }
     for pressure in pressure_points(
         instance, solution, end_day=config.end_day,
     ):
-        missing.add(pressure.customer)
+        # Soft terminal headroom is a quantity/density signal, not evidence
+        # that route topology is absent.  Keep forcing topology moves for real
+        # replay failures, or when the pressured customer has no active visit.
+        if pressure.hard_steps or pressure.customer not in active_customers:
+            missing.add(pressure.customer)
     missing.update(
         violation.point
         for violation in validate_solution(instance, solution)
@@ -896,9 +963,13 @@ def _narrow_window_pressures(instance, pressures):
     is feature-derived and only affects which bounded block is searched first.
     """
     def key(pressure):
+        # Some operator tests and external callers supply a pressure-like
+        # record created before ``hard_steps`` became public.  Conservatively
+        # treat those as hard pressure rather than breaking the interface.
+        hard_steps = getattr(pressure, "hard_steps", 1)
         customer = instance.customer_by_point.get(pressure.customer)
         if customer is None:
-            return (float("inf"), float("inf"), -pressure.deficit_area, pressure.customer)
+            return (0 if hard_steps else 1, float("inf"), float("inf"), -pressure.deficit_area, pressure.customer)
         feasible = [
             (
                 max(0, min(window.end - customer.setup_time, pressure.first_minute) - window.start),
@@ -908,9 +979,9 @@ def _narrow_window_pressures(instance, pressures):
             if window.start <= min(window.end - customer.setup_time, pressure.first_minute)
         ]
         if not feasible:
-            return (float("inf"), float("inf"), -pressure.deficit_area, pressure.customer)
+            return (0 if hard_steps else 1, float("inf"), float("inf"), -pressure.deficit_area, pressure.customer)
         slack, gap = min(feasible)
-        return (slack, gap, -pressure.deficit_area, pressure.customer)
+        return (0 if hard_steps else 1, slack, gap, -pressure.deficit_area, pressure.customer)
     return tuple(sorted(pressures, key=key))
 
 
@@ -931,6 +1002,7 @@ def _create_shift_candidates(instance, solution, config) -> list[Solution]:
         max_chain_length=3,
         nearest_chain_neighbors=5,
         target_fill_ratio=0.98,
+        allow_future_rebalance=True,
     )
     shifts = generate_rescue_candidates(instance, solution, pressure, config=rescue)
     shifts += generate_carryover_rescue_candidates(
@@ -1175,7 +1247,11 @@ def _insert_operation_candidates(instance, solution, config) -> list[Solution]:
                 )
                 if available < customer.min_operation_quantity:
                     continue
-                quantity = max(customer.min_operation_quantity, min(available, customer.capacity))
+                # This is a topology activation, not a greedy delivery
+                # decision. A capacity-sized seed creates false overfill and
+                # load-path conflicts before the hard quantity model has a
+                # chance to rebalance the route.
+                quantity = customer.min_operation_quantity
                 operations = list(shift.operations)
                 operations.insert(op_pos, Operation(customer.index, approx_arrival, quantity))
                 mutated = try_optimize_shift_times(
@@ -2344,7 +2420,12 @@ def _pressure_band_resource_block_candidates(
     if not pressures:
         return []
     cap = max(8, config.candidates_per_move * 2)
-    radius = max(1_440, min(4_320, config.end_day * 288))
+    # Pressure may first become visible after the immediately preceding daily
+    # window has closed.  Search at least three days backwards so periodic
+    # service windows and an earlier carried-load/reload slot remain reachable.
+    # Longer horizons get a modestly wider band without making generation
+    # unbounded.
+    radius = max(4_320, min(10_080, config.end_day * 432))
     derived = derive_solution(instance, solution)
     results: list[Solution] = []
     seen: set[str] = set()
@@ -2388,6 +2469,53 @@ def _pressure_band_resource_block_candidates(
             solution.shifts[item[0]].operations[item[1]].arrival
             - pressure.first_minute
         ))
+        # A late visit on the scarce chain may be the only usable slot.  Try
+        # the coverage-preserving two-route ejection before cheaper-looking
+        # one-route substitutions consume the bounded generation budget.
+        ejections = generate_pressure_substitution_ejections(
+            instance,
+            solution,
+            customer_point=pressure.customer,
+            first_minute=pressure.first_minute,
+            radius=max(radius, min(10_080, pressure.first_minute)),
+            max_candidates=max(4, config.samples_per_customer),
+            deadline=deadline,
+        )
+        for rebuilt in ejections:
+            append_candidate(list(rebuilt.shifts))
+            if len(results) >= cap:
+                return results
+        if (
+            getattr(pressure, "hard_steps", 0) > 0
+            and len(ejections) >= max(4, config.samples_per_customer)
+        ):
+            # Yield this high-priority batch to hard timing/quantity replay
+            # before spending the remaining budget on lower-ranked surfaces.
+            # A partial batch does not suppress the remaining connectivity
+            # families, which may be the only way to evacuate a predecessor.
+            return results
+        # Slot-preserving pressure substitutions are the cheapest structural
+        # repair and may replace a redundant reload as well as an optional
+        # customer. Price them before advance/reassignment families can fill
+        # the bounded result pool.
+        substitutions = generate_pressure_block_substitutions(
+            instance,
+            solution,
+            customer_point=pressure.customer,
+            first_minute=pressure.first_minute,
+            radius=radius,
+            max_candidates=max(4, config.samples_per_customer),
+            # Retiming only the edited shift and its immediate neighbours can
+            # push the resource-chain boundary outside a driver's periodic
+            # window.  A five-shift block is still small, but includes both
+            # predecessor and successor boundary contracts on the long-horizon
+            # cases that motivate this operator.
+            max_block_shifts=5,
+        )
+        for rebuilt in substitutions:
+            append_candidate(list(rebuilt.shifts))
+            if len(results) >= cap:
+                return results
         if not target_positions:
             # Binary activation may remove every visit to a still-pressured
             # VMI customer. Price it back into an earlier optional slot using
@@ -2449,11 +2577,8 @@ def _pressure_band_resource_block_candidates(
             target_shift = solution.shifts[target_shift_position]
             target_operation = target_shift.operations[target_operation_position]
 
-            # Internal densification is a separate rebuild surface from the
-            # source-backed create-shift fallback below. It keeps a late
-            # layover-enabling visit intact and prices an additional earlier
-            # delivery into a compatible chain, then jointly retimes that
-            # chain's driver/trailer component.
+            # Internal densification remains the next surface when no paired
+            # ejection closes the scarce compatibility path.
             inserted = generate_pressure_block_insertions(
                 instance,
                 solution,
@@ -2461,29 +2586,9 @@ def _pressure_band_resource_block_candidates(
                 first_minute=pressure.first_minute,
                 radius=radius,
                 max_candidates=max(4, config.samples_per_customer),
+                deadline=deadline,
             )
             for rebuilt in inserted:
-                append_candidate(list(rebuilt.shifts))
-                if len(results) >= cap:
-                    return results
-            substitutions = generate_pressure_block_substitutions(
-                instance,
-                solution,
-                customer_point=pressure.customer,
-                first_minute=pressure.first_minute,
-                radius=radius,
-                max_candidates=max(4, config.samples_per_customer),
-            )
-            for rebuilt in substitutions:
-                append_candidate(list(rebuilt.shifts))
-                if len(results) >= cap:
-                    return results
-            ejections = generate_pressure_substitution_ejections(
-                instance, solution, customer_point=pressure.customer,
-                first_minute=pressure.first_minute, radius=radius,
-                max_candidates=max(4, config.samples_per_customer),
-            )
-            for rebuilt in ejections:
                 append_candidate(list(rebuilt.shifts))
                 if len(results) >= cap:
                     return results
@@ -4247,122 +4352,6 @@ def _rebuilt_route_target(
     return None
 
 
-def _select_operator(rewards, attempts, last_used, iteration, rng, feasibility_bias):
-    # Match the adaptive selection mechanics from Ghidra (0x140023580):
-    # Operator score = EWMA reward * recency multiplier (2.0 if unused for >=33 iterations) * feasibility bias
-    scores = []
-    for i in range(len(OPERATORS)):
-        recency = 2.0 if (iteration - last_used[i]) >= 33 else 1.0
-        bias = 4.0 if feasibility_bias and i in (0, 1, 3) else 1.0
-        scores.append(max(1.0, rewards[i]) * recency * bias)
-    draw = rng.random() * sum(scores)
-    for i, value in enumerate(scores):
-        draw -= value
-        if draw <= 0:
-            return i
-    return len(OPERATORS) - 1
-
-
-def _score(instance, solution, end_day):
-    return score_prefix_with_feasibility_tail(
-        instance, solution, score_days=end_day, feasibility_days=end_day,
-        ignore_tail_call_ins=True,
-    )
-
-
-def _candidate_frontier(candidates, *, budget: int, stagnation: int):
-    """Spend a fixed evaluation budget across exploitation and exploration.
-
-    Generators place cheap/local edits before expensive reload and ejection
-    structures.  A simple prefix cap therefore turns a time budget into an
-    unintended topology ban.  Keep the leading candidates, but sample the
-    remainder evenly; exploration increases after unsuccessful iterations.
-    """
-    if budget <= 0 or len(candidates) <= budget:
-        return candidates
-    exploration_share = 1 / 3 if stagnation == 0 else 1 / 2
-    explore = max(1, int(budget * exploration_share))
-    exploit = max(1, budget - explore)
-    head = candidates[:exploit]
-    tail = candidates[exploit:]
-    if explore == 1:
-        return head + [tail[-1]]
-    indexes = [
-        round(index * (len(tail) - 1) / (explore - 1))
-        for index in range(explore)
-    ]
-    return head + [tail[index] for index in indexes]
-
-
-_WORKER_INSTANCE = None
-_WORKER_CANDIDATES = None
-_WORKER_END_DAY = None
-
-
-def _score_candidate_index(index):
-    candidate = _WORKER_CANDIDATES[index]
-    return index, _score(_WORKER_INSTANCE, candidate, _WORKER_END_DAY)
-
-
-def _score_candidates(instance, candidates, end_day, workers):
-    if workers <= 1 or len(candidates) <= 1:
-        return [(candidate, _score(instance, candidate, end_day)) for candidate in candidates]
-    global _WORKER_INSTANCE, _WORKER_CANDIDATES, _WORKER_END_DAY
-    _WORKER_INSTANCE = instance
-    _WORKER_CANDIDATES = candidates
-    _WORKER_END_DAY = end_day
-    context = multiprocessing.get_context("fork")
-    with context.Pool(processes=min(workers, len(candidates))) as pool:
-        indexed_scores = list(pool.imap_unordered(_score_candidate_index, range(len(candidates)), chunksize=1))
-    indexed_scores.sort(key=lambda item: item[0])
-    return [(candidates[index], score) for index, score in indexed_scores]
-
-
-def _accept_move(
-    current: ContestScore,
-    candidate: ContestScore,
-    perturbation: int,
-    rng: random.Random,
-) -> bool:
-    if _key(candidate) < _key(current):
-        return True
-    if perturbation <= 0:
-        return False
-    if candidate.hard_violations > current.hard_violations:
-        return False
-    error_allowance = max(1, perturbation // 8)
-    if candidate.feasibility_errors > current.feasibility_errors + error_allowance:
-        return False
-    deficit_allowance = perturbation * 50_000.0
-    if candidate.safety_kg_min > current.safety_kg_min + deficit_allowance:
-        return False
-    # Keep a small stochastic refusal separate from the controller's verified
-    # one-in-four incumbent restore draw.
-    return rng.random() >= 0.05
-
-
-def _hard_invariants_not_worse(
-    before: ViolationVector,
-    after: ViolationVector,
-) -> bool:
-    """Keep physical/service/resource feasibility as a commit invariant."""
-    fields = (
-        "non_finite_values",
-        "reference_errors",
-        "physical_errors",
-        "missed_orders",
-        "missed_order_deficit",
-        "negative_quantity_minutes",
-        "overfill_quantity_minutes",
-        "resource_timing_errors",
-        "other_errors",
-    )
-    return all(
-        getattr(after, field) <= getattr(before, field) + 1e-6
-        for field in fields
-    )
-
-
 def _early_pressure_insertion_target(
     before: Solution,
     candidate: Solution,
@@ -4390,58 +4379,6 @@ def _early_pressure_insertion_target(
     return added[0] if len(added) == 1 else None
 
 
-def _key(score: ContestScore):
-    return (
-        score.hard_violations,
-        score.feasibility_errors,
-        score.safety_kg_min,
-        _logistic_ratio(score),
-    )
-
-
-def _repair_key(
-    instance: Instance,
-    solution: Solution,
-    score: ContestScore,
-):
-    """Continuation ordering for an infeasible constructed seed.
-
-    The EXE normally starts from a feasible plan, so structural feasibility is
-    implicit. During reconstruction, preserve a neutral structural cleanup as
-    an incumbent checkpoint instead of losing it on restart.
-    """
-    return (
-        score.hard_violations,
-        score.feasibility_errors,
-        _structural_shift_errors(instance, solution),
-        score.safety_kg_min,
-        _logistic_ratio(score),
-    )
-
-
-def _feasibility_key(score: ContestScore):
-    return (
-        score.hard_violations,
-        score.feasibility_errors,
-        score.safety_kg_min,
-    )
-
-
-def _scalar(score: ContestScore):
-    return (
-        1_000_000 * score.hard_violations
-        + 1_000 * score.feasibility_errors
-        + score.safety_kg_min * 1e-5
-        + _logistic_ratio(score)
-    )
-
-
-def _logistic_ratio(score: ContestScore) -> float:
-    return score.scored_estimated_cost / max(
-        1.0, score.scored_delivered_quantity,
-    )
-
-
 def _reindex(solution: Solution) -> Solution:
     return Solution(tuple(replace(shift, index=i) for i, shift in enumerate(solution.shifts)))
 
@@ -4458,16 +4395,4 @@ def _structure_signature(solution: Solution) -> tuple[object, ...]:
             ),
         )
         for shift in solution.shifts
-    )
-
-
-def _structural_shift_errors(instance: Instance, solution: Solution) -> int:
-    return sum(
-        1
-        for violation in validate_solution(instance, solution)
-        if (
-            violation.severity == "error"
-            and violation.shift is not None
-            and violation.code not in {"QS01", "QS02"}
-        )
     )

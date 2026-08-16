@@ -495,6 +495,7 @@ def build_numba_candidate_pool(
         candidates_by_customer: Dict[int, List[CandidateShift]] = {}
         candidates_by_customer_day: Dict[Tuple[int, int], List[CandidateShift]] = {}
         direct_by_customer_day: Dict[Tuple[int, int], List[CandidateShift]] = {}
+        reload_by_customer_day: Dict[Tuple[int, int], List[CandidateShift]] = {}
         candidates_by_order: Dict[Tuple[int, int], List[CandidateShift]] = {}
         for candidate in candidate_shifts:
             for position, point in enumerate(candidate.points):
@@ -504,6 +505,8 @@ def build_numba_candidate_pool(
                     candidates_by_customer_day.setdefault((point, day), []).append(candidate)
                     if len(candidate.points) == 1:
                         direct_by_customer_day.setdefault((point, day), []).append(candidate)
+                    if candidate.reload_after_first:
+                        reload_by_customer_day.setdefault((point, day), []).append(candidate)
                     customer = instance.customer_by_point[point]
                     if customer.call_in:
                         for order_index, order in enumerate(customer.orders):
@@ -566,6 +569,16 @@ def build_numba_candidate_pool(
                 direct_ids.add(candidate.shift_id)
         kept_ids.update(direct_ids)
 
+        # Reload columns are the only pool members that can replenish two
+        # capacity-scale customers without carrying both deliveries from the
+        # initial source visit.  Preserve a sparse resource-diverse set rather
+        # than allowing cheaper direct columns to erase this topology.
+        reload_ids: Set[int] = set()
+        for candidates in reload_by_customer_day.values():
+            for candidate in diverse_columns(candidates, 1):
+                reload_ids.add(candidate.shift_id)
+        kept_ids.update(reload_ids)
+
         # A call-in order is a discrete appointment, not merely inventory
         # coverage.  Keep a resource/time-diverse mini portfolio for each one
         # so a density tie cannot force two orders onto the same driver slot.
@@ -584,11 +597,11 @@ def build_numba_candidate_pool(
                 for candidate in candidates:
                     cover_count[candidate.shift_id] = cover_count.get(candidate.shift_id, 0) + 1
             priority_ids = sorted(
-                critical_ids | direct_ids,
+                reload_ids | critical_ids,
                 key=lambda shift_id: (-cover_count.get(shift_id, 0), shift_id),
             )
             remaining_ids = sorted(
-                kept_ids - critical_ids - direct_ids,
+                kept_ids - reload_ids - critical_ids,
                 key=lambda shift_id: (-cover_count.get(shift_id, 0), shift_id),
             )
             kept_ids = set((priority_ids + remaining_ids)[:max_candidates])
@@ -871,8 +884,11 @@ def solve_numba_gurobi_mip(
                 [name for name in iis if name.startswith("inv_")][:100],
                 flush=True,
             )
+        status = model.Status
+        model.dispose()
+        gp.disposeDefaultEnv()
         raise RuntimeError(
-            f"native solver found no feasible solution (Gurobi status {model.Status})"
+            f"native solver found no feasible solution (Gurobi status {status})"
         )
     for s in pool:
         if x[s.shift_id].X > 0.5:
@@ -953,8 +969,15 @@ def solve_numba_gurobi_mip(
         counts: Dict[str, int] = {}
         for violation in errors:
             counts[violation.code] = counts.get(violation.code, 0) + 1
+        model.dispose()
+        gp.disposeDefaultEnv()
         raise RuntimeError(
             "native solver refused to return an invalid solution: "
             f"{len(errors)} errors by code {counts}"
         )
+    # The available WLS token is single-use: retaining Gurobi's default
+    # environment after a completed solve prevents the next serialized task
+    # in this same process (or another process) from acquiring the license.
+    model.dispose()
+    gp.disposeDefaultEnv()
     return sol

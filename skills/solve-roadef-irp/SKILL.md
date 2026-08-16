@@ -1,51 +1,121 @@
 ---
 name: solve-roadef-irp
-description: Design, implement, diagnose, benchmark, and independently validate native cold-start solvers for the ROADEF 2016 inventory-routing problem, especially Set B. Use for route chaining, ALNS or matheuristics, timing and quantity repair, call-in orders, VMI inventory, resource constraints, Solver.exe comparisons, official-checker validity, or Set B generalisation.
+description: Design, implement, diagnose, benchmark, and independently validate native cold-start solvers for the ROADEF 2016 inventory-routing problem, especially Set B. Use for route/resource chaining, rolling-horizon or column-generation construction, ALNS and matheuristics, timing or quantity repair, call-in and VMI inventory, driver/trailer/source constraints, solver-backend comparisons, official-checker validity, and Set B qualification.
 ---
 
 # Solve ROADEF IRP
 
-Treat official validity as the first objective and LR as the objective among valid solutions.
+Treat official validity as the first objective and LR as the objective only
+among valid solutions.
 
-## Preserve provenance
+## Preserve provenance and proof
 
-Label outputs as `native-cold-start`, `native-repair`, `oracle`, or `reference`. Never describe oracle/reference topology or repair of a supplied candidate as native cold start. Keep oracle routes out of native construction and use them only for aggregate analysis.
+Label inputs and outputs as `native-cold-start`, `native-repair`, `oracle`, or
+`reference`. Never describe repair of a supplied candidate or imported
+oracle/reference topology as a cold start.
 
-## Inspect and validate first
+Replay every candidate from initial state. Treat malformed data, overfill,
+negative stock, safety breach, missed order, trailer discontinuity, illegal
+timing, and resource overlap as hard failures. Local zero errors are necessary
+but insufficient: publish validity only when the released checker accepts the
+exact serialized XML through the fail-closed wrapper.
 
-1. Locate parsing, XML I/O, simulation, local validation, official-checker wrapper, solver entry points, and tests.
-2. Identify the released checker's fail-closed success condition.
-3. Replay the current candidate from initial state, including time zero and horizon boundaries.
-4. Record instance, provenance, seed, command, runtime, checker hash, violations, official verdict, and valid LR.
+Record instance, provenance, seed/configuration, command, solver backends,
+runtime, checker hash, local violation vector, official verdict, and valid LR.
 
-Treat overfill, negative stock, trailer discontinuity, illegal timing, and missed orders as hard failures. Never clamp/delete a violation and call it repaired without full replay. Local zero errors are necessary but insufficient; publish success only when the released checker accepts the exact XML.
+## Inspect before changing the solver
+
+Locate parsing, XML I/O, replay, validation, official-checker wrapper, solver
+entry points, exact models, audit harnesses, tests, and current candidates.
+Inspect working-tree changes and preserve unrelated work. Use existing entry
+points and validators rather than creating competing versions.
+
+## Classify the failure regime
+
+Use structured violation magnitude and duration, not raw error count alone.
+Classify a run before choosing an intervention:
+
+- **Direct-construction feasible:** stop when the task is feasibility; do not
+  spend the remaining budget polishing LR unless explicitly requested.
+- **Near-feasible:** no physical/resource/call-in failures and a small number or
+  area of inventory deficits. Use pressure-band donor exchange, internal/tail
+  insertion, reload relocation, joint retiming, and hard quantity repair.
+- **Moderate topology deficiency:** coverage exists but deficit area remains
+  material. Expand to multi-route densification and fragment exchange.
+- **Constructor collapse:** many unscheduled customers, missed orders, or large
+  negative/safety areas. Do not rely on terminal quantity repair. Redesign
+  construction with compatibility scarcity, dense columns, proactive reloads,
+  and rolling lookahead.
 
 ## Use the chain-first matheuristic
 
-Read [references/matheuristic.md](references/matheuristic.md) before changing construction, topology, timing, quantities, acceptance, or qualification.
+Read [references/matheuristic.md](references/matheuristic.md) before changing
+construction, topology, timing, quantities, acceptance, backend policy, or
+qualification.
 
-Use:
+Use this atomic iteration:
 
-`select multi-shift block -> destroy -> rebuild route/resource chains -> joint timing repair -> hard full-horizon quantity repair -> replay -> accept/reject`
+`select connected block -> destroy -> rebuild route/resource chains -> topology screen -> joint timing repair -> hard full-horizon quantity repair -> global replay -> accept/reject`
 
-Do not rely on quantity-only repair or repeated single-customer emergency insertion when topology is deficient. Include driver/trailer predecessor and successor boundaries in atomic block replacement.
+Include affected driver/trailer predecessors and successors. Quantity-only
+repair cannot create absent route topology. A direct emergency shift is a
+fallback column, not the default move.
 
-## Keep search and proof separate
+## Price compatibility and future feasibility
 
-Use the local checker in the inner loop. Run the official checker when a locally feasible candidate first appears, when the best valid LR improves, and before publication. Keep feasible candidates ordered by LR and diagnostics ordered by structured violation magnitude/duration.
+Treat usable capacity as compatible driver-trailer-source time, not free
+driver-days. Rank demands using first breach, deficit area, window slack,
+compatibility scarcity, load-path position, incremental travel, and future
+resource opportunity cost.
 
-## Demonstrate real progress
+For long or resource-tight horizons, prefer rolling construction with a
+protected prefix and lookahead tail. Penalize terminal states by future demand
+and reachability rather than generic tank fill.
 
-Report generated/deduplicated candidates, timing-feasible count, quantity-feasible count, complete violation-vector deltas, shifts, stops, reloads, delivered volume, valid LR, and wall time. A completed run with no improved invariant is evidence, not success.
+## Screen before exact optimization
 
-## Promote probes into mechanics
+Before calling an LP/MIP, reject a topology that lacks:
 
-Use customer-specific probes only to identify a missing move or invariant. Once a reusable mechanism is found, stop manually repairing IDs/timestamps, implement a feature-driven production operator with tests, and resume through the native entry point. Do not spend more than two consecutive experiments micromanaging named customers except for checker disagreement or minimal regression isolation.
+- an active visit before the relevant breach/order deadline;
+- sufficient cumulative compatible trailer capacity;
+- a reachable compatible source or carried load;
+- a legal driver/trailer chain gap including return and rest;
+- a relocation path for displaced mandatory demand.
 
-Express operators using pressure area, first breach, window slack, resource boundaries, compatibility, load-path position, and incremental travel. Never encode the probe's customer ID, instance name, or fixed minute.
+Log candidate funnel counts so time spent in generation, timing, quantity
+repair, and replay is distinguishable.
 
-## Generalise and report honestly
+## Treat solver backends as an experiment
 
-Derive policy from continuous instance features and qualify call-in-heavy, VMI-heavy, compatibility-sparse, resource-tight, reload/layover, and scale-extreme Set B regimes with repeated seeds. Require official validity on the agreed corpus before calling the solver general.
+Fail closed on `Unknown`, time limit without an accepted incumbent, numerical
+failure, or ambiguous status. Do not infer that a stronger backend fixes a
+topology problem.
 
-State exactly whether the result is a mechanism test, locally feasible, officially valid native repair, or officially valid native cold start. If the requested level was not reached, name the smallest demonstrated blocker.
+When comparing HiGHS and Gurobi, hold construction, seed, topology sequence,
+model, and budget fixed. Record status distributions, feasible-model counts,
+violation-vector improvements, and time to official validity. Prefer
+HiGHS-first fallback on unresolved models only after an ablation demonstrates
+value. Keep the open-source path independently functional.
+
+## Use hard budgets and honest telemetry
+
+An internal deadline may be exceeded by an in-flight exact model. Use a
+process-level timeout for a strict SLA and checkpoint after each instance.
+Recompute final metrics from the returned solution; do not report stale
+constructor fields as final coverage.
+
+Maintain separate feasible and diagnostic archives. Run the official checker
+when the first local-feasible XML appears, when the best valid LR improves, and
+before publication—not for known-invalid candidates.
+
+## Generalise and report precisely
+
+Promote customer-specific probes into feature-driven operators and regression
+tests. Never branch on instance name, customer ID, fixed day, or copied route.
+Qualify repeated fixed seeds across call-in-heavy, VMI-heavy,
+compatibility-sparse, resource-tight, reload/layover, small, and scale-extreme
+regimes.
+
+State exactly whether the result is a mechanism test, locally feasible,
+officially valid native repair, or officially valid native cold start. If the
+requested level was not reached, name the smallest demonstrated blocker.
