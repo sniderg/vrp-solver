@@ -163,6 +163,15 @@ def truncate_solution(solution: Solution, cutoff_minute: int) -> Solution:
     return Solution(shifts=tuple(shifts))
 
 
+def truncate_solution_atomic(solution: Solution, cutoff_minute: int) -> Solution:
+    """Truncate solution keeping full shift operations intact to avoid mid-shift splits."""
+    shifts: list[Shift] = [
+        shift for shift in solution.shifts
+        if shift.start < cutoff_minute and shift.operations
+    ]
+    return Solution(shifts=tuple(shifts))
+
+
 def truncate_instance(
     instance: Instance,
     cutoff_minute: int,

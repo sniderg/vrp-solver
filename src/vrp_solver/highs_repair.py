@@ -224,7 +224,11 @@ def repair_with_highs_selection(
                     highs.addRow(1.0, inf, 0, np.array([], dtype=np.int32), np.array([], dtype=np.float64))
                 continue
             
-            lower_safety = customer.safety_level - customer.initial_tank_quantity + cumulative_demand
+            # Add safety stock target buffer so intra-step delivery arrivals
+            # do not cause fractional micro-dips below safety level before the delivery minute.
+            safety_target = customer.safety_level + max(20.0, 0.01 * customer.capacity)
+            safety_target = min(safety_target, customer.capacity - 10.0)
+            lower_safety = safety_target - customer.initial_tank_quantity + cumulative_demand
             lower_zero = 0.0 - customer.initial_tank_quantity + cumulative_demand
             upper = customer.capacity - customer.initial_tank_quantity + cumulative_demand
 

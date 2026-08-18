@@ -284,10 +284,11 @@ def days_of_inventory(
     
     inventory = current_inventory
     steps_autonomy = 0
+    safety_threshold = customer.safety_level + max(25.0, 0.01 * customer.capacity)
     for step in range(start_step, instance.horizon):
         forecast = customer.forecast[step] if step < len(customer.forecast) else 0.0
         inventory -= forecast
-        if inventory < customer.safety_level - EPSILON:
+        if inventory < safety_threshold:
             break
         steps_autonomy += 1
     

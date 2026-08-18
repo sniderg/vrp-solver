@@ -781,7 +781,7 @@ def _candidate_customer_ids(
     daily_delivery_targets: dict[int, float],
     score_cutoff_minute: int | None,
     inventory_cache: dict[tuple[int, tuple[tuple[int, float], ...]], tuple[float, ...]] | None = None,
-    fill_doi_days: float = 2.5,
+    fill_doi_days: float = 4.0,
     max_fill: int = 16,
     max_smoothing: int = 0,
     global_pressure_ids: tuple[int, ...] = (),
@@ -1618,8 +1618,10 @@ def _first_breach_step(instance, customer, deliveries, min_step=0, *, cache=None
     key = (customer.index, tuple(sorted(deliveries.items())))
     projection = cache.get(key) if cache is not None else None
     if projection is None:
-        levels_array, breaches_array = project_customer_inventory_arrays(instance, customer, deliveries)
-        projection = (tuple(levels_array), tuple(bool(value) for value in breaches_array))
+        levels_array, _ = project_customer_inventory_arrays(instance, customer, deliveries)
+        safety_threshold = customer.safety_level + max(25.0, 0.01 * customer.capacity)
+        breaches_array = tuple(levels_array[i] < safety_threshold for i in range(len(levels_array)))
+        projection = (tuple(levels_array), breaches_array)
         if cache is not None:
             cache[key] = projection
     _, breaches = projection
@@ -1797,6 +1799,15 @@ def _paper_events(
 ) -> tuple:
     key = (customer.index, tuple(sorted(deliveries.items())))
     if key not in cache:
+        # Candidate evaluation creates a distinct delivery schedule for nearly
+        # every speculative insertion.  Keeping all of those full-horizon
+        # event sequences turns the memo into an unbounded, O(candidates ×
+        # horizon) allocation on the 35-day Set-B instances.  The cache is
+        # only a speed optimisation, so discard its least useful generation
+        # once it reaches a modest working-set size rather than allowing a
+        # construction attempt to be killed before it can report feasibility.
+        if len(cache) >= 256:
+            cache.clear()
         cache[key] = tuple(project_customer_inventory(instance, customer, deliveries))
     return cache[key]
 
@@ -1862,14 +1873,25 @@ def _build_paper_shift(
         # formal safety violation.  Restricting this pool to currently
         # unsatisfied tanks made the constructor waste scarce driver windows
         # on one-stop routes, unlike the published order-up-to construction.
+        #
+        # Coverage-aware ranking: customers with fewer scheduled deliveries
+        # receive a priority bonus so that every customer gets adequate
+        # service across the full horizon.  Without this, urgency-only
+        # ranking on 35-day instances causes the greedy to re-serve ~50 of
+        # 134 customers while leaving the rest unserved.
+        def _coverage_shortage_key(customer):
+            shortage = _paper_shortage_time(
+                instance, customer, scheduled[customer.index], inventory_cache,
+            )
+            num_deliveries = len(scheduled[customer.index])
+            # Customers with 0 deliveries get a large bonus (earlier shortage).
+            # This decays with each delivery so natural urgency takes over once
+            # a customer has received adequate service.
+            coverage_bonus = max(0, 3 - num_deliveries) * instance.latest_time
+            return shortage - coverage_bonus
         ranked_pool = sorted(
             instance.customers,
-            key=lambda customer: _paper_shortage_time(
-                instance,
-                customer,
-                scheduled[customer.index],
-                inventory_cache,
-            ),
+            key=_coverage_shortage_key,
         )[:candidate_pool_size]
         for customer in ranked_pool:
             if customer.index in visited or resource.trailer not in customer.allowed_trailers:
