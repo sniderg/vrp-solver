@@ -1076,35 +1076,51 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         )
         print(f"resumed_from,{resume_from},errors,{resume_errors}")
         idle_caps = []
-    for idle_cap in idle_caps:
-        if end_day >= 28:
-            from .solver.horizon_master import construct_horizon_master_solution
-            candidate_seed = construct_horizon_master_solution(
-                instance,
-                safety_buffer=args.safety_buffer,
-            )
-            candidate_report = ConstructionReport(
-                shifts=len(candidate_seed.shifts),
-                operations=sum(len(shift.operations) for shift in candidate_seed.shifts),
-                delivered_quantity=sum(
-                    operation.quantity
-                    for shift in candidate_seed.shifts
-                    for operation in shift.operations
-                    if operation.quantity > 0
-                ),
-                unscheduled_customers=(),
-                exhausted_resources=False,
-            )
-        else:
-            candidate_seed, candidate_report = construct_cluster_solution(
+    # Seed portfolio: the proven cluster constructor per idle-cap setting,
+    # plus (on long horizons) one horizon-master candidate.  The horizon
+    # master must never *replace* the cluster constructor: routing it
+    # exclusively through `end_day >= 28` regressed V2.14 from a 0-error
+    # cap-180 seed to 62,053 errors, because every long-horizon instance
+    # silently lost the constructor that closes it.
+    seed_builders: list[tuple[object, callable]] = [
+        (
+            idle_cap,
+            lambda cap=idle_cap: construct_cluster_solution(
                 instance,
                 safety_buffer=args.safety_buffer,
                 neighborhood_size=policy.neighborhood_size,
                 score_cutoff_minute=end_day * 1440,
                 global_pressure_fill=policy.global_pressure_fill,
                 tie_break_seed=args.seed,
-                max_idle_wait_minutes=idle_cap,
+                max_idle_wait_minutes=cap,
+            ),
+        )
+        for idle_cap in idle_caps
+    ]
+    if idle_caps and end_day >= 28:
+        from .solver.horizon_master import construct_horizon_master_solution
+
+        def _horizon_master_candidate():
+            candidate = construct_horizon_master_solution(
+                instance,
+                safety_buffer=args.safety_buffer,
             )
+            return candidate, ConstructionReport(
+                shifts=len(candidate.shifts),
+                operations=sum(len(shift.operations) for shift in candidate.shifts),
+                delivered_quantity=sum(
+                    operation.quantity
+                    for shift in candidate.shifts
+                    for operation in shift.operations
+                    if operation.quantity > 0
+                ),
+                unscheduled_customers=(),
+                exhausted_resources=False,
+            )
+
+        seed_builders.append(("horizon-master", _horizon_master_candidate))
+    for seed_label, seed_builder in seed_builders:
+        candidate_seed, candidate_report = seed_builder()
         candidate_errors = sum(
             violation.severity == "error"
             for violation in validate_solution(instance, candidate_seed)
@@ -1114,7 +1130,7 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         _, _, _, candidate_safety_qm = _tank_aggregates(instance, candidate_seed)
         key = (candidate_errors, candidate_safety_qm)
         print(
-            f"seed_candidate,idle_cap,{idle_cap},errors,{candidate_errors},"
+            f"seed_candidate,idle_cap,{seed_label},errors,{candidate_errors},"
             f"safety_deficit_qm,{candidate_safety_qm:.0f}"
         )
         if best_key is None or key < best_key:
