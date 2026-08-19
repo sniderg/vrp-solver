@@ -1071,15 +1071,34 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         print(f"resumed_from,{resume_from},errors,{resume_errors}")
         idle_caps = []
     for idle_cap in idle_caps:
-        candidate_seed, candidate_report = construct_cluster_solution(
-            instance,
-            safety_buffer=args.safety_buffer,
-            neighborhood_size=policy.neighborhood_size,
-            score_cutoff_minute=end_day * 1440,
-            global_pressure_fill=policy.global_pressure_fill,
-            tie_break_seed=args.seed,
-            max_idle_wait_minutes=idle_cap,
-        )
+        if end_day >= 28:
+            from .solver.horizon_master import construct_horizon_master_solution
+            candidate_seed = construct_horizon_master_solution(
+                instance,
+                safety_buffer=args.safety_buffer,
+            )
+            candidate_report = ConstructionReport(
+                shifts=len(candidate_seed.shifts),
+                operations=sum(len(shift.operations) for shift in candidate_seed.shifts),
+                delivered_quantity=sum(
+                    operation.quantity
+                    for shift in candidate_seed.shifts
+                    for operation in shift.operations
+                    if operation.quantity > 0
+                ),
+                unscheduled_customers=(),
+                exhausted_resources=False,
+            )
+        else:
+            candidate_seed, candidate_report = construct_cluster_solution(
+                instance,
+                safety_buffer=args.safety_buffer,
+                neighborhood_size=policy.neighborhood_size,
+                score_cutoff_minute=end_day * 1440,
+                global_pressure_fill=policy.global_pressure_fill,
+                tie_break_seed=args.seed,
+                max_idle_wait_minutes=idle_cap,
+            )
         candidate_errors = sum(
             violation.severity == "error"
             for violation in validate_solution(instance, candidate_seed)
@@ -1101,6 +1120,38 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     solution = seed_solution
     steps = []
     completed_rounds = 0
+    if getattr(args, "engine", "surgical") == "fast":
+        # REBUILD_PLAN step 5: the rebuilt fast search as a shipped engine.
+        # It runs orders of magnitude more steps per second than the surgical
+        # rounds, which is what the large instances need — the surgical
+        # engine's per-round candidate generation stalls outright above ~100
+        # points.  The published (errors, LR) incumbent is what gets saved,
+        # never the live adaptive-quality best.
+        from .fast.search import run_search
+        from .fast.state import SearchState, instance_days
+
+        seed_errors = sum(
+            violation.severity == "error"
+            for violation in validate_solution(instance, solution)
+        )
+        remaining = max(1.0, deadline - time.monotonic())
+        print(f"fast_engine,start_errors,{seed_errors},budget,{remaining:.1f}")
+        state = SearchState.from_solution(
+            instance, solution, score_days=instance_days(instance),
+        )
+        result = run_search(state, limit=remaining, seed=args.seed)
+        published = result.published_solution or result.best_solution
+        published_errors = sum(
+            violation.severity == "error"
+            for violation in validate_solution(instance, published)
+        )
+        if published_errors <= seed_errors:
+            solution = published
+        print(
+            f"fast_engine,steps,{result.telemetry.steps},"
+            f"published_errors,{published_errors}"
+        )
+        save_solution(solution, args.output_xml)
     # Rotating the first operator across rounds is what closes hard instances:
     # this exact rotation took V2.25 from 156 errors to 24 to 18 to 0.  Each
     # round continues from the previous round's incumbent, so a long run is
@@ -1113,6 +1164,8 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
         "recombine_route_blocks",
         "create_shift",
         "insert_operation",
+        "balanced_reload_stop_insert",
+        "merge_lone_reload_shift",
     )
     from .inventory import tank_aggregates
 
@@ -2091,6 +2144,18 @@ def build_parser() -> argparse.ArgumentParser:
             "or pass 0 to force uncapped"
         ),
     )
+    native_solve.add_argument(
+        "--engine",
+        choices=("surgical", "fast"),
+        default="surgical",
+        help=(
+            "search engine after construction: 'surgical' runs the operator "
+            "restart rounds (default, best on small instances); 'fast' runs "
+            "the rebuilt high-throughput search, which is what large "
+            "instances need — leftover budget still flows into surgical "
+            "rounds afterwards"
+        ),
+    )
     native_solve.set_defaults(func=cmd_native_solve)
 
     native_batch = subparsers.add_parser(
@@ -2519,6 +2584,7 @@ def build_parser() -> argparse.ArgumentParser:
         "relocate_between_shifts", "relocate_within_shift",
         "pressure_band_resource_block", "multiroute_pressure_block",
         "recombine_route_blocks", "joint_retailer_reinsert",
+        "merge_lone_reload_shift", "balanced_reload_stop_insert",
     ))
     surgical.set_defaults(func=cmd_surgical_search)
 

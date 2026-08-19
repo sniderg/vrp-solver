@@ -80,6 +80,8 @@ OPERATORS = (
     "multiroute_pressure_block",
     "recombine_route_blocks",
     "joint_retailer_reinsert",
+    "merge_lone_reload_shift",
+    "balanced_reload_stop_insert",
 )
 
 logging.getLogger("vrp_solver.highs_time_opt").setLevel(logging.ERROR)
@@ -177,6 +179,11 @@ def _surgical_search_loop(
             }
             if "SHI16" in structural_codes and iteration % 4 == 0:
                 operator_index = OPERATORS.index("insert_operation")
+            elif "DRI01" in structural_codes and iteration % 4 == 2:
+                # A reload-only shift bound by rest gaps on both sides is
+                # unreachable by retiming; merging it into its predecessor
+                # removes the boundary (closed V2.26's last DRI01).
+                operator_index = OPERATORS.index("merge_lone_reload_shift")
             elif (
                 structural_codes & {"DRI01", "TL01"}
                 and iteration % 4 == 1
@@ -821,6 +828,7 @@ def _coverage_rebuild_operator(
         "insert_operation",
         "pressure_band_resource_block",
         "multiroute_pressure_block",
+        "balanced_reload_stop_insert",
     ]
     if config.coverage_include_ejection:
         surfaces.append("replace_operation_point")
@@ -883,6 +891,10 @@ def _candidates(
         return results
     if operator == "joint_retailer_reinsert":
         return _joint_retailer_reinsert_candidates(instance, solution, config)
+    if operator == "merge_lone_reload_shift":
+        return _merge_lone_reload_candidates(instance, solution, config)
+    if operator == "balanced_reload_stop_insert":
+        return _balanced_reload_stop_candidates(instance, solution, config, rng)
     return _within_shift_candidates(instance, solution, config, rng)
 
 
@@ -3582,6 +3594,237 @@ def _rebalance_retailer_after_early_column(
     ):
         return None
     return candidate
+
+
+def _merge_lone_reload_candidates(
+    instance: Instance,
+    solution: Solution,
+    config: SurgicalSearchConfig,
+) -> list[Solution]:
+    """Absorb a reload-only shift into its same-driver-same-trailer predecessor.
+
+    A shift whose every operation is a source load exists only to restock its
+    trailer, yet as a separate shift it owes the driver's full inter-shift rest
+    on both sides.  When those gaps bind on both sides no retiming can satisfy
+    DRI01 — but appending the loads to the predecessor shift removes the
+    boundary entirely, because a single shift has no internal rest requirement.
+    The merged loads are re-timed to the earliest chain-feasible arrivals; the
+    caller's atomic scorer judges source stock and shift-duration effects.
+    """
+    result: list[Solution] = []
+    source_points = set(instance.source_by_point)
+    for position, shift in enumerate(solution.shifts):
+        if not shift.operations:
+            continue
+        if any(
+            operation.quantity >= 0 or operation.point not in source_points
+            for operation in shift.operations
+        ):
+            continue
+        predecessors = [
+            (other_position, other)
+            for other_position, other in enumerate(solution.shifts)
+            if (
+                other.driver == shift.driver
+                and other.trailer == shift.trailer
+                and other.operations
+                and other.start < shift.start
+            )
+        ]
+        if not predecessors:
+            continue
+        pred_position, predecessor = max(
+            predecessors, key=lambda item: item[1].start,
+        )
+        appended = list(predecessor.operations)
+        previous = appended[-1]
+        for operation in shift.operations:
+            arrival = (
+                previous.arrival
+                + instance.setup_time_for_point(previous.point)
+                + instance.time_matrix[previous.point][operation.point]
+            )
+            appended.append(replace(operation, arrival=arrival))
+            previous = appended[-1]
+        shifts = [
+            replace(other, operations=tuple(appended))
+            if other_position == pred_position
+            else other
+            for other_position, other in enumerate(solution.shifts)
+            if other_position != position
+        ]
+        result.append(_reindex(Solution(tuple(shifts))))
+        if len(result) >= config.candidates_per_move:
+            break
+    return result
+
+
+def _unsatisfied_call_in_orders(
+    instance: Instance,
+    solution: Solution,
+) -> list[tuple[int, float, int, int]]:
+    """Return (customer_point, needed_quantity, earliest, latest) per short order."""
+    deliveries: dict[int, list[Operation]] = {}
+    for shift in solution.shifts:
+        for operation in shift.operations:
+            if operation.quantity > 0:
+                deliveries.setdefault(operation.point, []).append(operation)
+    shortfalls: list[tuple[int, float, int, int]] = []
+    for customer in instance.customers:
+        if not customer.call_in:
+            continue
+        for order in customer.orders:
+            delivered = sum(
+                operation.quantity
+                for operation in deliveries.get(customer.index, ())
+                if order.earliest_time <= operation.arrival <= order.latest_time
+            )
+            floor = order.min_quantity_to_satisfy
+            if delivered + 1e-6 >= floor:
+                continue
+            # The satisfaction floor is exclusive in practice (see SKILL.md);
+            # aim one unit above it, bounded by the order's nominal ceiling.
+            needed = min(floor - delivered + 1.0, order.quantity - delivered)
+            if needed <= 0:
+                continue
+            shortfalls.append(
+                (customer.index, needed, order.earliest_time, order.latest_time),
+            )
+    return shortfalls
+
+
+def _balanced_reload_stop_candidates(
+    instance: Instance,
+    solution: Solution,
+    config: SurgicalSearchConfig,
+    rng: random.Random,
+) -> list[Solution]:
+    """Serve a short call-in order from an existing shift, product included.
+
+    Adding a stop for a missed order is useless when the host trailer has no
+    product to spare, and reloading "to full" cascades: every downstream reload
+    was sized against the old stock.  This move inserts the delivery stop and a
+    load of *exactly the delivered amount* earlier in the same route, so the
+    trailer leaves the shift with its stock unchanged and the edit is local by
+    construction.  Hosts are ranked by detour cost; arrivals later in the route
+    are pushed only as far as chain feasibility requires, so existing slack
+    absorbs the detour where it can.
+    """
+    shortfalls = _unsatisfied_call_in_orders(instance, solution)
+    if not shortfalls:
+        return []
+    result: list[Solution] = []
+    cap = max(4, config.candidates_per_move)
+    source_points = tuple(instance.source_by_point)
+    base = instance.base_index
+    for customer_point, needed, earliest, latest in shortfalls:
+        customer = instance.customer_by_point[customer_point]
+        hosts: list[tuple[int, int, int]] = []
+        for position, shift in enumerate(solution.shifts):
+            if not shift.operations:
+                continue
+            if customer.allowed_trailers and shift.trailer not in customer.allowed_trailers:
+                continue
+            for insert_at in range(len(shift.operations) + 1):
+                previous_point = (
+                    base if insert_at == 0
+                    else shift.operations[insert_at - 1].point
+                )
+                previous_arrival = (
+                    shift.start if insert_at == 0
+                    else shift.operations[insert_at - 1].arrival
+                    + instance.setup_time_for_point(previous_point)
+                )
+                arrival = previous_arrival + instance.time_matrix[previous_point][customer_point]
+                if arrival > latest:
+                    continue
+                arrival = max(arrival, earliest)
+                hosts.append((position, insert_at, arrival))
+        def detour(item):
+            position, insert_at, _arrival = item
+            previous = (
+                base if insert_at == 0
+                else solution.shifts[position].operations[insert_at - 1].point
+            )
+            return instance.time_matrix[previous][customer_point]
+
+        # Bound positions per host shift: the shifts already stopping at the
+        # customer have zero detour but are usually the ones out of product
+        # or driving slack, and they would crowd every other host out.
+        rng.shuffle(hosts)
+        by_shift: dict[int, list[tuple[int, int, int]]] = {}
+        for item in hosts:
+            by_shift.setdefault(item[0], []).append(item)
+        ranked_shifts = sorted(
+            by_shift.values(), key=lambda items: min(detour(i) for i in items),
+        )
+        combos: list[tuple[int, int, int, int, int]] = []
+        for items in ranked_shifts[: max(4, cap // 2)]:
+            for position, insert_at, arrival in sorted(items, key=detour)[:2]:
+                shift = solution.shifts[position]
+                for reload_at in {0, insert_at}:
+                    previous_point = (
+                        base if reload_at == 0
+                        else shift.operations[reload_at - 1].point
+                    )
+                    # Pick the source that costs the least driving at this
+                    # reload position, not the one nearest the customer —
+                    # the reload leg is the detour being paid for.
+                    next_point = (
+                        shift.operations[reload_at].point
+                        if reload_at < len(shift.operations)
+                        else customer_point
+                    )
+                    source = min(
+                        source_points,
+                        key=lambda point: (
+                            instance.time_matrix[previous_point][point]
+                            + instance.time_matrix[point][next_point]
+                        ),
+                    )
+                    combos.append((position, insert_at, arrival, reload_at, source))
+        for position, insert_at, arrival, reload_at, source in combos:
+            shift = solution.shifts[position]
+            stop = Operation(point=customer_point, arrival=arrival, quantity=needed)
+            previous_point = (
+                base if reload_at == 0
+                else shift.operations[reload_at - 1].point
+            )
+            previous_arrival = (
+                shift.start if reload_at == 0
+                else shift.operations[reload_at - 1].arrival
+                + instance.setup_time_for_point(previous_point)
+            )
+            reload = Operation(
+                point=source,
+                arrival=previous_arrival + instance.time_matrix[previous_point][source],
+                quantity=-needed,
+            )
+            operations = list(shift.operations)
+            operations.insert(insert_at, stop)
+            operations.insert(reload_at, reload)
+            # Re-chain arrivals: keep each original arrival unless the
+            # detour makes it physically unreachable, in which case push
+            # it to the earliest chain-feasible minute.
+            rechained: list[Operation] = []
+            previous = None
+            for operation in operations:
+                if previous is not None:
+                    minimum = (
+                        previous.arrival
+                        + instance.setup_time_for_point(previous.point)
+                        + instance.time_matrix[previous.point][operation.point]
+                    )
+                    if operation.arrival < minimum:
+                        operation = replace(operation, arrival=minimum)
+                rechained.append(operation)
+                previous = operation
+            shifts = list(solution.shifts)
+            shifts[position] = replace(shift, operations=tuple(rechained))
+            result.append(_reindex(Solution(tuple(shifts))))
+            if len(result) >= cap:
+                return result
+    return result
 
 
 def _retime_joint_blockers(

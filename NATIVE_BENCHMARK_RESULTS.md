@@ -44,25 +44,182 @@ meaningful among officially valid solutions.
 
 ## Current demonstrated milestones
 
-| Instance | Provenance | Released checker | Wall time | LR |
-| --- | --- | ---: | ---: | ---: |
-| V2.13 | **native-cold-start** | **VALID** | 345 s | — |
-| V2.16.2 | **native-cold-start** | **VALID** | 62 s | 0.042634 |
-| V2.19 | **native-cold-start** | **VALID** | 104 s | 0.096702 |
-| V2.20.2 | **native-cold-start** | **VALID** | 150 s | 0.032622 |
-| V2.21.2 | **native-cold-start** | **VALID** | 678 s | 0.032982 |
-| V2.24 | **native-cold-start** | **VALID** | 789 s | — |
-| V2.25 | **native-cold-start** | **VALID** | ~80 min total | 0.035982 |
-| V2.14 | **native-cold-start** | **VALID** | 32 s | 0.084934 |
-| V2.12 | native-repair | VALID | — | 0.027209 |
+Ten of the fifteen Set B instances are officially valid. Benchmark policy as of
+2026-08-10: a result is competition-comparable only when produced by a single
+30-minute run (construction + search, one seed, no resumed state), matching the
+official protocol. Chained resume rounds remain a legitimate exploration tool
+but are reported separately and never share a table with budget-compliant rows.
 
-All eight cold starts were produced on 2026-08-07 by `vrp-solver native-solve`
+### Competition-budget regression, 2026-08-10
+
+One `native-solve-batch` sweep over all 15 instances — seed 1, 1800 s each,
+released-checker verification inside the run. Logs and artifacts under
+`scratch/regress_full/`; every valid row is a genuine cold start.
+
+| Instance | Released checker | LR (single 30-min run) | vs. milestone |
+| --- | ---: | ---: | --- |
+| V2.13 | **VALID** | 0.070567 | slightly better |
+| V2.14 | **VALID** | 0.084934 | exact reproduction |
+| V2.16.2 | **VALID** | 0.042634 | exact reproduction |
+| V2.19 | **VALID** | 0.096702 | exact reproduction |
+| V2.20.2 | **VALID** | 0.031588 | better |
+| V2.21.2 | **VALID** | 0.033473 | slightly worse |
+| V2.24 | **VALID** | 0.028583 | slightly worse |
+| V2.25 | **VALID** | **0.038978** | **now closes inside 30 min** (milestone needed ~80 min) |
+| V2.12, V2.15, V2.17, V2.18, V2.22, V2.23, V2.26 | INVALID | — | do not close from cold in 30 min |
+
+All eight documented cold starts reproduce as valid at the competition budget,
+so the recent engine work (quantity decoder, staged primitives, Cython kernels,
+LLH0/LLH5, roulette selector) did not disturb the shipping path — expected,
+since `surgical_search` remains the default engine until step 5. The V2.25 row
+retires that instance's 80-minute exception:
+`scratch/regress_full/V2.25_native.xml`, SHA-256
+`f84829c3fd09df04465c388b067579ea7ba612b0e44df67d23b370525d657282`.
+Three exact LR reproductions pin the pipeline as unchanged; the small wobbles
+on V2.13/V2.20.2/V2.21.2/V2.24 are run-to-run variation of the restart-round
+schedule.
+
+### Best-known artifacts (any provenance)
+
+Every row re-verified with `Checker_V2.2_07032016.zip` against the exact XML
+named; `scratch/verify_setb.py` reproduces the sweep.
+
+| Instance | Provenance | Released checker | LR | Artifact |
+| --- | --- | ---: | ---: | --- |
+| V2.12 | native-repair | **VALID** | 0.027209 | `scratch/v212_skill_orders_final_local.xml` |
+| V2.13 | native-cold-start | **VALID** | 0.070567 | `scratch/regress_full/V2.13_native.xml` |
+| V2.14 | native-cold-start | **VALID** | 0.084934 | `scratch/cold_V2.14_cadence.xml` |
+| V2.15 | **fast-search (LLH0/LLH5)** | **VALID** | **0.039373** | `scratch/valid_V2.15_lr2.xml` |
+| V2.16.2 | native-cold-start | **VALID** | 0.042634 | `scratch/cold_V2.16.2_batch.xml` |
+| V2.19 | native-cold-start | **VALID** | 0.096702 | `scratch/opt_V2.19_native.xml` |
+| V2.20.2 | native-cold-start | **VALID** | 0.031588 | `scratch/regress_full/V2.20.2_native.xml` |
+| V2.21.2 | native-cold-start | **VALID** | 0.032982 | `scratch/opt_V2.21.2_native.xml` |
+| V2.24 | native-cold-start | **VALID** | 0.027025 | `scratch/replicate_V2.24_native.xml` |
+| V2.25 | native-cold-start | **VALID** | 0.035982 | `scratch/opt3_V2.25_native.xml` |
+| V2.17 | fast-search (chained) | INVALID | — | `scratch/chain_V2.17_best.xml` (186 internal errors) |
+| V2.18 | fast-search (LLH0/LLH5) | INVALID | — | `scratch/camp_V2.18_s11.xml` (116 internal errors) |
+| V2.22 | fast-search (decoder) | INVALID | — | `scratch/dec_V2.22.xml` |
+| V2.23 | fast-search (decoder) | INVALID | — | `scratch/dec_V2.23.xml` |
+| V2.26 | **fast-search + surgical probes** | **VALID** | **0.036609** | `scratch/valid_V2.26_surgical.xml` |
+
+V2.15's best artifact improved on 2026-08-10 from LR 0.055610 to **0.039373**
+(a 2-minute fast-search polish of the valid solution, re-verified;
+`scratch/valid_V2.15_lr2.xml`, SHA-256
+`11591f5e3ad012ac9dab143c0065439b6864f330ff554f93959524c2e8ab88c2`). The
+original closure artifact remains `scratch/valid_V2.15_llh.xml` at 0.055610.
+
+### Exploration ceilings on the open instances (not competition-comparable)
+
+Chained fast-search resume rounds (25 min each, each seeding from the prior
+best) establish how far the current operator set can descend, irrespective of
+budget:
+
+- **V2.17: 1,206 -> 186 errors** over 12 rounds (~5 h), improving every round
+  with no plateau at cutoff. The instance is closable by this operator set;
+  what is missing is reaching that depth inside 1800 s.
+- **V2.26: CLOSED 2026-08-11** (6 -> 0 errors, officially valid, LR 0.036609,
+  `scratch/valid_V2.26_surgical.xml`, SHA-256
+  `1172aecfe322ac19dfb4fd7924c9e10b31be4cf5797fee0d621270d50eb97775`). The
+  descent: surgical rounds with the new `multiroute_pressure_block` /
+  `pressure_band_resource_block` operators took 6 -> 5 -> (4 after a manual
+  merge probe) -> 1; the last two errors fell to hand-constructed probes that
+  are candidate production operators. (a) The DRI01 on a lone-reload shift was
+  closed by *merging the reload into the predecessor shift* (same driver +
+  trailer) and deleting the shift — delaying it was provably infeasible because
+  the driver's 550-min gaps bound on both sides. (b) The final missed order
+  (customer 10, floors of three co-hosted call-ins exceeded every reachable
+  trailer's capacity) was closed by a *balanced reload+stop insertion*: append
+  the delivery stop to a timing-feasible shift on a different trailer and add a
+  same-size reload at the route head, so the trailer leaves the shift with its
+  stock unchanged and nothing cascades downstream. Both moves are now
+  production operators (`merge_lone_reload_shift`,
+  `balanced_reload_stop_insert` in `surgical_search.py`, wired into the
+  coverage rotation, the DRI01 structural schedule, and `native-solve`'s
+  restart rotation, with unit tests). This artifact is
+  a repaired native-lineage artifact, not a cold start.
+- **V2.26 hands-off CLI closure (2026-08-11, same day):** with the new
+  operators shipped, a fully autonomous chain closed the instance from the
+  instance XML alone. `native-solve --seed 2 --time-limit 1800
+  --restart-rounds 8` reached 1 error (construction seeded 13;
+  `balanced_reload_stop_insert` accepted as a new best during the descent),
+  then one `native-solve --resume-from` round (~4 min) closed it:
+  `recombine_route_blocks` restructured the window, `create_shift` served the
+  final order. Officially valid, LR 0.042263, `out/V2.26_coldstart_s2r.xml`,
+  SHA-256 `71d5a200de02c65cc9c9ecc673e7efdcc9a80377b5b0d4ed082e88dcc3060d48`.
+  A chained native result (~34 min total), not a single-budget cold start:
+  seed 1 at the same budget plateaus at 2 errors, so the 30-minute single-run
+  claim remains open. Best LR remains the surgical artifact (0.036609).
+- **V2.18: 188 -> 116 errors** in one 15-minute run; driver/layover rules
+  (DRI01/DRI08/LAY02) dominate its checker breakdown, a different failure mode
+  from the tank-dominated instances.
+- **V2.18 fast-engine cold runs (2026-08-11):** `native-solve --engine fast`
+  (the step-5 CLI integration of the rebuilt search) took the cold seed
+  4,243 -> **729** errors in one 30-minute budget (seed 1; seed 2 reached
+  890), where the surgical engine made zero progress from the same seed —
+  its 220-second rounds stall outright at 136 points. One fast
+  `--resume-from` round continued 729 -> 638, so the chain still descends
+  but the tail is a grind. Two structural blockers measured: the constructor
+  leaves **69 of 134 customers unscheduled** (the seed itself is the
+  ceiling), and both idle-cap settings now produce identical 4,243-error
+  seeds on this instance. Artifacts: `out/V2.18_fast_s1.xml`,
+  `out/V2.18_fast_r2.xml` (both invalid, exploration only).
+- **V2.17 / V2.22 / V2.23 fast-engine budget runs (2026-08-11, seed 1, one
+  30-minute `native-solve --engine fast` each, all invalid/exploration):**
+  V2.17 seed 6,312 -> **508** (the previous 186-error mark needed ~5 hours of
+  chained rounds; one budgeted run now lands within 3x of it). V2.22 seed
+  6,352 -> **955**. V2.23 seed **255** -> **112** — the constructor now seeds
+  V2.23 an order of magnitude better than the documented 2,642, and it is the
+  clear next-closest instance. Its residual is spread across codes
+  (85 QS02, 19 QS01, 11 DRI01, plus a few SHI/LAY), so the next lever there
+  is chained fast resume rounds, then the surgical portfolio near zero.
+  Artifacts: `out/V2.1{7,22,23}_fast_s1.xml`... (`out/V2.23_fast_s1.xml`).
+  Continuation measured the plateau precisely: a second fast round ran
+  **2,008,044 steps without moving 112**, and eight surgical rounds ground
+  112 -> **104** (`out/V2.23_surgical_r3.xml`). The residual is
+  82 QS02 tank-safety breach steps (safety deficit 435,670 qm) plus
+  19 QS01 / 11 DRI01 — the trapped-capacity/resource-cadence class, the same
+  signature as V2.15's plateau, not a single missing move. Next lever is
+  seed coverage / joint-slack repair at scale, not more search budget.
+
+### V2.15, and what closed it
+
+V2.15 is the tenth instance and the first closed by the rebuilt fast search
+rather than by construction. Its single remaining error was
+`checkQS01 MissedOrder[0] of the customer[37]`, and reading the instance XML
+made the cause exact. That order is `quantity=8000`,
+`window=[1440,1860]`, `orderQuantityFlexibility=80`, so the least amount that
+satisfies it is `0.80 * 8000 = 6400.0` — and the decoder was delivering
+**exactly 6400.0**. The quantity decoder's "least possible amount" rule
+(TS2020 sec. 3.1) lands precisely on the satisfaction boundary, and the released
+checker resolves that tie against the solution: sitting *on* the minimum ratio
+counts the order as missed. The HUST reference delivers the full 8000 to the
+same customer.
+
+The fix was not a quantity change. LLH0/LLH5 targeting (insert or replace using
+the customer with the earliest unsatisfied demand or order, per TS2020 sec. 3.2)
+gave the search a route on which the order could be served properly, and the
+resulting topology is our own: 11 shifts / 53 operations, against the HUST
+reference's 21 / 80.
+
+`scratch/valid_V2.15_llh.xml`, SHA-256
+`d30d0dc5edb2b4a82e861b5e2abf77963f08f93be287fd215976ad9baf5800c8`
+(a stable copy of the run output `scratch/llh_V2.15.xml`).
+
+One discrepancy is open and worth pinning down: the run log recorded 1 published
+error for the V2.15 seed-1 row, while both the internal scorer and the checker
+report zero on the saved file. The best-so-far selection and the logged best
+therefore disagree about which solution they are describing.
+
+The eight cold starts were produced on 2026-08-07 by `vrp-solver native-solve`
 (instance XML + seed only; V2.25 additionally continued through
 `surgical_search` restart rounds from its own native checkpoint) and verified
 with the released checker on Windows. Seven of the eight finished inside the
-official 30-minute budget. Exact XMLs (SHA-256):
+official 30-minute budget at the time; the 2026-08-10 regression above closed
+V2.25 inside the budget as well, so all eight are now demonstrated at
+competition conditions. Exact XMLs (SHA-256):
 
 - V2.13: `scratch/replicate_V2.13_native.xml`
+  `6ec05835c64f41a002222e0792d132298edd4db53063ee632d0af4c02d68a9f2`
 - V2.16.2: `scratch/cold_V2.16.2_batch.xml`
   `527becb29ddc9d21f835b01c19ede4844d86e09e1f13a37971f8cce91fba1a8b`
   (LR 0.042634, produced by `native-solve-batch`, superseding
@@ -74,6 +231,7 @@ official 30-minute budget. Exact XMLs (SHA-256):
 - V2.21.2: `scratch/opt_V2.21.2_native.xml`
   `237cab0c61d310427dc2d50e1aa106704ee3fd293e8bc9fce3d489a40381db05`
 - V2.24: `scratch/replicate_V2.24_native.xml`
+  `5b74a6f36729937d5cece9d30bc9d04eab8f7f384bc96579ca43259906609e85`
 - V2.25: `scratch/opt3_V2.25_native.xml`
   `a407cde5d2f0ddc1ba34a0471328ac7cd374067c48b046aee07b9b2f1c4bedc7`
 - V2.14: `scratch/cold_V2.14_cadence.xml`
@@ -83,8 +241,8 @@ V2.14 is the first instance to reach zero errors from construction alone, with
 no topology search at all, using the mid-route idle cap
 (`native-solve --idle-cap 180`, 73 shifts, 282 operations, 32 s).
 
-Remaining Set B instances (V2.15, V2.17, V2.18, V2.22, V2.23, V2.26, and a
-V2.12 cold start) have not reached zero errors. The earlier "constructor
+Remaining Set B instances (V2.17, V2.18, V2.22, V2.23, V2.26, and a V2.12 cold
+start) have not reached zero errors. The earlier "constructor
 coverage" diagnosis was wrong: measurement showed the constructor already
 serves 137 of 140 naturally breaching V2.12 tanks. The measured cause is
 resource cadence — 46,624 idle minutes against 34,273 travel minutes, with 40

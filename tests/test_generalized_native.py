@@ -91,14 +91,17 @@ def test_missing_coverage_rotates_across_topology_surfaces() -> None:
     ) == "multiroute_pressure_block"
     assert _coverage_rebuild_operator(
         instance, empty, config, iteration=4, stagnation=4,
+    ) == "balanced_reload_stop_insert"
+    assert _coverage_rebuild_operator(
+        instance, empty, config, iteration=5, stagnation=5,
     ) == "replace_operation_point"
 
     development = replace(config, coverage_include_ejection=False)
     assert _coverage_rebuild_operator(
-        instance, empty, development, iteration=3, stagnation=3,
-    ) == "multiroute_pressure_block"
-    assert _coverage_rebuild_operator(
         instance, empty, development, iteration=4, stagnation=4,
+    ) == "balanced_reload_stop_insert"
+    assert _coverage_rebuild_operator(
+        instance, empty, development, iteration=5, stagnation=5,
     ) == "recombine_route_blocks"
 
 

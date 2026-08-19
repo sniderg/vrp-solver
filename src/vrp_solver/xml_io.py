@@ -200,8 +200,16 @@ def save_solution(solution: Solution, path: str | Path) -> None:
     root = ET.Element("IRP_Roadef_Challenge_Output")
     shifts_element = ET.SubElement(root, "Shifts")
 
+    # Operation-free shifts are dropped.  The official truncation already
+    # ignores them when scoring, so this changes no result, but the released
+    # checker throws an unhandled .NET exception on an empty <operations />
+    # element (return code 0xE0434352) and reports execution_failed instead of
+    # a verdict.  Writing them out therefore loses the run.
     for output_index, shift in enumerate(
-        sorted(solution.shifts, key=lambda item: (item.start, item.index))
+        sorted(
+            (s for s in solution.shifts if s.operations),
+            key=lambda item: (item.start, item.index),
+        )
     ):
         shift_element = ET.SubElement(shifts_element, "IRP_Roadef_Challenge_Shift_")
         ET.SubElement(shift_element, "index").text = str(output_index)

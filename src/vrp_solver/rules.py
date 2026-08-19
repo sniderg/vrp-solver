@@ -510,6 +510,20 @@ def _validate_service_quality(instance: Instance, solution: Solution) -> list[Ru
                         point=customer.index,
                     )
                 )
+            elif delivered > order.quantity + EPSILON:
+                # The nominal quantity is a ceiling, not a target: the released
+                # checker reports an over-delivered order as a *missed* order.
+                # Measured on V2.24 order 0 of customer 6 (min 9600, nominal
+                # 12000): 9600, 10800 and 12000 all pass, 12001 produces
+                # "[ checkQS01 MissedOrder ] : Missed Order[0] of the
+                # customer[6]".
+                violations.append(
+                    _violation(
+                        "QS01",
+                        f"order {order_index} delivered {delivered}, above nominal {order.quantity}",
+                        point=customer.index,
+                    )
+                )
             elif delivered + EPSILON < order.quantity:
                 violations.append(
                     _violation(

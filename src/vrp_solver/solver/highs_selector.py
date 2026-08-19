@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, List, Dict, Tuple, Set
 import os
+import time
 
 from ..model import Instance, Solution, Shift, Operation
 from ..inventory import project_customer_inventory, tank_events
@@ -110,8 +111,13 @@ def select_shifts_with_highs(
 
         highs = highspy.Highs()
         highs.setOptionValue("output_flag", selector_config.output)
-        if selector_config.threads is not None:
-            highs.setOptionValue("threads", selector_config.threads)
+        if selector_config.threads is not None and selector_config.threads > 1:
+            # HiGHS >= 1.15: parallel MIP search is opt-in via "parallel".
+            # Leave "threads" at 0 (auto): the process-global scheduler is
+            # sized by the first HiGHS run in the process, and a later run
+            # with a *different* explicit thread count fails with kError.
+            # Auto always adapts to the existing scheduler.
+            highs.setOptionValue("parallel", "on")
         inf = highspy.kHighsInf
         integer_type = highspy.HighsVarType.kInteger
 
@@ -342,9 +348,15 @@ def select_shifts_with_highs(
         has_solution = values is not None
     else:
         highs.setOptionValue("time_limit", selector_config.time_limit)
+        solve_start = time.perf_counter()
         highs.run()
+        solve_seconds = time.perf_counter() - solve_start
         status = highs.modelStatusToString(highs.getModelStatus())
-        print(f"HiGHS Status: {status}")
+        print(
+            f"HiGHS Status: {status} "
+            f"({solve_seconds:.1f}s, {highs.getNumCol()} cols, "
+            f"{highs.getInfo().mip_node_count} nodes)"
+        )
         has_solution = highs.getInfo().primal_solution_status == 2 or "Optimal" in status or "Feasible" in status
         if has_solution:
             values = highs.getSolution().col_value

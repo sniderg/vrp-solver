@@ -49,6 +49,145 @@ def project_inventory_core(
     return np.asarray(inventory_out), np.asarray(breach_out)
 
 
+def score_customer_row(
+    double initial_qty,
+    double[:] forecast,
+    double[:] deliveries,
+    double capacity,
+    double safety_level,
+    int horizon,
+    int unit_mins,
+):
+    """Single-customer tank aggregates for the incremental search substrate.
+
+    Mirrors ``vrp_solver.fast.state.SearchState._recompute_customer_tank``
+    exactly, collapsing its five separate numpy passes (cumsum plus three
+    ``count_nonzero`` plus the deficit sum) into one C loop.  The Python
+    version stays as the reference oracle for the equivalence test.
+
+    Returns ``(breach_steps, negative_steps, overfill_steps,
+    has_breach, safety_kg_min)``.
+    """
+    cdef int breaches = 0
+    cdef int negatives = 0
+    cdef int overfills = 0
+    cdef double safety_kg_min = 0.0
+    cdef double inventory = initial_qty
+    cdef double ending, deficit
+    cdef double EPS = 1e-6
+    cdef double over_limit = capacity + EPS
+    cdef double under_limit = safety_level - EPS
+    cdef int step
+
+    for step in range(horizon):
+        ending = inventory + deliveries[step] - forecast[step]
+        if ending < -EPS:
+            negatives += 1
+        if ending > over_limit:
+            overfills += 1
+        if ending < under_limit:
+            breaches += 1
+        deficit = under_limit - ending
+        if deficit > 0.0:
+            safety_kg_min += deficit
+        inventory = ending
+
+    return (
+        breaches,
+        negatives,
+        overfills,
+        1 if breaches else 0,
+        safety_kg_min * unit_mins,
+    )
+
+
+def tank_bounds(
+    double initial_qty,
+    double[:] forecast,
+    double[:] deliveries,
+    int step,
+    double capacity,
+    double safety_level,
+):
+    """``(safety_need, headroom)`` for one VMI customer stop.
+
+    Mirrors ``vrp_solver.fast.decode._tank_bounds`` exactly: project the tank
+    level over the horizon, then take the deepest shortfall and the tightest
+    headroom over the tail from ``step`` onward.  The numpy version allocates a
+    cumsum array per call and the decoder makes one call per customer stop on
+    every search step; this loop allocates nothing.
+    """
+    cdef Py_ssize_t n = forecast.shape[0]
+    cdef double level = initial_qty
+    cdef double tail_max = -1e300
+    cdef double tail_min = 1e300
+    cdef double headroom, worst_short
+    cdef Py_ssize_t i
+
+    for i in range(n):
+        level += deliveries[i] - forecast[i]
+        if i >= step:
+            if level > tail_max:
+                tail_max = level
+            if level < tail_min:
+                tail_min = level
+
+    if tail_max == -1e300:  # empty tail
+        return 0.0, 0.0
+    headroom = capacity - tail_max
+    worst_short = safety_level - tail_min
+    return (
+        worst_short if worst_short > 0.0 else 0.0,
+        headroom if headroom > 0.0 else 0.0,
+    )
+
+
+def sum_shift_totals(list shifts, list by_trailer, list by_driver):
+    """One pass over the shift list: totals plus the resource membership index.
+
+    Mirrors ``vrp_solver.fast.state.SearchState._sum_shift_totals`` exactly,
+    including the deliberate full re-sum (delta accounting on floats drifts in
+    the last bits, which would make rollback inexact).  Called once per
+    mutation, so the Python attribute loop was the single largest line in the
+    V2.17 profile.
+
+    Returns ``(shift_errors, shift_warnings, cost, distance, delivered,
+    loaded)`` and fills ``by_trailer`` / ``by_driver`` in place.
+    """
+    cdef Py_ssize_t n_trailers = len(by_trailer)
+    cdef Py_ssize_t n_drivers = len(by_driver)
+    cdef long shift_errors = 0
+    cdef long shift_warnings = 0
+    cdef double cost = 0.0
+    cdef double distance = 0.0
+    cdef double delivered = 0.0
+    cdef double loaded = 0.0
+    cdef long trailer_id, driver_id
+    cdef object rec
+
+    for bucket in by_trailer:
+        (<list> bucket).clear()
+    for bucket in by_driver:
+        (<list> bucket).clear()
+
+    for rec in shifts:
+        if <list> rec.points:
+            trailer_id = rec.trailer
+            if 0 <= trailer_id < n_trailers:
+                (<list> by_trailer[trailer_id]).append(rec)
+            driver_id = rec.driver
+            if 0 <= driver_id < n_drivers:
+                (<list> by_driver[driver_id]).append(rec)
+        shift_errors += rec.local_errors
+        shift_warnings += rec.local_warnings
+        cost += rec.cost
+        distance += rec.distance
+        delivered += rec.delivered
+        loaded += rec.loaded
+
+    return (shift_errors, shift_warnings, cost, distance, delivered, loaded)
+
+
 def score_all_customers(
     double[:] initial_quantities,
     double[:,:] forecasts,
