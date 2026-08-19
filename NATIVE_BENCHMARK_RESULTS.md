@@ -42,6 +42,39 @@ The old costs, delivered volumes, logistic ratios, “wins”, and aggregate sco
 were calculated for invalid outputs and are withdrawn. Logistic ratio is only
 meaningful among officially valid solutions.
 
+## 2026-08-19 integrity audit and regression fix
+
+- **Inputs authenticated:** the checker archive and all 20 Set B/Set X instance
+  XMLs are byte-identical to fresh roadef.org downloads. The checker hash is
+  now enforced in code and the instance hashes pinned
+  (`src/vrp_solver/instance_manifest.py`, commit `2f2b437`).
+- **Withdrawn:** the `f2b58f7` commit-message claim of a "complete multi-stop
+  cold-start solver ... across all Set B and Set X instances"
+  (`solve_instance.py`). No officially valid artifact from that pipeline
+  survives re-verification; see the script's docstring for the measured
+  defects. A same-day session also circulated an 11-row "all VALID in 5-11 s"
+  table: 9 rows had no artifact at all, and the two artifacts that existed
+  (V2.12, X1) are rejected by the released checker (391 and 1,159 runouts).
+- **Regression fixed:** `f2b58f7` had routed every instance with a horizon
+  >= 28 days through the untested horizon-master constructor, bypassing the
+  proven cluster constructor (V2.14 seed: 0 errors -> 62,053). Fixed in
+  `4338493` (horizon-master is now one portfolio candidate, never a
+  replacement).
+- **Reference restored:** the supplied V2.12 reference solution had been
+  overwritten with an invalid file; restored from git and re-verified
+  (`official_valid,True`, LR 0.018496, SHA-256 `61a7ef87b50f...`).
+- **Confirmation sweep (in progress at pause):** `native-solve-batch`, seed 1,
+  1800 s, HiGHS only — first 8 results all VALID: V2.13 0.070567,
+  V2.14 0.084934, V2.16.2 0.042634, V2.19 0.096702, V2.20.2 0.031588,
+  V2.21.2 0.033473, V2.24 0.028583, V2.25 0.038978 (exact or near-exact
+  reproductions of the milestone table below). V2.15 (7 errors) and V2.26
+  (8 errors, safety deficit 0) were still descending at pause;
+  V2.12/V2.17/V2.18/V2.22/V2.23 sat at their documented plateaus. Artifacts
+  and logs: `out/setB_sweep/`. **Gurobi is not required for any valid
+  result**: the shipping path is Python/Cython + HiGHS; Gurobi remains an
+  optional substitute for the quantity-repair MILP only
+  (`ROADEF_SOLVER=gurobi`, single-process license).
+
 ## Current demonstrated milestones
 
 Ten of the fifteen Set B instances are officially valid. Benchmark policy as of

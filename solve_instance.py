@@ -1,5 +1,16 @@
-﻿"""Single standalone CLI script to solve any ROADEF 2016 IRP XML instance (Set B or Set X)
-from cold start with zero hints, and verify the resulting solution against the official C++ checker.
+﻿"""EXPERIMENTAL one-command cold-start pipeline (construction + Gurobi LP).
+
+Status correction (2026-08-19): this script has produced NO officially valid
+solution that survives re-verification.  Its only saved artifact (V2.12) is
+rejected by the released checker (3 missed orders, 391 runouts), and on V2.14
+every parameter-grid candidate yields an infeasible LP.  Known defects: the
+order lower bound sits exactly on the exclusive satisfaction floor (missed
+orders by construction), quantities are rounded *down* to 4 decimals below the
+LP's own bounds (SHI16 rejections), the tank model diverges from the checker's
+simulation, and the candidate loop swallows all exceptions.  Requires Gurobi.
+
+Use `vrp-solver native-solve` + `vrp-solver verify-official` for results you
+intend to report.
 
 Usage:
     uv run python solve_instance.py <input_instance_xml> <output_solution_xml> [--no-verify]

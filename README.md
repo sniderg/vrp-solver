@@ -38,24 +38,22 @@ pip install -e ".[gurobi]"
 ```
 This extra also installs Numba, which is required by the native Gurobi solver.
 
-## Quick Start: One-Command Cold-Start Solver
+## Quick Start: One-Command Cold-Start Solver (experimental)
 
-To solve any ROADEF 2016 instance XML (`Set B` or `Set X`) from cold start and automatically verify it against the official competition checker:
+`solve_instance.py` chains cluster construction, a Gurobi LP over delivery
+quantities, and checker-gated shift elimination:
 
 ```bash
 uv run python solve_instance.py <input_instance.xml> <output_solution.xml>
 ```
 
-**Example:**
-```bash
-uv run python solve_instance.py roadef_2016_data/set_B/Instances_B_V25-11042016/V2.12.xml out/V2.12_solution.xml
-```
-
-This single command:
-1. Performs cold-start cluster-based route construction (zero hints, zero historical data).
-2. Optimizes delivery quantities to global optimality via continuous LP.
-3. Eliminates redundant shifts while preserving 100% feasibility.
-4. Validates the resulting XML against the official C++ ROADEF checker (`THIS OUTPUT IS VALID`, 0 safety stock breaches, 0 penalties).
+> **Status correction (2026-08-19):** the earlier claim that this pipeline
+> produces officially valid solutions across all Set B and Set X instances is
+> withdrawn. The one artifact it left (`out/set_B/V2.12_solution.xml`) is
+> rejected by the released checker (3 missed orders, 391 runouts), and on
+> V2.14 every parameter-grid candidate yields an infeasible LP. Its inner
+> loop also swallows all exceptions. Treat it as an experiment; use
+> `native-solve` + `verify-official` below for results you intend to report.
 
 ---
 
