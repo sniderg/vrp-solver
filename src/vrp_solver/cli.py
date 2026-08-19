@@ -923,6 +923,9 @@ def cmd_verify_official(args: argparse.Namespace) -> int:
         checker_archive=archive,
         timeout_seconds=args.timeout,
     )
+    from .instance_manifest import classify_instance
+
+    print(f"instance_provenance,{classify_instance(args.instance_xml)}")
     print(f"official_status,{result.status}")
     print(f"official_valid,{result.valid}")
     print(f"message,{result.message}")
@@ -1031,6 +1034,9 @@ def cmd_native_solve(args: argparse.Namespace) -> int:
     started = time.monotonic()
     Path(args.output_xml).parent.mkdir(parents=True, exist_ok=True)
     deadline = started + args.time_limit
+    from .instance_manifest import classify_instance
+
+    print(f"instance_provenance,{classify_instance(args.instance_xml)}")
     instance = load_instance(args.instance_xml)
     policy = derive_cluster_construction_policy(instance)
     end_day = max(1, (instance.horizon * instance.unit + 1439) // 1440)

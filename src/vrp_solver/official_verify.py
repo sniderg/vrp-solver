@@ -20,6 +20,11 @@ import zipfile
 
 
 V2_ARCHIVE_NAME = "Checker_V2.2_07032016.zip"
+# SHA-256 of the archive as downloaded from
+# https://roadef.org/challenge/2016/files/Checker_V2.2_07032016.zip
+# (byte-compared against the official site 2026-08-19).  A verdict from any
+# other archive is meaningless, so a hash mismatch fails closed.
+V2_ARCHIVE_SHA256 = "fc5c4aec01b78fd10d6fd733ea6659baf676b34b6d3a0e93fab8751bbb5b494a"
 V2_EXE_MEMBER = (
     "Challenge_Roadef_EURO_Checker_V2/bin/Release/"
     "IRP_Roadef_Challenge_Checker.exe"
@@ -81,6 +86,14 @@ def verify_v2_solution(
         launcher = [mono]
 
     archive_hash = _sha256(archive)
+    if archive_hash != V2_ARCHIVE_SHA256:
+        return _unavailable(
+            "checker archive SHA-256 does not match the released "
+            f"Checker_V2.2_07032016.zip (expected {V2_ARCHIVE_SHA256}, "
+            f"got {archive_hash}); refusing to run an unofficial checker",
+            archive,
+            archive_hash,
+        )
     try:
         with zipfile.ZipFile(archive) as bundle:
             try:

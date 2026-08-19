@@ -73,8 +73,17 @@ to use unless you were asked for something else. See
    Windows use the venv interpreter explicitly, e.g. `.venv/Scripts/python.exe`.
 2. `roadef_2016_data/Checker_V2.2_07032016.zip` must exist for verification.
    Its SHA-256 must be
-   `fc5c4aec01b78fd10d6fd733ea6659baf676b34b6d3a0e93fab8751bbb5b494a`.
-   Verification runs the `.exe` natively on Windows and under Mono elsewhere.
+   `fc5c4aec01b78fd10d6fd733ea6659baf676b34b6d3a0e93fab8751bbb5b494a`
+   (byte-identical to the roadef.org download; `verify-official` now refuses
+   any archive with a different hash). Verification runs the `.exe` natively
+   on Windows and under Mono elsewhere.
+
+Both `native-solve` and `verify-official` print an `instance_provenance` line
+classifying the instance XML against pinned SHA-256s of the official roadef.org
+Set B/Set X downloads (`src/vrp_solver/instance_manifest.py`): `official`,
+`MODIFIED-OFFICIAL` (an official filename with altered content — never report
+results on such a file as benchmark results), or `not-in-manifest` (a private
+or simulated instance, a supported workflow).
 
 ### Two commands
 

@@ -77,6 +77,8 @@ def solve_with_gurobi_if_requested(
             finally:
                 model.dispose()
     except gp.GurobiError as exc:
-        print(f"⚠️ Gurobi Solver Warning: Gurobi failed with error: {exc}")
-        print("💡 Automatically falling back to open-source HiGHS solver to complete the run!")
+        # ASCII only: emoji here crashes under Windows cp1252 and turns this
+        # graceful HiGHS fallback into an unhandled UnicodeEncodeError.
+        print(f"gurobi_warning,{exc}")
+        print("gurobi_fallback,highs")
         return "Unsolved", None, False
