@@ -27,13 +27,15 @@ The remaining work, with the confidence each item deserves:
   fixes a seed that never visits half the customers). V2.12/V2.23 residuals
   are trapped-capacity/resource-cadence (joint driver+trailer slack, not
   aggregate slack).
-- **HYPOTHESIS, the designed next step (not yet built):** optimization-based
-  seeding — enumerate candidate routes, select a covering set with a HiGHS
-  set-covering MILP, assign resources with the interval-clique MIP instead of
-  the greedy placement gate; and wire the exact quantity-LP/resource-MIP in
-  as *search-time repair* so operators whose candidates fail only on
-  resources or quantities stop returning nothing. Plausible by analogy to the
-  measured polish gains; unproven as a constructor.
+- **MEASURED, the breakthrough (2026-08-20):** exact-repair inside the loop
+  works. `joint_restructure.py` (quantities + reloads + removals + customer
+  stops + new-shift columns, escalated by infeasibility certificates) moved
+  every open instance to its best state ever: V2.23 61->15, V2.18 638->166,
+  V2.17 ->191 in seconds, V2.22 953->288. None validated yet - search
+  endgames + iteration remain. Set `ROADEF_SOLVER=gurobi` above ~700
+  binaries: HiGHS times out on V2.22's 2,778-binary model where Gurobi
+  solves in 24.5 s (frontier measured, `out/highs_timings.csv` is the
+  trigger for new families).
 - **HYPOTHESIS, cheap multiplier (not yet built):** an algorithm-configuration
   harness (Optuna or irace) over the exposed constants — multi-seed,
   multi-instance, fixed-cap fitness, checker-gated promotion. Likely converts
