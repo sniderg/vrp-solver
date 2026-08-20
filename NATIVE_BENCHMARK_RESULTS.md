@@ -187,8 +187,14 @@ publishable artifact.
 
 Same session, V2.23 fast-engine seed portfolio (seeds 2-5): finals
 62 / 96 / 122 / 144 vs seed 1's 112-error plateau — **seed 2's 62 errors is
-the best state V2.23 has ever reached**; a chained fast resume from that
-checkpoint is running.
+the best state V2.23 has ever reached**. The chained fast resume then ran
+2.18M steps and moved 62 -> **61**: seed choice relocates the plateau, search
+cannot descend from it. Checker breakdown of the 61-error state
+(`out/v223_fast/V2.23_s2_resume.xml`): SHI06 x203 (trailer stock
+consistency) dominates, plus DRI01 x7 and singleton LAY/SHI/TL codes — the
+residual is a resource/stock-chain restructuring problem, reinforcing that
+the lever is exact resource/quantity repair inside the search
+(interval-clique MIP + quantity LP), not more budget.
 
 ## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
 
