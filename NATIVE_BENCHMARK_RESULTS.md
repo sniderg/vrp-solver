@@ -77,7 +77,8 @@ meaningful among officially valid solutions.
 
 ## Current demonstrated milestones
 
-Ten of the fifteen Set B instances are officially valid. Benchmark policy as of
+Eleven of the fifteen Set B instances are officially valid (see the
+best-known table below; open: V2.17, V2.18, V2.22, V2.23). Benchmark policy as of
 2026-08-10: a result is competition-comparable only when produced by a single
 30-minute run (construction + search, one seed, no resumed state), matching the
 official protocol. Chained resume rounds remain a legitimate exploration tool
@@ -117,23 +118,52 @@ schedule.
 Every row re-verified with `Checker_V2.2_07032016.zip` against the exact XML
 named; `scratch/verify_setb.py` reproduces the sweep.
 
-| Instance | Provenance | Released checker | LR | Artifact |
-| --- | --- | ---: | ---: | --- |
-| V2.12 | native-repair | **VALID** | 0.027209 | `scratch/v212_skill_orders_final_local.xml` |
-| V2.13 | native-cold-start | **VALID** | 0.070567 | `scratch/regress_full/V2.13_native.xml` |
-| V2.14 | native-cold-start | **VALID** | 0.084934 | `scratch/cold_V2.14_cadence.xml` |
-| V2.15 | **fast-search (LLH0/LLH5)** | **VALID** | **0.039373** | `scratch/valid_V2.15_lr2.xml` |
-| V2.16.2 | native-cold-start | **VALID** | 0.042634 | `scratch/cold_V2.16.2_batch.xml` |
-| V2.19 | native-cold-start | **VALID** | 0.096702 | `scratch/opt_V2.19_native.xml` |
-| V2.20.2 | native-cold-start | **VALID** | 0.031588 | `scratch/regress_full/V2.20.2_native.xml` |
-| V2.21.2 | native-cold-start | **VALID** | 0.032982 | `scratch/opt_V2.21.2_native.xml` |
-| V2.24 | native-cold-start | **VALID** | 0.027025 | `scratch/replicate_V2.24_native.xml` |
-| V2.25 | native-cold-start | **VALID** | 0.035982 | `scratch/opt3_V2.25_native.xml` |
-| V2.17 | fast-search (chained) | INVALID | — | `scratch/chain_V2.17_best.xml` (186 internal errors) |
-| V2.18 | fast-search (LLH0/LLH5) | INVALID | — | `scratch/camp_V2.18_s11.xml` (116 internal errors) |
-| V2.22 | fast-search (decoder) | INVALID | — | `scratch/dec_V2.22.xml` |
-| V2.23 | fast-search (decoder) | INVALID | — | `scratch/dec_V2.23.xml` |
-| V2.26 | **fast-search + surgical probes** | **VALID** | **0.036609** | `scratch/valid_V2.26_surgical.xml` |
+| Instance | Provenance | Released checker | LR (Baseline) | LR (Polished Multi-Drop) | LR Improvement | Artifact |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| V2.12 | native-repair | **VALID** | 0.027209 | — | Baseline | `scratch/v212_skill_orders_final_local.xml` |
+| V2.13 | deep-polish | **VALID** | 0.070567 | **0.042045** | **-40.42%** | `out/deep_polished/V2.13_deep_polished.xml` |
+| V2.14 | deep-polish | **VALID** | 0.084934 | **0.075429** | **-11.19%** | `out/deep_polished/V2.14_deep_polished.xml` |
+| V2.15 | fast-search (LLH0/LLH5) | **VALID** | 0.039373 | — | Baseline | `scratch/valid_V2.15_lr2.xml` |
+| V2.16.2 | deep-polish | **VALID** | 0.042634 | **0.025961** | **-39.11%** | `out/deep_polished/V2.16.2_deep_polished.xml` |
+| V2.19 | deep-polish | **VALID** | 0.096702 | **0.080677** | **-16.57%** | `out/deep_polished/V2.19_deep_polished.xml` |
+| V2.20.2 | deep-polish | **VALID** | 0.031588 | **0.031151** | **-1.38%** | `out/deep_polished/V2.20.2_deep_polished.xml` |
+| V2.21.2 | native-cold-start | **VALID** | **0.032982** | 0.033015 (worse; baseline kept) | Baseline | `scratch/opt_V2.21.2_native.xml` |
+| V2.24 | deep-polish | **VALID** | 0.027025 | **0.020387** | **-24.56%** | `out/deep_polished/V2.24_deep_polished.xml` |
+| V2.25 | deep-polish | **VALID** | 0.035982 | **0.027588** | **-23.33%** | `out/deep_polished/V2.25_deep_polished.xml` |
+| V2.26 | deep-polish | **VALID** | 0.036609 | **0.030957** | **-15.44%** | `out/deep_polished/V2.26_deep_polished.xml` |
+| V2.17 | fast-search (chained) | INVALID | — | — | — | `scratch/chain_V2.17_best.xml` (186 internal errors) |
+| V2.18 | fast-search (LLH0/LLH5) | INVALID | — | — | — | `scratch/camp_V2.18_s11.xml` (116 internal errors) |
+| V2.22 | fast-search (decoder) | INVALID | — | — | — | `scratch/dec_V2.22.xml` |
+| V2.23 | fast-search + MIP | INVALID | — | — | see note below | `out/V2.23_INTEGRATED_RESULT.xml` |
+
+All nine `deep_polished` rows re-verified 2026-08-20 with the released checker
+(fail-closed wrapper); the LRs above are the checker's own numbers. The
+intermediate `out/polished/*_polished.xml` generation is also valid at slightly
+higher LRs. **The newer `out/universal_polished_*.xml` generation is rejected
+by the checker on all nine instances — do not cite it.** V2.21.2's polish came
+out marginally *worse* than its baseline, so the baseline artifact remains the
+best-known.
+
+## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
+
+1. **Continuous multi-drop chaining & payload maximization**: maximizes
+   delivered payload per shift within tank headspace and trailer capacity.
+   Measured on the nine valid Set B artifacts above: LR reductions up to
+   -40.42%, all re-verified officially valid. (An earlier draft of this
+   section claimed "100% validity with zero regressions" — V2.21.2 regressed
+   slightly and its baseline is kept instead.)
+2. **Interval-clique MIP resource assignment** (`scipy.optimize.milp`,
+   in `src/vrp_solver/fast/universal_polish.py`): assigns shifts to
+   driver/trailer pairs. The "completely resolves all discrete resource
+   conflicts" claim from the earlier draft is **withdrawn**: the surviving
+   integrated artifact (`out/V2.23_INTEGRATED_RESULT.xml`) still fails the
+   checker with DRI03 x3, SHI04 x38, LAY02 x1, plus DYN01 x15,256 and
+   SHI06 x65,550; the claimed V2.17/V2.18/V2.22 integrated artifacts do not
+   exist on disk.
+3. **Convex customer inventory LP tuner** (`scipy.optimize.linprog`): tunes
+   drop sizes along piecewise tank trajectories. Ships inside
+   `universal_polish.py`, whose end-to-end outputs are currently rejected by
+   the checker (see above) — the tuner is not yet validated in isolation.
 
 V2.15's best artifact improved on 2026-08-10 from LR 0.055610 to **0.039373**
 (a 2-minute fast-search polish of the valid solution, re-verified;

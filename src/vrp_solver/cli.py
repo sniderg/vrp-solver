@@ -1303,6 +1303,8 @@ def cmd_native_solve_batch(args: argparse.Namespace) -> int:
         ]
         if args.idle_cap is not None:
             command += ["--idle-cap", str(args.idle_cap)]
+        if getattr(args, "engine", None):
+            command += ["--engine", str(args.engine)]
         handle = log_path.open("w", encoding="utf-8")
         process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
         process._log_handle = handle  # type: ignore[attr-defined]
@@ -2193,6 +2195,12 @@ def build_parser() -> argparse.ArgumentParser:
     native_batch.add_argument("--no-improvement-limit", type=int, default=10_000)
     native_batch.add_argument("--candidates-per-move", type=int, default=120)
     native_batch.add_argument("--idle-cap", type=int)
+    native_batch.add_argument(
+        "--engine",
+        choices=("surgical", "fast"),
+        default="surgical",
+        help="search engine after construction: 'surgical' or 'fast'",
+    )
     native_batch.add_argument("--concurrency", type=int, default=7)
     native_batch.add_argument("--checker-archive", type=Path)
     native_batch.add_argument("--verify-timeout", type=float, default=180.0)
