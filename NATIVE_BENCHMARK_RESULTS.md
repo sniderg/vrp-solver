@@ -144,6 +144,32 @@ by the checker on all nine instances — do not cite it.** V2.21.2's polish came
 out marginally *worse* than its baseline, so the baseline artifact remains the
 best-known.
 
+## 2026-08-20 seed-portfolio experiment: V2.26 closed, twelfth valid instance
+
+Eight parallel 30-minute cold runs per instance (seeds 2-9), then one
+`--resume-from` round on the best checkpoint (scripts:
+`scratch/portfolio_run.sh`; artifacts: `out/portfolio/`).
+
+- **V2.26 CLOSED (chained-native): `official_valid,True`, LR 0.050572.**
+  Seed 3 reached 1 error in its 30-minute budget; a 27-second resume round
+  finished it. ~30.5 minutes total compute, instance XML + seeds only,
+  fully hands-off. `out/portfolio/V2.26_s3_resume.xml`, SHA-256
+  `597059138e30bd40f0aca053f750b33d37f7acabbc4d423634861108fc8fe673`.
+  Not a single-run result; the best-known LR remains the deep-polished
+  0.030957. Every one of the 8 seeds beat seed 1's 4-error plateau ceiling
+  at round 6 pace or better (finals: 1,1,2,2,2,4,4,5).
+- **V2.12: seed choice is worth 3x.** Seed 7 ended at 38 errors vs seed 1's
+  119; a further 30-minute resume moved only 38 -> 37 (hard plateau,
+  consistent with the trapped-capacity diagnosis — more budget does not
+  help; the lever is constructor coverage / joint-slack repair).
+- **Fast-engine CLI batch on the open four** (`native-solve-batch --engine
+  fast`, first CLI reproduction of the 08-11 measurements): V2.17
+  6,312 -> 491, V2.18 4,243 -> 729, V2.22 6,352 -> 953, V2.23 255 -> 112.
+  All invalid, exploration only (`out/fast_open4/`). V2.23's 112 matches its
+  documented plateau exactly.
+
+Set B validity count: **12 of 15** (open: V2.17, V2.18, V2.22, V2.23).
+
 ## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
 
 1. **Continuous multi-drop chaining & payload maximization**: maximizes
