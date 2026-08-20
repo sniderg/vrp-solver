@@ -135,7 +135,15 @@ the released checker. New best LRs, artifacts at
 | V2.25 | 0.027588 | **0.025184** | -8.7% |
 | V2.26 | 0.030957 | **0.027171** | -12.2% |
 
-V2.12 at **0.016696** is the first artifact to beat the supplied reference
+**2026-08-20, later:** the new reload-insertion MIP
+(`src/vrp_solver/joint_restructure.py`) improved two rows further, both
+re-verified: **V2.12 0.016696 -> 0.016037** (one in-gap reload) and
+**V2.16.2 0.021969 -> 0.021402** (two), artifacts
+`artifacts/valid/{V2.12,V2.16.2}_reload_mip.xml`. On the other nine the MIP
+proves quantities are already at their tank-ceiling optimum for the fixed
+topology - their remaining LR headroom is topological.
+
+V2.12 at **0.016037** is the first artifact to beat the supplied reference
 solution (0.018496). The table below predates this sweep; where it
 disagrees, the fast-polished numbers above are the current best.
 
