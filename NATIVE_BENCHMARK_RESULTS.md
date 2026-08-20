@@ -123,7 +123,7 @@ named; `scratch/verify_setb.py` reproduces the sweep.
 | V2.12 | native-repair | **VALID** | 0.027209 | — | Baseline | `scratch/v212_skill_orders_final_local.xml` |
 | V2.13 | deep-polish | **VALID** | 0.070567 | **0.042045** | **-40.42%** | `out/deep_polished/V2.13_deep_polished.xml` |
 | V2.14 | deep-polish | **VALID** | 0.084934 | **0.075429** | **-11.19%** | `out/deep_polished/V2.14_deep_polished.xml` |
-| V2.15 | fast-search (LLH0/LLH5) | **VALID** | 0.039373 | — | Baseline | `scratch/valid_V2.15_lr2.xml` |
+| V2.15 | **native-cold-start (fast engine, single 30-min run)** | **VALID** | **0.039686** | — | Baseline | `artifacts/valid/V2.15_cold_fast.xml` |
 | V2.16.2 | deep-polish | **VALID** | 0.042634 | **0.025961** | **-39.11%** | `out/deep_polished/V2.16.2_deep_polished.xml` |
 | V2.19 | deep-polish | **VALID** | 0.096702 | **0.080677** | **-16.57%** | `out/deep_polished/V2.19_deep_polished.xml` |
 | V2.20.2 | deep-polish | **VALID** | 0.031588 | **0.031151** | **-1.38%** | `out/deep_polished/V2.20.2_deep_polished.xml` |
@@ -169,6 +169,26 @@ Eight parallel 30-minute cold runs per instance (seeds 2-9), then one
   documented plateau exactly.
 
 Set B validity count: **12 of 15** (open: V2.17, V2.18, V2.22, V2.23).
+
+### 2026-08-20 artifact loss and recovery
+
+The `748602b` scratch cleanup deleted the on-disk valid artifacts. Seven were
+restored from git history and re-verified at their exact documented LRs.
+V2.15's two valid artifacts (0.039373 and 0.055610) were untracked and are
+lost; the recorded SHA-256s remain in this file's history. **Re-derivation
+upgraded the claim:** three of four fresh `native-solve --engine fast` seeds
+closed V2.15 in single 30-minute cold runs (LRs 0.047948 / 0.049595 /
+**0.039686**), so V2.15 now closes at the competition budget — the lost
+artifact had required chaining. Best artifact:
+`artifacts/valid/V2.15_cold_fast.xml`, SHA-256 `949cb5b3fb53...`.
+All valid XMLs now live in git-tracked `artifacts/valid/` with a SHA256SUMS
+manifest; `scratch/` and `out/` must never be the only home of a
+publishable artifact.
+
+Same session, V2.23 fast-engine seed portfolio (seeds 2-5): finals
+62 / 96 / 122 / 144 vs seed 1's 112-error plateau — **seed 2's 62 errors is
+the best state V2.23 has ever reached**; a chained fast resume from that
+checkpoint is running.
 
 ## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
 
