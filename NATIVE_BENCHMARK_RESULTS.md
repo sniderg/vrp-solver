@@ -230,6 +230,16 @@ boundary crossing therefore requires joint topology+resource restructuring,
 not requantification; quantity-only repair on the plateau states is refuted
 as a path to closing V2.23.
 
+**Triple confirmation (2026-08-20):** the surgical engine (with the
+structural operators that closed V2.26) ran 8 rotation rounds from the same
+61-error state and moved it **zero** (61 -> 61). V2.23's boundary state is
+now confirmed unreachable by (a) 2.18M fast-search steps, (b) an exact
+quantity MILP over the fixed topology (infeasible), and (c) the full
+surgical operator rotation. Only a joint topology+resource+quantity
+restructuring move remains untried. Contrast V2.17: the same surgical
+resume ground 491 -> 461 in 30 min — it is a depth/throughput grind, not a
+boundary problem.
+
 ## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
 
 1. **Continuous multi-drop chaining & payload maximization**: maximizes
