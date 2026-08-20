@@ -244,7 +244,14 @@ structural operators that closed V2.26) ran 8 rotation rounds from the same
 now confirmed unreachable by (a) 2.18M fast-search steps, (b) an exact
 quantity MILP over the fixed topology (infeasible), and (c) the full
 surgical operator rotation. Only a joint topology+resource+quantity
-restructuring move remains untried. Contrast V2.17: the same surgical
+restructuring move remains untried. **Extended 2026-08-20 (later):** the
+same strict-LP infeasibility certificate now covers V2.17, V2.18, and
+V2.22's best states as well - all four open instances provably require
+structural change, not requantification. The in-gap reload MIP is also
+infeasible on all four (3-27 candidates each). MILP monitor verdict: the
+largest model we build (V2.23 min-delivered, 213k cols, 819 binaries)
+root-solves in 25 s at 1 B&B node - HiGHS is not the bottleneck and a
+stronger MIP solver would change nothing today (`out/highs_timings.csv`). Contrast V2.17: the same surgical
 resume ground 491 -> 461 in 30 min — it is a depth/throughput grind, not a
 boundary problem.
 
