@@ -5,6 +5,46 @@ description: Design, implement, diagnose, benchmark, and independently validate 
 
 # Solve ROADEF IRP
 
+## Where the work stands and what remains (2026-08-20)
+
+Status: **12 of 15 Set B instances officially valid** (best-known table with
+artifacts and SHA-256s: [NATIVE_BENCHMARK_RESULTS.md](../../NATIVE_BENCHMARK_RESULTS.md)).
+Open: V2.17, V2.18, V2.22, V2.23, plus a single-run cold-start claim for V2.12
+and V2.26. Inputs are authenticated (checker + all 20 instance XMLs
+byte-match roadef.org; hashes enforced in `official_verify.py` and
+`instance_manifest.py`). The stack is fully open-source: Python/Cython +
+HiGHS; Gurobi is optional and no valid result depends on it.
+
+The remaining work, with the confidence each item deserves:
+
+- **MEASURED, exhausted:** more search budget on the open instances. Chained
+  resumes plateau (V2.12: 38 -> 37 in 30 min; V2.23: 2M steps without moving
+  112). Seed portfolios are worth ~3x on seed-sensitive instances (V2.12
+  119 -> 38) and closed V2.26 (1-error checkpoint + 27 s resume), but do not
+  touch the structural plateaus.
+- **MEASURED, the binding constraints:** V2.18/V2.22 are seed-coverage-bound
+  (the constructor leaves 69/134 V2.18 customers unscheduled — no search
+  fixes a seed that never visits half the customers). V2.12/V2.23 residuals
+  are trapped-capacity/resource-cadence (joint driver+trailer slack, not
+  aggregate slack).
+- **HYPOTHESIS, the designed next step (not yet built):** optimization-based
+  seeding — enumerate candidate routes, select a covering set with a HiGHS
+  set-covering MILP, assign resources with the interval-clique MIP instead of
+  the greedy placement gate; and wire the exact quantity-LP/resource-MIP in
+  as *search-time repair* so operators whose candidates fail only on
+  resources or quantities stop returning nothing. Plausible by analogy to the
+  measured polish gains; unproven as a constructor.
+- **HYPOTHESIS, cheap multiplier (not yet built):** an algorithm-configuration
+  harness (Optuna or irace) over the exposed constants — multi-seed,
+  multi-instance, fixed-cap fitness, checker-gated promotion. Likely converts
+  near-misses (V2.26-class) into single-run closes; cannot fix coverage-bound
+  instances. Prerequisite: centralize the tunable constants into one config
+  surface (they are currently scattered across CLI defaults and hard-coded
+  fast-engine thresholds).
+- **UNKNOWN:** whether any of the four open instances closes without new
+  constructor machinery. Treat every claim otherwise as unverified until an
+  artifact passes `verify-official`.
+
 Treat official validity as the first objective and LR as the objective among valid solutions. The operational target is milestone-shaped: reach an error-free (officially valid) solution within the first 10 minutes of the run, then spend the remaining budget improving LR. When comparing runs or tuning, report time-to-first-valid and LR-at-budget as separate numbers — a run that polishes LR but never goes valid, or goes valid only at minute 29, is worse than one that is valid at minute 8 with a middling ratio.
 
 ## Run a cold start
@@ -364,6 +404,64 @@ Report generated/deduplicated candidates, timing-feasible count, quantity-feasib
 Use customer-specific probes only to identify a missing move or invariant. Once a reusable mechanism is found, stop manually repairing IDs/timestamps, implement a feature-driven production operator with tests, and resume through the native entry point. Do not spend more than two consecutive experiments micromanaging named customers except for checker disagreement or minimal regression isolation.
 
 Express operators using pressure area, first breach, window slack, resource boundaries, compatibility, load-path position, and incremental travel. Never encode the probe's customer ID, instance name, or fixed minute.
+
+## Exact post-hoc polish works — but only one checker-gated step at a time
+
+The LP/MIP polish layer (quantity maximization within headroom, interval-clique
+resource assignment) produced the largest single-day LR gains in the project's
+history (up to -40% on V2.13, all nine artifacts re-verified valid,
+`out/deep_polished/`). The same components chained more aggressively
+(`universal_polish.py` end-to-end) produced outputs the checker rejects on all
+nine instances. The measured lesson: exact layers preserve validity only when
+every accepted step is individually checker-gated, the way
+`eliminate_redundant_shifts` and the deep-polish loop do it. An exact solve of
+an approximate model is still approximate — the tank/timing models in these
+layers diverge from the checker's simulation, and chaining compounds the
+divergence. Do not promote a polish pipeline on its internal claims; verify
+per artifact.
+
+Also from that layer: **round derived quantities up (or keep full precision),
+never down.** Writing `round(q, 4)` under an LP lower bound produced SHI16
+rejections of the form `2932.1429 < 2932.1429486887` — the checker compares at
+full precision.
+
+## A claim without an artifact is not a result — and this repo has the scars
+
+Three times now (2026-08-02 "15/15", 2026-08-19 "all Set B and Set X" +
+a fabricated 11-row table, and an overwritten reference solution cited as
+solver output), work in this repo has asserted validity the released checker
+refutes. The discipline that catches it every time, cheaply:
+
+- A result is the pair (exact XML path, fresh `verify-official` run). No
+  artifact, no result — commit messages, tables, and READMEs are claims, not
+  evidence.
+- Re-verify before citing, even "known" artifacts: files get overwritten
+  (the V2.12 reference was; restored from git, SHA `61a7ef87...`).
+- `verify-official` prints `instance_provenance` — `MODIFIED-OFFICIAL` means
+  the benchmark input itself was tampered with; stop and restore before
+  anything else.
+- Derived XMLs must not live in the official instance directory.
+- Fabrication tells: identical LRs on different instances, uniform implausible
+  solve times, results on instances no engine has ever closed, artifact paths
+  that do not exist.
+
+## Seed portfolios are a production tactic, not just a construction knob
+
+Seeds differ enough that eight parallel 30-minute runs are the cheapest
+quality multiplier available when compute rules are relaxed (measured:
+V2.26 seeds 2-9 finished 1,1,2,2,2,4,4,5 errors against seed 1's 4; V2.12
+best seed 38 vs 119). Pair with the resume recipe: portfolio to a 1-2 error
+checkpoint, then one short `--resume-from` round (closed V2.26 in 27 s).
+Label the chained result honestly — it is not a single-budget claim.
+
+## Only one Gurobi process at a time
+
+The local license resolves to single-use/WLS: a second concurrent process gets
+"Single-use license. Another Gurobi process running" and falls back to HiGHS
+(the fallback message must stay ASCII — an emoji there crashed under Windows
+cp1252 and killed the run). Concurrent sweeps should not set
+`ROADEF_SOLVER=gurobi`; run Gurobi solves sequentially or accept heterogeneous
+solver provenance.
 
 ## Generalise and report honestly
 
