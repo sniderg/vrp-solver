@@ -7,7 +7,7 @@ description: Design, implement, diagnose, benchmark, and independently validate 
 
 ## Where the work stands and what remains (2026-08-20)
 
-Status: **12 of 15 Set B instances officially valid** (best-known table with
+Status: **11 of 15 Set B instances officially valid** (best-known table with
 artifacts and SHA-256s: [NATIVE_BENCHMARK_RESULTS.md](../../NATIVE_BENCHMARK_RESULTS.md)).
 Open: V2.17, V2.18, V2.22, V2.23, plus a single-run cold-start claim for V2.12
 and V2.26. Inputs are authenticated (checker + all 20 instance XMLs

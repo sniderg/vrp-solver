@@ -168,7 +168,9 @@ Eight parallel 30-minute cold runs per instance (seeds 2-9), then one
   All invalid, exploration only (`out/fast_open4/`). V2.23's 112 matches its
   documented plateau exactly.
 
-Set B validity count: **12 of 15** (open: V2.17, V2.18, V2.22, V2.23).
+Set B validity count: **11 of 15** (open: V2.17, V2.18, V2.22, V2.23; an
+earlier revision of this line said 12 — a double-count of V2.26's
+re-closure).
 
 ### 2026-08-20 artifact loss and recovery
 
