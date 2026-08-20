@@ -255,6 +255,33 @@ stronger MIP solver would change nothing today (`out/highs_timings.csv`). Contra
 resume ground 491 -> 461 in 30 min — it is a depth/throughput grind, not a
 boundary problem.
 
+## 2026-08-20/21 joint restructuring MIP: every open instance moves
+
+`src/vrp_solver/joint_restructure.py`, built in one day through five
+escalations, each driven by an infeasibility certificate: quantities ->
++in-gap reloads -> +removals/end-insertions -> +customer stops -> +new-shift
+columns in joint driver+trailer idle windows (multi-failure greedy-max-fill
+coverage, pairwise overlap exclusions, penalty slack for provably
+uncoverable customers). All error counts below are local; none of these
+states is valid yet — they are the best exploration states each instance
+has ever reached:
+
+| Instance | Before (best ever) | After MIP(+search) | Mechanism |
+| --- | ---: | ---: | --- |
+| V2.23 | 61 | **15** | v4 Optimal (7 activations) + surgical |
+| V2.18 | 638 | **166** | soft-all, 21 activations |
+| V2.17 | 186 (5h chain) / 461 | **191..195** | soft-all, 18-21 activations, seconds |
+| V2.22 | 953 | **288** | soft-all, 50 activations — Gurobi only |
+
+**HiGHS/Gurobi capacity frontier (measured on this model family):**
+V2.17/V2.18 (~75k vars, ~650 binaries): HiGHS 47/333 s, Gurobi 7.7/12.7 s.
+V2.22 (117k vars, 2,778 binaries): HiGHS times out at 900 s (289 B&B nodes,
+no incumbent); **Gurobi solves it in 24.5 s.** Set `ROADEF_SOLVER=gurobi`
+for restructure MIPs above ~700 binaries; every extracted solution is
+replayed through local validation and the released checker, so MPS
+translation cannot fake a success. The `milp_monitor` slow-solve log
+(`out/highs_timings.csv`) is the trigger for routing new model families.
+
 ## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
 
 1. **Continuous multi-drop chaining & payload maximization**: maximizes
