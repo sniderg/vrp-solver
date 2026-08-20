@@ -36,6 +36,13 @@ class _ReloadCandidate:
     source_point: int
     arrival: int
     max_quantity: float
+    # v2 (remove-and-insert): this insertion is legal only if the delivery at
+    # ``requires_removal`` (an operation index in the same shift) is removed,
+    # freeing its time slot.  -1 means unconditional (fits an existing gap).
+    requires_removal: int = -1
+    # v2: insert after the last operation, extending the shift end within the
+    # driver/trailer chain slack computed by the candidate generator.
+    at_end: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,145 @@ def _gap_candidates(
     return candidates
 
 
+def _removable_ops(instance: Instance, solution: Solution) -> set[tuple[int, int]]:
+    """Delivery operations whose removal cannot fire QS01 or LAY02.
+
+    VMI customers only (no call-in orders), and never a layover-designated
+    customer, whose presence may legalise a represented rest on the route.
+    """
+    removable: set[tuple[int, int]] = set()
+    for shift in solution.shifts:
+        for op_index, op in enumerate(shift.operations):
+            customer = instance.customer_by_point.get(op.point)
+            if (
+                customer is not None
+                and not customer.call_in
+                and not customer.orders
+                and not customer.layover_customer
+                and op.quantity > EPSILON
+            ):
+                removable.add((shift.index, op_index))
+    return removable
+
+
+def _extended_candidates(
+    instance: Instance,
+    fi: FastInstance,
+    solution: Solution,
+    target_trailers: set[int],
+    removable: set[tuple[int, int]],
+) -> list[_ReloadCandidate]:
+    """v2 candidates: removal-conditioned insertions and end-of-route ones.
+
+    Every existing arrival that survives stays exactly as-is, so the
+    customer inventory rows remain valid.  A removal-conditioned candidate
+    occupies the removed stop's time slot (detour prev -> source -> next
+    must return before *next*'s original arrival).  An end candidate extends
+    the shift within the explicit slack to the driver's next shift (DRI01
+    separation), the trailer's next shift (TL01), the driver window that
+    hosts the shift (DRI08), and the scoring cutoff.
+    """
+    time = fi.time_matrix
+    setup = fi.setup_time
+    sources = [source.index for source in instance.sources]
+
+    next_start_by_driver: dict[tuple[int, int], int] = {}
+    next_start_by_trailer: dict[tuple[int, int], int] = {}
+    by_driver: dict[int, list] = {}
+    by_trailer: dict[int, list] = {}
+    for shift in solution.shifts:
+        by_driver.setdefault(shift.driver, []).append(shift)
+        by_trailer.setdefault(shift.trailer, []).append(shift)
+    for driver, shifts in by_driver.items():
+        ordered = sorted(shifts, key=lambda s: (s.start, s.index))
+        for here, after in zip(ordered, ordered[1:]):
+            next_start_by_driver[(driver, here.index)] = after.start
+    for trailer, shifts in by_trailer.items():
+        ordered = sorted(shifts, key=lambda s: (s.start, s.index))
+        for here, after in zip(ordered, ordered[1:]):
+            next_start_by_trailer[(trailer, here.index)] = after.start
+
+    candidates: list[_ReloadCandidate] = []
+    for shift in solution.shifts:
+        if shift.trailer not in target_trailers or not shift.operations:
+            continue
+        trailer_capacity = instance.trailers[shift.trailer].capacity
+        ops = shift.operations
+
+        window_end = fi.cutoff
+        for w_start, w_end in fi.driver_windows[shift.driver]:
+            if w_start <= shift.start < w_end:
+                window_end = min(window_end, w_end)
+                break
+        allowed_end = min(
+            next_start_by_driver.get(
+                (shift.driver, shift.index), fi.cutoff
+            )
+            - fi.driver_min_inter_shift[shift.driver],
+            next_start_by_trailer.get((shift.trailer, shift.index), fi.cutoff),
+            window_end,
+        )
+
+        # Removal-conditioned: take over the removed stop's slot.
+        for op_index, op in enumerate(ops):
+            if (shift.index, op_index) not in removable:
+                continue
+            prev_point = fi.base if op_index == 0 else ops[op_index - 1].point
+            prev_departure = (
+                shift.start
+                if op_index == 0
+                else ops[op_index - 1].arrival + setup[prev_point]
+            )
+            for source_point in sources:
+                arrival_at_source = prev_departure + time[prev_point][source_point]
+                departure_from_source = arrival_at_source + setup[source_point]
+                if op_index + 1 < len(ops):
+                    next_op = ops[op_index + 1]
+                    fits = (
+                        departure_from_source + time[source_point][next_op.point]
+                        <= next_op.arrival
+                    )
+                else:
+                    fits = (
+                        departure_from_source + time[source_point][fi.base]
+                        <= allowed_end
+                    )
+                if fits:
+                    candidates.append(
+                        _ReloadCandidate(
+                            shift_index=shift.index,
+                            insert_before=op_index,
+                            source_point=source_point,
+                            arrival=arrival_at_source,
+                            max_quantity=trailer_capacity,
+                            requires_removal=op_index,
+                        )
+                    )
+
+        # End-of-route: extend the shift within the chain slack.
+        last = ops[-1]
+        last_departure = last.arrival + setup[last.point]
+        for source_point in sources:
+            arrival_at_source = last_departure + time[last.point][source_point]
+            new_end = (
+                arrival_at_source
+                + setup[source_point]
+                + time[source_point][fi.base]
+            )
+            if new_end <= allowed_end:
+                candidates.append(
+                    _ReloadCandidate(
+                        shift_index=shift.index,
+                        insert_before=len(ops),
+                        source_point=source_point,
+                        arrival=arrival_at_source,
+                        max_quantity=trailer_capacity,
+                        at_end=True,
+                    )
+                )
+    return candidates
+
+
 def reload_augmented_repair(
     instance: Instance,
     solution: Solution,
@@ -132,8 +278,9 @@ def reload_augmented_repair(
     score_days: int,
     time_limit_seconds: float = 600.0,
     target_trailers: set[int] | None = None,
+    allow_removals: bool = True,
 ) -> tuple[Solution, RestructureReport]:
-    """Strict quantity repair with optional in-gap reload insertions."""
+    """Strict quantity repair with reload insertions and paired removals."""
     import highspy
 
     from .contest import truncate_solution
@@ -188,7 +335,21 @@ def reload_augmented_repair(
                         )
                     )
 
+    trailer_of = {shift.index: shift.trailer for shift in working.shifts}
+    removable = (
+        {
+            key
+            for key in _removable_ops(instance, working)
+            if trailer_of.get(key[0]) in target_trailers
+        }
+        if allow_removals
+        else set()
+    )
     candidates = _gap_candidates(instance, fi, working, target_trailers)
+    if allow_removals:
+        candidates += _extended_candidates(
+            instance, fi, working, target_trailers, removable
+        )
 
     highs = highspy.Highs()
     highs.setOptionValue("output_flag", False)
@@ -198,12 +359,44 @@ def reload_augmented_repair(
 
     q_indices: list[int] = []
     for var in variables:
-        highs.addCol(-1.0, var.min_quantity, var.max_quantity, 0, no_idx, no_val)
+        is_removable = (var.shift_index, var.operation_index) in removable
+        lower = 0.0 if is_removable else var.min_quantity
+        highs.addCol(-1.0, lower, var.max_quantity, 0, no_idx, no_val)
         q_indices.append(highs.getNumCol() - 1)
     load_indices: list[int] = []
     for lvar in load_variables:
         highs.addCol(0.0, 0.0, lvar.max_quantity, 0, no_idx, no_val)
         load_indices.append(highs.getNumCol() - 1)
+
+    # Removal binaries: d=1 forces q to 0; d=0 restores the min-quantity
+    # floor.  A small cost discourages gratuitous removals (the lost
+    # delivered quantity already costs -1 per unit in the objective).
+    d_by_op: dict[tuple[int, int], int] = {}
+    for i, var in enumerate(variables):
+        key = (var.shift_index, var.operation_index)
+        if key not in removable:
+            continue
+        highs.addCol(0.25, 0.0, 1.0, 0, no_idx, no_val)
+        d_idx = highs.getNumCol() - 1
+        highs.changeColIntegrality(d_idx, highspy.HighsVarType.kInteger)
+        pair = np.array([q_indices[i], d_idx], dtype=np.int32)
+        # q + minq * d >= minq
+        highs.addRow(
+            var.min_quantity,
+            inf,
+            2,
+            pair,
+            np.array([1.0, var.min_quantity], dtype=np.float64),
+        )
+        # q + maxq * d <= maxq
+        highs.addRow(
+            -inf,
+            var.max_quantity,
+            2,
+            pair,
+            np.array([1.0, var.max_quantity], dtype=np.float64),
+        )
+        d_by_op[key] = d_idx
 
     # Candidate columns: y (binary, small cost to prefer fewer insertions)
     # and r (reload amount, coupled r <= cap * y).
@@ -224,6 +417,20 @@ def reload_augmented_repair(
         )
         y_indices.append(y_idx)
         r_indices.append(r_idx)
+        if cand.requires_removal >= 0:
+            d_idx = d_by_op.get((cand.shift_index, cand.requires_removal))
+            if d_idx is None:
+                # Candidate's removal target is not modeled; forbid it.
+                highs.changeColBounds(y_idx, 0.0, 0.0)
+            else:
+                # y <= d: the slot exists only if the stop is removed.
+                highs.addRow(
+                    -inf,
+                    0.0,
+                    2,
+                    np.array([y_idx, d_idx], dtype=np.int32),
+                    np.array([1.0, -1.0], dtype=np.float64),
+                )
     by_shift: dict[int, list[int]] = {}
     for cand, y_idx in zip(candidates, y_indices):
         by_shift.setdefault(cand.shift_index, []).append(y_idx)
@@ -316,6 +523,19 @@ def reload_augmented_repair(
                         np.array(columns, dtype=np.int32),
                         np.array(coefficients, dtype=np.float64),
                     )
+            # End-of-route candidates load after the shift's last operation.
+            for r_idx in cands_by_pos.get(
+                (shift.index, len(shift.operations)), []
+            ):
+                columns.append(r_idx)
+                coefficients.append(1.0)
+                highs.addRow(
+                    -constant,
+                    trailer.capacity - constant,
+                    len(columns),
+                    np.array(columns, dtype=np.int32),
+                    np.array(coefficients, dtype=np.float64),
+                )
 
     highs.setOptionValue("time_limit", max(0.01, float(time_limit_seconds)))
     from .milp_monitor import timed_run
@@ -332,18 +552,17 @@ def reload_augmented_repair(
         )
 
     values = highs.getSolution().col_value
-    chosen: dict[tuple[int, int], tuple[int, float]] = {}
+    chosen: dict[tuple[int, int], tuple[int, int, float]] = {}
     chosen_count = 0
     for cand, y_idx, r_idx in zip(candidates, y_indices, r_indices):
         if values[y_idx] > 0.5 and values[r_idx] > EPSILON:
             chosen[(cand.shift_index, cand.insert_before)] = (
                 cand.source_point,
+                cand.arrival,
                 float(values[r_idx]),
             )
             chosen_count += 1
-    cand_arrival = {
-        (cand.shift_index, cand.insert_before): cand.arrival for cand in candidates
-    }
+    removed = {key for key, d_idx in d_by_op.items() if values[d_idx] > 0.5}
 
     q_by_ref = {
         (v.shift_index, v.operation_index): max(0.0, float(values[q_indices[i]]))
@@ -359,14 +578,12 @@ def reload_augmented_repair(
         for op_index, op in enumerate(shift.operations):
             key = (shift.index, op_index)
             if key in chosen:
-                source_point, reload = chosen[key]
+                source_point, arrival, reload = chosen[key]
                 operations.append(
-                    Operation(
-                        point=source_point,
-                        arrival=cand_arrival[key],
-                        quantity=-reload,
-                    )
+                    Operation(point=source_point, arrival=arrival, quantity=-reload)
                 )
+            if key in removed:
+                continue
             if key in load_by_ref:
                 operations.append(replace(op, quantity=-load_by_ref[key]))
             elif key in q_by_ref:
@@ -375,6 +592,12 @@ def reload_augmented_repair(
                     operations.append(replace(op, quantity=quantity))
             else:
                 operations.append(op)
+        end_key = (shift.index, len(shift.operations))
+        if end_key in chosen:
+            source_point, arrival, reload = chosen[end_key]
+            operations.append(
+                Operation(point=source_point, arrival=arrival, quantity=-reload)
+            )
         if operations:
             shifts.append(replace(shift, operations=tuple(operations)))
     return Solution(shifts=tuple(shifts)), RestructureReport(
