@@ -1159,10 +1159,27 @@ def reload_augmented_repair(
                 )
 
     highs.setOptionValue("time_limit", max(0.01, float(time_limit_seconds)))
-    from .milp_monitor import timed_run
-    timed_run(highs, "reload_restructure")
-    status = highs.modelStatusToString(highs.getModelStatus())
-    has_solution = "Optimal" in status or "Feasible" in status
+    # ROADEF_SOLVER=gurobi routes this model through the bridge (MPS
+    # translation).  Any solution extracted is still replayed through local
+    # validation and the released checker, so translation errors cannot
+    # produce a false success.
+    from .solver.gurobi_bridge import solve_with_gurobi_if_requested
+
+    g_status, g_values, solved_by_gurobi = solve_with_gurobi_if_requested(
+        highs, time_limit=time_limit_seconds
+    )
+    if solved_by_gurobi:
+        status = g_status
+        has_solution = g_values is not None
+        if has_solution:
+            class _G:  # minimal shim mirroring highs.getSolution()
+                col_value = g_values
+            highs_solution = _G()
+    else:
+        from .milp_monitor import timed_run
+        timed_run(highs, "reload_restructure")
+        status = highs.modelStatusToString(highs.getModelStatus())
+        has_solution = "Optimal" in status or "Feasible" in status
     if not has_solution:
         return working, RestructureReport(
             status=status,
@@ -1172,7 +1189,7 @@ def reload_augmented_repair(
             constraints=highs.getNumRow(),
         )
 
-    values = highs.getSolution().col_value
+    values = g_values if solved_by_gurobi else highs.getSolution().col_value
     chosen: dict[tuple[int, int], tuple[int, int, float]] = {}
     chosen_count = 0
     for cand, y_idx, r_idx in zip(candidates, y_indices, r_indices):
