@@ -212,6 +212,45 @@ def _uncovered_breach_steps(
     return breaches
 
 
+def _coverage_needs(
+    instance: Instance, solution: Solution, max_needs: int = 6
+) -> dict[int, list[int]]:
+    """All failure steps per customer under greedy max fill.
+
+    On each failure the simulation assumes a rescuing visit refills the tank
+    and continues, so a customer needing several extra visits reports one
+    step per needed visit (capped at ``max_needs``)."""
+    visit_steps: dict[int, list[int]] = {}
+    for shift in solution.shifts:
+        for op in shift.operations:
+            if op.point in instance.customer_by_point and op.quantity > EPSILON:
+                visit_steps.setdefault(op.point, []).append(
+                    op.arrival // instance.unit
+                )
+    needs: dict[int, list[int]] = {}
+    for customer in instance.customers:
+        if customer.call_in:
+            continue
+        steps = sorted(visit_steps.get(customer.index, []))
+        level = customer.initial_tank_quantity
+        cursor = 0
+        fails: list[int] = []
+        for step in range(instance.horizon):
+            if step < len(customer.forecast):
+                level -= customer.forecast[step]
+            while cursor < len(steps) and steps[cursor] <= step:
+                level = customer.capacity
+                cursor += 1
+            if level < customer.safety_level - EPSILON:
+                fails.append(step)
+                level = customer.capacity  # assume a rescuing visit lands here
+                if len(fails) >= max_needs:
+                    break
+        if fails:
+            needs[customer.index] = fails
+    return needs
+
+
 def _stop_candidates(
     instance: Instance,
     fi: FastInstance,
@@ -327,6 +366,7 @@ class _ShiftCandidate:
     min_quantity: float
     max_quantity: float
     trailer_capacity: float
+    end: int = 0
 
 
 def _busy_intervals(
@@ -386,8 +426,16 @@ def _shift_candidates(
     sources = [source.index for source in instance.sources]
     busy_driver, busy_trailer = _busy_intervals(fi, solution)
 
+    # Accept either {point: step} or {point: [steps]}.
+    needy_pairs: list[tuple[int, int]] = []
+    for point, steps in needy.items():
+        if isinstance(steps, int):
+            needy_pairs.append((point, steps))
+        else:
+            needy_pairs.extend((point, step) for step in steps)
+
     candidates: list[_ShiftCandidate] = []
-    for point, breach_step in needy.items():
+    for point, breach_step in needy_pairs:
         deadline = (breach_step + 1) * instance.unit
         customer = instance.customer_by_point[point]
         allowed = fi.trailer_allowed[point]
@@ -460,6 +508,7 @@ def _shift_candidates(
                                     _ShiftCandidate(
                                         driver=driver_id,
                                         trailer=trailer_id,
+                                        end=arrival + tail,
                                         start=start,
                                         source_point=source_point,
                                         source_arrival=(
@@ -641,6 +690,7 @@ def reload_augmented_repair(
     allow_removals: bool = True,
     allow_stop_insertions: bool = True,
     allow_new_shifts: bool = True,
+    soft_all_safety: bool = False,
 ) -> tuple[Solution, RestructureReport]:
     """Strict quantity repair with reload insertions and paired removals."""
     import highspy
@@ -791,19 +841,29 @@ def reload_augmented_repair(
     # first visit -- the class of infeasibility no reload/removal can fix.
     stop_candidates: list[_StopCandidate] = []
     shift_candidates: list[_ShiftCandidate] = []
+    soft_points: set[int] = set()
     if allow_stop_insertions:
-        needy = _uncovered_breach_steps(instance, working)
-        if needy:
+        needs = _coverage_needs(instance, working)
+        if needs:
             stop_candidates = _stop_candidates(
                 instance,
                 fi,
                 working,
-                needy,
+                {point: max(steps) for point, steps in needs.items()},
                 removable,
                 _allowed_end_map(fi, working),
             )
             if allow_new_shifts:
-                shift_candidates = _shift_candidates(instance, fi, working, needy)
+                shift_candidates = _shift_candidates(instance, fi, working, needs)
+            # A needy customer with no candidate at all would veto the whole
+            # model.  Soften exactly those customers' safety rows (heavy
+            # penalty slack) so everything fixable still gets fixed; the
+            # residual names the customers the incumbent cannot serve.
+            covered = {c.customer_point for c in stop_candidates}
+            covered |= {k.customer_point for k in shift_candidates}
+            soft_points = set(needs) - covered
+    if soft_all_safety:
+        soft_points = {c.index for c in instance.customers if not c.call_in}
     w_indices: list[int] = []
     u_indices: list[int] = []
     for scand in stop_candidates:
@@ -868,20 +928,37 @@ def reload_augmented_repair(
         n_indices.append(n_idx)
         nu_indices.append(nu_idx)
         nr_indices.append(nr_idx)
-    # A driver or trailer hosts at most one new shift (the joint windows are
-    # verified per candidate, not pairwise between candidates).
-    per_driver: dict[int, list[int]] = {}
-    per_trailer: dict[int, list[int]] = {}
+    # Two chosen new shifts must not overlap on a shared driver (including
+    # the DRI01 separation) or a shared trailer.  Joint windows are verified
+    # per candidate against the *existing* shifts, so only candidate-pair
+    # conflicts need rows.
+    per_driver: dict[int, list[tuple[int, _ShiftCandidate]]] = {}
+    per_trailer: dict[int, list[tuple[int, _ShiftCandidate]]] = {}
     for kand, n_idx in zip(shift_candidates, n_indices):
-        per_driver.setdefault(kand.driver, []).append(n_idx)
-        per_trailer.setdefault(kand.trailer, []).append(n_idx)
-    for indices in list(per_driver.values()) + list(per_trailer.values()):
-        if len(indices) > 1:
-            highs.addRow(
-                -inf, 1.0, len(indices),
-                np.array(indices, dtype=np.int32),
-                np.ones(len(indices), dtype=np.float64),
-            )
+        per_driver.setdefault(kand.driver, []).append((n_idx, kand))
+        per_trailer.setdefault(kand.trailer, []).append((n_idx, kand))
+    seen_pairs: set[tuple[int, int]] = set()
+
+    def _exclude(entries, margin):
+        for i in range(len(entries)):
+            idx_a, a = entries[i]
+            for j in range(i + 1, len(entries)):
+                idx_b, b = entries[j]
+                if a.start < b.end + margin and b.start < a.end + margin:
+                    pair = (min(idx_a, idx_b), max(idx_a, idx_b))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    highs.addRow(
+                        -inf, 1.0, 2,
+                        np.array(list(pair), dtype=np.int32),
+                        np.ones(2, dtype=np.float64),
+                    )
+
+    for driver_id, entries in per_driver.items():
+        _exclude(entries, fi.driver_min_inter_shift[driver_id])
+    for entries in per_trailer.values():
+        _exclude(entries, 0)
 
     by_shift: dict[int, list[int]] = {}
     for cand, y_idx in zip(candidates, y_indices):
@@ -927,16 +1004,35 @@ def reload_augmented_repair(
                 for i, k in newshifts_by_point.get(customer.index, [])
                 if k.arrival_step <= step
             ]
+            is_soft = customer.index in soft_points
             if not indices:
-                if customer.initial_tank_quantity - cumulative < customer.safety_level - EPSILON:
+                if (
+                    not is_soft
+                    and customer.initial_tank_quantity - cumulative
+                    < customer.safety_level - EPSILON
+                ):
                     highs.addRow(1.0, inf, 0, no_idx, no_val)
                 continue
-            arr = np.array(indices, dtype=np.int32)
-            ones = np.ones(len(indices), dtype=np.float64)
             lower = customer.safety_level - customer.initial_tank_quantity + cumulative
             upper = customer.capacity - customer.initial_tank_quantity + cumulative
-            highs.addRow(lower, inf, len(indices), arr, ones)
-            highs.addRow(-inf, upper, len(indices), arr, ones)
+            if is_soft:
+                # Provably uncoverable customer: penalty slack keeps the model
+                # feasible so every other repair still happens.
+                highs.addCol(10_000_000.0, 0.0, inf, 0, no_idx, no_val)
+                slack_idx = highs.getNumCol() - 1
+                arr = np.array(indices + [slack_idx], dtype=np.int32)
+                ones = np.ones(len(indices) + 1, dtype=np.float64)
+                highs.addRow(lower, inf, len(indices) + 1, arr, ones)
+                arr_u = np.array(indices, dtype=np.int32)
+                highs.addRow(
+                    -inf, upper, len(indices), arr_u,
+                    np.ones(len(indices), dtype=np.float64),
+                )
+            else:
+                arr = np.array(indices, dtype=np.int32)
+                ones = np.ones(len(indices), dtype=np.float64)
+                highs.addRow(lower, inf, len(indices), arr, ones)
+                highs.addRow(-inf, upper, len(indices), arr, ones)
 
     # --- trailer stock chains including candidate reloads ------------------
     q_by_op = {
