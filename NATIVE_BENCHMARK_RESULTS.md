@@ -115,6 +115,31 @@ schedule.
 
 ### Best-known artifacts (any provenance)
 
+**2026-08-20 fast-polish sweep** (`scratch/lr_polish_run.sh`, 15-min
+fast-search resume from each best valid artifact, publication incumbent
+ranked (errors, LR)): **all 11 valid instances improved**, re-verified with
+the released checker. New best LRs, artifacts at
+`artifacts/valid/<inst>_lrpolish.xml`:
+
+| Instance | Previous best | Fast-polished | Change |
+| --- | ---: | ---: | ---: |
+| V2.12 | 0.027209 | **0.016696** | -38.6% |
+| V2.13 | 0.042045 | **0.041129** | -2.2% |
+| V2.14 | 0.075429 | **0.072574** | -3.8% |
+| V2.15 | 0.039686 | **0.039516** | -0.4% |
+| V2.16.2 | 0.025961 | **0.021969** | -15.4% |
+| V2.19 | 0.080677 | **0.077745** | -3.6% |
+| V2.20.2 | 0.031151 | **0.031124** | -0.1% |
+| V2.21.2 | 0.032982 | **0.032366** | -1.9% |
+| V2.24 | 0.020387 | **0.017312** | -15.1% |
+| V2.25 | 0.027588 | **0.025184** | -8.7% |
+| V2.26 | 0.030957 | **0.027171** | -12.2% |
+
+V2.12 at **0.016696** is the first artifact to beat the supplied reference
+solution (0.018496). The table below predates this sweep; where it
+disagrees, the fast-polished numbers above are the current best.
+
+
 Every row re-verified with `Checker_V2.2_07032016.zip` against the exact XML
 named; `scratch/verify_setb.py` reproduces the sweep.
 
