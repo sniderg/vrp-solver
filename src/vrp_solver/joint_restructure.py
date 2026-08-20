@@ -132,6 +132,185 @@ def _gap_candidates(
     return candidates
 
 
+@dataclass(frozen=True)
+class _StopCandidate:
+    shift_index: int
+    insert_before: int
+    customer_point: int
+    arrival: int
+    arrival_step: int
+    min_quantity: float
+    max_quantity: float
+    requires_removal: int = -1
+
+
+def _allowed_end_map(fi: FastInstance, solution: Solution) -> dict[int, int]:
+    """Latest legal shift end per shift: driver's next start minus DRI01
+    separation, trailer's next start (TL01), the hosting driver window
+    (DRI08), and the scoring cutoff."""
+    next_by_driver: dict[tuple[int, int], int] = {}
+    next_by_trailer: dict[tuple[int, int], int] = {}
+    by_driver: dict[int, list] = {}
+    by_trailer: dict[int, list] = {}
+    for shift in solution.shifts:
+        by_driver.setdefault(shift.driver, []).append(shift)
+        by_trailer.setdefault(shift.trailer, []).append(shift)
+    for driver, shifts in by_driver.items():
+        ordered = sorted(shifts, key=lambda s: (s.start, s.index))
+        for here, after in zip(ordered, ordered[1:]):
+            next_by_driver[(driver, here.index)] = after.start
+    for trailer, shifts in by_trailer.items():
+        ordered = sorted(shifts, key=lambda s: (s.start, s.index))
+        for here, after in zip(ordered, ordered[1:]):
+            next_by_trailer[(trailer, here.index)] = after.start
+    allowed: dict[int, int] = {}
+    for shift in solution.shifts:
+        window_end = fi.cutoff
+        for w_start, w_end in fi.driver_windows[shift.driver]:
+            if w_start <= shift.start < w_end:
+                window_end = min(window_end, w_end)
+                break
+        allowed[shift.index] = min(
+            next_by_driver.get((shift.driver, shift.index), fi.cutoff)
+            - fi.driver_min_inter_shift[shift.driver],
+            next_by_trailer.get((shift.trailer, shift.index), fi.cutoff),
+            window_end,
+        )
+    return allowed
+
+
+def _uncovered_breach_steps(
+    instance: Instance, solution: Solution
+) -> dict[int, int]:
+    """Customers whose tank breaches before their first delivery, with the
+    breach step.  These make any fixed-stop-set model infeasible; only a new
+    visit at or before the breach step can help."""
+    first_visit: dict[int, int] = {}
+    for shift in solution.shifts:
+        for op in shift.operations:
+            if op.point in instance.customer_by_point and op.quantity > EPSILON:
+                step = op.arrival // instance.unit
+                first_visit[op.point] = min(
+                    first_visit.get(op.point, 1 << 30), step
+                )
+    breaches: dict[int, int] = {}
+    for customer in instance.customers:
+        if customer.call_in:
+            continue
+        level = customer.initial_tank_quantity
+        visit = first_visit.get(customer.index, 1 << 30)
+        for step in range(instance.horizon):
+            if step < len(customer.forecast):
+                level -= customer.forecast[step]
+            if level < customer.safety_level - EPSILON:
+                if step < visit:
+                    breaches[customer.index] = step
+                break
+            if step >= visit:
+                break
+    return breaches
+
+
+def _stop_candidates(
+    instance: Instance,
+    fi: FastInstance,
+    solution: Solution,
+    needy: dict[int, int],
+    removable: set[tuple[int, int]],
+    allowed_end: dict[int, int],
+) -> list[_StopCandidate]:
+    """Delivery-stop insertions for customers breaching before their first
+    visit: in existing gaps, in removal-freed slots (requires_removal), and
+    at route ends within chain slack.  Each candidate lands at or before the
+    customer's breach step, inside a customer time window, on a qualified
+    trailer (SHI05), within the driving cap; no surviving arrival changes."""
+    time = fi.time_matrix
+    setup = fi.setup_time
+    candidates: list[_StopCandidate] = []
+
+    def _try(shift, op_index, prev_point, prev_departure, next_point,
+             next_arrival, base_driving, max_driving, requires_removal):
+        for point, breach_step in needy.items():
+            allowed = fi.trailer_allowed[point]
+            if allowed is not None and shift.trailer not in allowed:
+                continue
+            arrival = prev_departure + time[prev_point][point]
+            if arrival // instance.unit > breach_step:
+                continue
+            windows = fi.customer_windows[point]
+            if windows and not any(s <= arrival < e for s, e in windows):
+                continue
+            if next_point is not None:
+                back = arrival + setup[point] + time[point][next_point]
+                extra = (
+                    time[prev_point][point]
+                    + time[point][next_point]
+                    - time[prev_point][next_point]
+                )
+                fits = back <= next_arrival and base_driving + extra <= max_driving
+            else:
+                new_end = arrival + setup[point] + time[point][fi.base]
+                extra = (
+                    time[prev_point][point]
+                    + time[point][fi.base]
+                    - time[prev_point][fi.base]
+                )
+                fits = (
+                    new_end <= allowed_end.get(shift.index, fi.cutoff)
+                    and base_driving + extra <= max_driving
+                )
+            if fits:
+                customer = instance.customer_by_point[point]
+                candidates.append(
+                    _StopCandidate(
+                        shift_index=shift.index,
+                        insert_before=op_index,
+                        customer_point=point,
+                        arrival=arrival,
+                        arrival_step=min(
+                            max(arrival // instance.unit, 0), instance.horizon - 1
+                        ),
+                        min_quantity=max(customer.min_operation_quantity, 10 * EPSILON),
+                        max_quantity=customer.capacity,
+                        requires_removal=requires_removal,
+                    )
+                )
+
+    for shift in solution.shifts:
+        if not shift.operations:
+            continue
+        ops = shift.operations
+        max_driving = fi.driver_max_driving[shift.driver]
+        base_driving = 0
+        prev = fi.base
+        for op in ops:
+            base_driving += time[prev][op.point]
+            prev = op.point
+        base_driving += time[prev][fi.base]
+
+        prev_point = fi.base
+        prev_departure = shift.start
+        for op_index, op in enumerate(ops):
+            # In an existing gap before op_index.
+            _try(shift, op_index, prev_point, prev_departure,
+                 op.point, op.arrival, base_driving, max_driving, -1)
+            # In the slot freed by removing op_index.
+            if (shift.index, op_index) in removable:
+                if op_index + 1 < len(ops):
+                    nxt, nxt_arr = ops[op_index + 1].point, ops[op_index + 1].arrival
+                else:
+                    nxt, nxt_arr = None, None
+                _try(shift, op_index, prev_point, prev_departure,
+                     nxt, nxt_arr, base_driving, max_driving, op_index)
+            prev_point = op.point
+            prev_departure = op.arrival + setup[op.point]
+        # At the end of the route, within chain slack.
+        last = ops[-1]
+        _try(shift, len(ops), last.point, last.arrival + setup[last.point],
+             None, None, base_driving, max_driving, -1)
+    return candidates
+
+
 def _removable_ops(instance: Instance, solution: Solution) -> set[tuple[int, int]]:
     """Delivery operations whose removal cannot fire QS01 or LAY02.
 
@@ -279,6 +458,7 @@ def reload_augmented_repair(
     time_limit_seconds: float = 600.0,
     target_trailers: set[int] | None = None,
     allow_removals: bool = True,
+    allow_stop_insertions: bool = True,
 ) -> tuple[Solution, RestructureReport]:
     """Strict quantity repair with reload insertions and paired removals."""
     import highspy
@@ -335,16 +515,10 @@ def reload_augmented_repair(
                         )
                     )
 
-    trailer_of = {shift.index: shift.trailer for shift in working.shifts}
-    removable = (
-        {
-            key
-            for key in _removable_ops(instance, working)
-            if trailer_of.get(key[0]) in target_trailers
-        }
-        if allow_removals
-        else set()
-    )
+    # Removals are allowed on every trailer: freeing a slot anywhere may be
+    # the only way to host a needy customer's early visit, and the strict
+    # inventory rows price the lost delivery globally.
+    removable = _removable_ops(instance, working) if allow_removals else set()
     candidates = _gap_candidates(instance, fi, working, target_trailers)
     if allow_removals:
         candidates += _extended_candidates(
@@ -431,9 +605,57 @@ def reload_augmented_repair(
                     np.array([y_idx, d_idx], dtype=np.int32),
                     np.array([1.0, -1.0], dtype=np.float64),
                 )
+    # v3: delivery-stop insertions for customers breaching before their
+    # first visit -- the class of infeasibility no reload/removal can fix.
+    stop_candidates: list[_StopCandidate] = []
+    if allow_stop_insertions:
+        needy = _uncovered_breach_steps(instance, working)
+        if needy:
+            stop_candidates = _stop_candidates(
+                instance,
+                fi,
+                working,
+                needy,
+                removable,
+                _allowed_end_map(fi, working),
+            )
+    w_indices: list[int] = []
+    u_indices: list[int] = []
+    for scand in stop_candidates:
+        highs.addCol(1.0, 0.0, 1.0, 0, no_idx, no_val)
+        w_idx = highs.getNumCol() - 1
+        highs.changeColIntegrality(w_idx, highspy.HighsVarType.kInteger)
+        highs.addCol(-1.0, 0.0, scand.max_quantity, 0, no_idx, no_val)
+        u_idx = highs.getNumCol() - 1
+        pair = np.array([u_idx, w_idx], dtype=np.int32)
+        highs.addRow(
+            -inf, 0.0, 2, pair,
+            np.array([1.0, -scand.max_quantity], dtype=np.float64),
+        )
+        highs.addRow(
+            0.0, inf, 2, pair,
+            np.array([1.0, -scand.min_quantity], dtype=np.float64),
+        )
+        w_indices.append(w_idx)
+        u_indices.append(u_idx)
+        if scand.requires_removal >= 0:
+            d_idx = d_by_op.get((scand.shift_index, scand.requires_removal))
+            if d_idx is None:
+                highs.changeColBounds(w_idx, 0.0, 0.0)
+            else:
+                highs.addRow(
+                    -inf,
+                    0.0,
+                    2,
+                    np.array([w_idx, d_idx], dtype=np.int32),
+                    np.array([1.0, -1.0], dtype=np.float64),
+                )
+
     by_shift: dict[int, list[int]] = {}
     for cand, y_idx in zip(candidates, y_indices):
         by_shift.setdefault(cand.shift_index, []).append(y_idx)
+    for scand, w_idx in zip(stop_candidates, w_indices):
+        by_shift.setdefault(scand.shift_index, []).append(w_idx)
     for indices in by_shift.values():
         if len(indices) > 1:
             highs.addRow(
@@ -444,19 +666,27 @@ def reload_augmented_repair(
                 np.ones(len(indices), dtype=np.float64),
             )
 
-    # --- strict customer inventory rows (arrivals unchanged by design) ----
+    # --- strict customer inventory rows (arrivals unchanged by design;
+    #     v3 stop candidates join their customer's rows from their step) ---
     by_point: dict[int, list[tuple[int, _DeliveryVariable]]] = {}
     for index, var in enumerate(variables):
         by_point.setdefault(var.point, []).append((index, var))
+    stops_by_point: dict[int, list[tuple[int, _StopCandidate]]] = {}
+    for index, scand in enumerate(stop_candidates):
+        stops_by_point.setdefault(scand.customer_point, []).append((index, scand))
     for customer in instance.customers:
         if customer.call_in:
             continue
         cust_vars = by_point.get(customer.index, [])
+        cust_stops = stops_by_point.get(customer.index, [])
         cumulative = 0.0
         for step in range(instance.horizon):
             if step < len(customer.forecast):
                 cumulative += customer.forecast[step]
             indices = [q_indices[i] for i, v in cust_vars if v.arrival_step <= step]
+            indices += [
+                u_indices[i] for i, s in cust_stops if s.arrival_step <= step
+            ]
             if not indices:
                 if customer.initial_tank_quantity - cumulative < customer.safety_level - EPSILON:
                     highs.addRow(1.0, inf, 0, no_idx, no_val)
@@ -480,6 +710,12 @@ def reload_augmented_repair(
     cands_by_pos: dict[tuple[int, int], list[int]] = {}
     for cand, r_idx in zip(candidates, r_indices):
         cands_by_pos.setdefault((cand.shift_index, cand.insert_before), []).append(r_idx)
+    # v3 stop candidates consume trailer stock at their position.
+    stops_by_pos: dict[tuple[int, int], list[int]] = {}
+    for scand, u_idx in zip(stop_candidates, u_indices):
+        stops_by_pos.setdefault(
+            (scand.shift_index, scand.insert_before), []
+        ).append(u_idx)
 
     shifts_by_trailer: dict[int, list] = {}
     for shift in working.shifts:
@@ -497,6 +733,17 @@ def reload_augmented_repair(
                     columns.append(r_idx)
                     coefficients.append(1.0)
                     # After a candidate reload the stock must fit the trailer.
+                    highs.addRow(
+                        -constant,
+                        trailer.capacity - constant,
+                        len(columns),
+                        np.array(columns, dtype=np.int32),
+                        np.array(coefficients, dtype=np.float64),
+                    )
+                for u_idx in stops_by_pos.get((shift.index, op_index), []):
+                    columns.append(u_idx)
+                    coefficients.append(-1.0)
+                    # After a candidate delivery the stock must stay >= 0.
                     highs.addRow(
                         -constant,
                         trailer.capacity - constant,
@@ -523,12 +770,21 @@ def reload_augmented_repair(
                         np.array(columns, dtype=np.int32),
                         np.array(coefficients, dtype=np.float64),
                     )
-            # End-of-route candidates load after the shift's last operation.
-            for r_idx in cands_by_pos.get(
-                (shift.index, len(shift.operations)), []
-            ):
+            # End-of-route candidates act after the shift's last operation.
+            end_pos = (shift.index, len(shift.operations))
+            for r_idx in cands_by_pos.get(end_pos, []):
                 columns.append(r_idx)
                 coefficients.append(1.0)
+                highs.addRow(
+                    -constant,
+                    trailer.capacity - constant,
+                    len(columns),
+                    np.array(columns, dtype=np.int32),
+                    np.array(coefficients, dtype=np.float64),
+                )
+            for u_idx in stops_by_pos.get(end_pos, []):
+                columns.append(u_idx)
+                coefficients.append(-1.0)
                 highs.addRow(
                     -constant,
                     trailer.capacity - constant,
@@ -563,6 +819,15 @@ def reload_augmented_repair(
             )
             chosen_count += 1
     removed = {key for key, d_idx in d_by_op.items() if values[d_idx] > 0.5}
+    chosen_stops: dict[tuple[int, int], tuple[int, int, float]] = {}
+    for scand, w_idx, u_idx in zip(stop_candidates, w_indices, u_indices):
+        if values[w_idx] > 0.5 and values[u_idx] > EPSILON:
+            chosen_stops[(scand.shift_index, scand.insert_before)] = (
+                scand.customer_point,
+                scand.arrival,
+                float(values[u_idx]),
+            )
+            chosen_count += 1
 
     q_by_ref = {
         (v.shift_index, v.operation_index): max(0.0, float(values[q_indices[i]]))
@@ -582,6 +847,11 @@ def reload_augmented_repair(
                 operations.append(
                     Operation(point=source_point, arrival=arrival, quantity=-reload)
                 )
+            if key in chosen_stops:
+                point, arrival, quantity = chosen_stops[key]
+                operations.append(
+                    Operation(point=point, arrival=arrival, quantity=quantity)
+                )
             if key in removed:
                 continue
             if key in load_by_ref:
@@ -597,6 +867,11 @@ def reload_augmented_repair(
             source_point, arrival, reload = chosen[end_key]
             operations.append(
                 Operation(point=source_point, arrival=arrival, quantity=-reload)
+            )
+        if end_key in chosen_stops:
+            point, arrival, quantity = chosen_stops[end_key]
+            operations.append(
+                Operation(point=point, arrival=arrival, quantity=quantity)
             )
         if operations:
             shifts.append(replace(shift, operations=tuple(operations)))
