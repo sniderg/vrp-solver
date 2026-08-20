@@ -318,7 +318,8 @@ def reload_augmented_repair(
                     )
 
     highs.setOptionValue("time_limit", max(0.01, float(time_limit_seconds)))
-    highs.run()
+    from .milp_monitor import timed_run
+    timed_run(highs, "reload_restructure")
     status = highs.modelStatusToString(highs.getModelStatus())
     has_solution = "Optimal" in status or "Feasible" in status
     if not has_solution:

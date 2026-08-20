@@ -289,7 +289,8 @@ def repair_with_highs_selection(
         print(f"Gurobi Status: {status}")
         has_solution = values is not None
     else:
-        highs.run()
+        from .milp_monitor import timed_run
+        timed_run(highs, "quantity_repair")
         status = highs.modelStatusToString(highs.getModelStatus())
         print(f"HiGHS Status: {status}")
         has_solution = highs.getInfo().primal_solution_status == 2 or "Optimal" in status or "Feasible" in status

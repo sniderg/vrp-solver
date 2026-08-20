@@ -349,7 +349,8 @@ def select_shifts_with_highs(
     else:
         highs.setOptionValue("time_limit", selector_config.time_limit)
         solve_start = time.perf_counter()
-        highs.run()
+        from ..milp_monitor import timed_run
+        timed_run(highs, "column_selector")
         solve_seconds = time.perf_counter() - solve_start
         status = highs.modelStatusToString(highs.getModelStatus())
         print(

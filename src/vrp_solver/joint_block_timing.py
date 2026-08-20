@@ -549,7 +549,8 @@ def schedule_route_templates(
                 ],
             )
 
-    highs.run()
+    from .milp_monitor import timed_run
+    timed_run(highs, "block_timing")
     status = highs.modelStatusToString(highs.getModelStatus())
     has_solution = (
         highs.getInfo().primal_solution_status == 2
@@ -1040,7 +1041,8 @@ def _solve_joint_timing(
                     elif following.index in block_ids:
                         add_row(derived[previous.index].end + gap, inf, [starts[following.index]], [1.0])
 
-    highs.run()
+    from .milp_monitor import timed_run
+    timed_run(highs, "block_timing_2")
     if highs.getModelStatus() != highspy.HighsModelStatus.kOptimal:
         return None
     values = highs.getSolution().col_value

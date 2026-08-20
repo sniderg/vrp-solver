@@ -171,7 +171,8 @@ def _try_optimize_shift_times(
             np.array([1.0], dtype=np.float64),
         )
         
-    highs.run()
+    from .milp_monitor import timed_run
+    timed_run(highs, "shift_retime")
     
     status = highs.getModelStatus()
     if status == highspy.HighsModelStatus.kOptimal:
