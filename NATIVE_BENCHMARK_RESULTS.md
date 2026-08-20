@@ -223,6 +223,13 @@ residual is a resource/stock-chain restructuring problem, reinforcing that
 the lever is exact resource/quantity repair inside the search
 (interval-clique MIP + quantity LP), not more budget.
 
+**Decisive follow-up (2026-08-20):** a strict full-horizon quantity MILP
+over the 61-error topology (fixed routes, `strict_inventory=True`) is
+**Infeasible** — no quantity assignment makes this topology valid. The
+boundary crossing therefore requires joint topology+resource restructuring,
+not requantification; quantity-only repair on the plateau states is refuted
+as a path to closing V2.23.
+
 ## 2026-08-20 Multi-drop polish architecture (claims corrected 2026-08-20)
 
 1. **Continuous multi-drop chaining & payload maximization**: maximizes
